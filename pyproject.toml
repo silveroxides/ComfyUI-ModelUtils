@@ -11,4 +11,4 @@ Repository = "https://github.com/silveroxides/ComfyUI-ModelUtils"
 [tool.comfy]
 PublisherId = "silveroxides"
 DisplayName = "Model Utility Toolkit"
-Icon = "🛠️"
+Icon = "https://github.com/silveroxides/ComfyUI-ModelUtils/raw/refs/heads/main/assets/tools-icon.svg"
