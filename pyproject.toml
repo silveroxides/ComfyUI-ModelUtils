@@ -1,6 +1,6 @@
 [project]
 name = "comfyui_modelutils"
-description = "Custom nodes for handling, inspecting, modifying and creating various model files."
+description = "[WIP]Custom nodes for handling, inspecting, modifying and creating various model files."
 version = "0.1.1"
 license = { file = "LICENSE" }
 
