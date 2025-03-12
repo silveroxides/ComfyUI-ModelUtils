@@ -1,0 +1,14 @@
+[project]
+name = "comfyui_modelutils"
+description = "Custom nodes for handling, inspecting, modifying and creating various model files."
+version = "0.1.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/silveroxides/ComfyUI-ModelUtils"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "silveroxides"
+DisplayName = "Model Utility Toolkit"
+Icon = "🛠️"
