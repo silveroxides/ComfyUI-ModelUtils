@@ -1,7 +1,7 @@
 [project]
-name = "comfyui_modelutils"
+name = "ComfyUI-ModelUtils"
 description = "[WIP]Custom nodes for handling, inspecting, modifying and creating various model files."
-version = "0.1.2"
+version = "0.1.3"
 license = { file = "LICENSE" }
 
 [project.urls]
