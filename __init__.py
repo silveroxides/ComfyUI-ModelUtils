@@ -5,6 +5,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPMetaKeys": CLIPMetaKeys,
     "LoRAMetaKeys": LoRAMetaKeys,
     "CheckpointMetaKeys": CheckpointMetaKeys,
+    "OffloadModels": OffloadModelsNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -12,4 +13,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPMetaKeys": "Get CLIP Metadata and Keys",
     "LoRAMetaKeys": "Get LoRA Metadata and Keys",
     "CheckpointMetaKeys": "Get Checkpoint Metadata and Keys",
+    "OffloadModelsNode": "Offload Models with Passthrough",
 }
