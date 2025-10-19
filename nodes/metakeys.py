@@ -8,7 +8,7 @@ class BaseMetaKeys:
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("metadata", "keys")
     FUNCTION = "get_metakeys"
-    CATEGORY = "utils"
+    CATEGORY = "ModelUtils/Keys"
     DESCRIPTION = "Loads a model and returns its metadata and layer names."
 
     def _get_metakeys(self, model_name, model_type):

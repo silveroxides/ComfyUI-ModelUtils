@@ -8,7 +8,7 @@ class BasePruneKeys:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "prune_keys"
-    CATEGORY = "ModelUtils"
+    CATEGORY = "ModelUtils/Keys"
     DESCRIPTION = "Loads a model, removes specified keys, and saves it as a new safetensors file."
 
     def _prune_keys(self, model_name, model_type, keys_to_prune_str, use_regex, output_filename):

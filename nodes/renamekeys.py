@@ -7,7 +7,7 @@ class BaseRenameKeys:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "rename_keys"
-    CATEGORY = "ModelUtils"
+    CATEGORY = "ModelUtils/Keys"
     DESCRIPTION = "Loads a model, renames specified keys, and saves it as a new safetensors file."
 
     def _rename_keys(self, model_name, model_type, old_keys_str, new_keys_str, output_filename):
