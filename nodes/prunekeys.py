@@ -110,3 +110,18 @@ class CheckpointPruneKeys(BasePruneKeys):
 
     def prune_keys(self, ckpt_name, keys_to_prune, use_regex, output_filename):
         return self._prune_keys(ckpt_name, "checkpoints", keys_to_prune, use_regex, output_filename)
+
+class EmbeddingPruneKeys(BasePruneKeys):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "embedding": (folder_paths.get_filename_list("embeddings"), ),
+                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
+                "use_regex": ("BOOLEAN", {"default": False}),
+                "output_filename": ("STRING", {"default": "pruned_embedding"}),
+            }
+        }
+
+    def prune_keys(self, embedding, keys_to_prune, use_regex, output_filename):
+        return self._prune_keys(embedding, "embeddings", keys_to_prune, use_regex, output_filename)

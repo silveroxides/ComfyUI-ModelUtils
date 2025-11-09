@@ -83,4 +83,16 @@ class CheckpointMetaKeys(BaseMetaKeys):
     def get_metakeys(self, ckpt_name):
         return self._get_metakeys(ckpt_name, "checkpoints")
 
-__all__ = ("UNetMetaKeys", "CLIPMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys")
+class EmbeddingMetaKeys(BaseMetaKeys):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "embedding": (folder_paths.get_filename_list("embeddings"), ),
+            }
+        }
+
+    def get_metakeys(self, embedding):
+        return self._get_metakeys(embedding, "embeddings")
+
+__all__ = ("UNetMetaKeys", "CLIPMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys", "EmbeddingMetaKeys")

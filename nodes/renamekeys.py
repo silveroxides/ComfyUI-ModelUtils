@@ -105,3 +105,18 @@ class CheckpointRenameKeys(BaseRenameKeys):
 
     def rename_keys(self, ckpt_name, old_keys, new_keys, output_filename):
         return self._rename_keys(ckpt_name, "checkpoints", old_keys, new_keys, output_filename)
+
+class EmbeddingRenameKeys(BaseRenameKeys):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "embedding": (folder_paths.get_filename_list("embeddings"), ),
+                "old_keys": ("STRING", {"multiline": True, "default": ""}),
+                "new_keys": ("STRING", {"multiline": True, "default": ""}),
+                "output_filename": ("STRING", {"default": "renamed_embedding"}),
+            }
+        }
+
+    def rename_keys(self, embedding, old_keys, new_keys, output_filename):
+        return self._rename_keys(embedding, "embeddings", old_keys, new_keys, output_filename)

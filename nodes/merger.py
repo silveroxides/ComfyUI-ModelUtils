@@ -140,6 +140,10 @@ class LoRATwoMerger(BaseTwoMerger):
     MODEL_TYPE = "loras"
     @classmethod
     def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
+class EmbeddingTwoMerger(BaseTwoMerger):
+    MODEL_TYPE = "embeddings"
+    @classmethod
+    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
 
 # --- Concrete 3-Model Nodes ---
 class CheckpointThreeMerger(BaseThreeMerger):
@@ -158,8 +162,12 @@ class LoRAThreeMerger(BaseThreeMerger):
     MODEL_TYPE = "loras"
     @classmethod
     def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
+class EmbeddingThreeMerger(BaseThreeMerger):
+    MODEL_TYPE = "embeddings"
+    @classmethod
+    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
 
 __all__ = [
-    "CheckpointTwoMerger", "UNetTwoMerger", "CLIPTwoMerger", "LoRATwoMerger",
-    "CheckpointThreeMerger", "UNetThreeMerger", "CLIPThreeMerger", "LoRAThreeMerger"
+    "CheckpointTwoMerger", "UNetTwoMerger", "CLIPTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
+    "CheckpointThreeMerger", "UNetThreeMerger", "CLIPThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger"
 ]
