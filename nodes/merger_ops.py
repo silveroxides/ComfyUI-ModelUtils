@@ -94,7 +94,7 @@ class TrainDiff(Operation):
         dist_bc, dist_ab = torch.abs(diff_bc), torch.abs(b.float() - a.float())
         scale = torch.where(dist_bc + dist_ab != 0, dist_ab / (dist_bc + dist_ab), 0.0)
         return (torch.sign(diff_bc) * torch.abs(scale) * torch.abs(diff_bc)).to(a.dtype) * 1.8
-class Extract(Operation):
+class ExtractOp(Operation):
     def __init__(self, key, alpha, beta, gamma, *args):
         super().__init__(key, *args)
         self.alpha, self.beta, self.gamma = alpha, beta, gamma
@@ -104,7 +104,7 @@ class Extract(Operation):
         c = torch.cosine_similarity(a_f.flatten(), b_f.flatten(), 0).clamp(-1, 1)
         d = ((c + 1) / 2)**self.gamma
         return (torch.lerp(a_f, b_f, self.alpha) * torch.lerp(d, 1 - d, self.beta)).to(a.dtype)
-class Similarities(Extract):
+class Similarities(ExtractOp):
     def oper(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor: return super().oper(None, a, b)
 class PowerUpOp(Operation):
     def __init__(self, key, alpha, seed, *sources):
@@ -198,7 +198,7 @@ class Extract(CalcMode):
         a = LoadTensor(key, kwargs['model_a'], **loader_args)
         b = LoadTensor(key, kwargs['model_b'], **loader_args)
         c = LoadTensor(key, kwargs['model_c'], **loader_args)
-        extracted = Extract(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'] * 15, a, b, c)
+        extracted = ExtractOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'] * 15, a, b, c)
         multiplied = Multiply(key, kwargs['delta'], extracted)
         return Add(key, a, multiplied)
 class AddDisimilarity(CalcMode):
