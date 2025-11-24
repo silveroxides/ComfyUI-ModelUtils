@@ -106,7 +106,7 @@ class Extract(Operation):
         return (torch.lerp(a_f, b_f, self.alpha) * torch.lerp(d, 1 - d, self.beta)).to(a.dtype)
 class Similarities(Extract):
     def oper(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor: return super().oper(None, a, b)
-class PowerUp(Operation):
+class PowerUpOp(Operation):
     def __init__(self, key, alpha, seed, *sources):
         super().__init__(key, *sources)
         self.alpha, self.seed = alpha, seed
@@ -223,7 +223,7 @@ class PowerUp(CalcMode):
         loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
         a = LoadTensor(key, kwargs['model_a'], **loader_args)
         b = LoadTensor(key, kwargs['model_b'], **loader_args)
-        deltahat = PowerUp(key, kwargs['alpha'], kwargs['seed'], a, b)
+        deltahat = PowerUpOp(key, kwargs['alpha'], kwargs['seed'], a, b)
         res = Multiply(key, kwargs['beta'], deltahat)
         return Add(key, a, res)
 class SVD(CalcMode):
