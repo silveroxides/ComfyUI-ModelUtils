@@ -36,29 +36,29 @@ class BaseMetaKeys:
 
 
 
-class UNetMetaKeys(BaseMetaKeys):
+class ModelMetaKeys(BaseMetaKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
+                "diffusionmodel_name": (folder_paths.get_filename_list("diffusion_models"), ),
             }
         }
 
-    def get_metakeys(self, unet_name):
-        return self._get_metakeys(unet_name, "diffusion_models")
+    def get_metakeys(self, diffusionmodel_name):
+        return self._get_metakeys(diffusionmodel_name, "diffusion_models")
 
-class CLIPMetaKeys(BaseMetaKeys):
+class TextEncoderMetaKeys(BaseMetaKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
+                "textencoder_name": (folder_paths.get_filename_list("text_encoders"), ),
             }
         }
 
-    def get_metakeys(self, clip_name):
-        return self._get_metakeys(clip_name, "text_encoders")
+    def get_metakeys(self, textencoder_name):
+        return self._get_metakeys(textencoder_name, "text_encoders")
 
 class LoRAMetaKeys(BaseMetaKeys):
     @classmethod
@@ -95,4 +95,4 @@ class EmbeddingMetaKeys(BaseMetaKeys):
     def get_metakeys(self, embedding):
         return self._get_metakeys(embedding, "embeddings")
 
-__all__ = ("UNetMetaKeys", "CLIPMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys", "EmbeddingMetaKeys")
+__all__ = ("ModelMetaKeys", "TextEncoderMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys", "EmbeddingMetaKeys")

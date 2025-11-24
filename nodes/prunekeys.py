@@ -51,35 +51,35 @@ class BasePruneKeys:
 
         return (output_path,)
 
-class UNetPruneKeys(BasePruneKeys):
+class ModelPruneKeys(BasePruneKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
+                "diffusionmodel_name": (folder_paths.get_filename_list("diffusion_models"), ),
                 "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
                 "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_unet"}),
+                "output_filename": ("STRING", {"default": "pruned_model"}),
             }
         }
 
-    def prune_keys(self, unet_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(unet_name, "diffusion_models", keys_to_prune, use_regex, output_filename)
+    def prune_keys(self, diffusionmodel_name, keys_to_prune, use_regex, output_filename):
+        return self._prune_keys(diffusionmodel_name, "diffusion_models", keys_to_prune, use_regex, output_filename)
 
-class CLIPPruneKeys(BasePruneKeys):
+class TextEncoderPruneKeys(BasePruneKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
+                "textencoder_name": (folder_paths.get_filename_list("text_encoders"), ),
                 "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
                 "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_clip"}),
+                "output_filename": ("STRING", {"default": "pruned_textencoder"}),
             }
         }
 
-    def prune_keys(self, clip_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(clip_name, "text_encoders", keys_to_prune, use_regex, output_filename)
+    def prune_keys(self, textencoder_name, keys_to_prune, use_regex, output_filename):
+        return self._prune_keys(textencoder_name, "text_encoders", keys_to_prune, use_regex, output_filename)
 
 class LoRAPruneKeys(BasePruneKeys):
     @classmethod

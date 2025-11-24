@@ -46,35 +46,35 @@ class BaseRenameKeys:
 
         return (output_path,)
 
-class UNetRenameKeys(BaseRenameKeys):
+class ModelRenameKeys(BaseRenameKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
+                "diffusionmodel_name": (folder_paths.get_filename_list("diffusion_models"), ),
                 "old_keys": ("STRING", {"multiline": True, "default": ""}),
                 "new_keys": ("STRING", {"multiline": True, "default": ""}),
-                "output_filename": ("STRING", {"default": "renamed_unet"}),
+                "output_filename": ("STRING", {"default": "renamed_model"}),
             }
         }
 
-    def rename_keys(self, unet_name, old_keys, new_keys, output_filename):
-        return self._rename_keys(unet_name, "diffusion_models", old_keys, new_keys, output_filename)
+    def rename_keys(self, diffusionmodel_name, old_keys, new_keys, output_filename):
+        return self._rename_keys(diffusionmodel_name, "diffusion_models", old_keys, new_keys, output_filename)
 
-class CLIPRenameKeys(BaseRenameKeys):
+class TextEncoderRenameKeys(BaseRenameKeys):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
+                "textencoder_name": (folder_paths.get_filename_list("text_encoders"), ),
                 "old_keys": ("STRING", {"multiline": True, "default": ""}),
                 "new_keys": ("STRING", {"multiline": True, "default": ""}),
-                "output_filename": ("STRING", {"default": "renamed_clip"}),
+                "output_filename": ("STRING", {"default": "renamed_textencoder"}),
             }
         }
 
-    def rename_keys(self, clip_name, old_keys, new_keys, output_filename):
-        return self._rename_keys(clip_name, "text_encoders", old_keys, new_keys, output_filename)
+    def rename_keys(self, textencoder_name, old_keys, new_keys, output_filename):
+        return self._rename_keys(textencoder_name, "text_encoders", old_keys, new_keys, output_filename)
 
 class LoRARenameKeys(BaseRenameKeys):
     @classmethod

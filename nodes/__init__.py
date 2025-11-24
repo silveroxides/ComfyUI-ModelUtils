@@ -4,9 +4,9 @@ from .prunekeys import *
 from .merger import *
 
 __all__ = [
-    "UNetMetaKeys", "CLIPMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys", "EmbeddingMetaKeys",
-    "UNetRenameKeys", "CLIPRenameKeys", "LoRARenameKeys", "CheckpointRenameKeys", "EmbeddingRenameKeys",
-    "UNetPruneKeys", "CLIPPruneKeys", "LoRAPruneKeys", "CheckpointPruneKeys", "EmbeddingPruneKeys",
-    "CheckpointTwoMerger", "UNetTwoMerger", "CLIPTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
-    "CheckpointThreeMerger", "UNetThreeMerger", "CLIPThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger",
+    "ModelMetaKeys", "TextEncoderMetaKeys", "LoRAMetaKeys", "CheckpointMetaKeys", "EmbeddingMetaKeys",
+    "ModelRenameKeys", "TextEncoderRenameKeys", "LoRARenameKeys", "CheckpointRenameKeys", "EmbeddingRenameKeys",
+    "ModelPruneKeys", "TextEncoderPruneKeys", "LoRAPruneKeys", "CheckpointPruneKeys", "EmbeddingPruneKeys",
+    "CheckpointTwoMerger", "ModelTwoMerger", "TextEncoderTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
+    "CheckpointThreeMerger", "ModelThreeMerger", "TextEncoderThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger",
 ]

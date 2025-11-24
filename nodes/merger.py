@@ -128,11 +128,11 @@ class CheckpointTwoMerger(BaseTwoMerger):
     MODEL_TYPE = "checkpoints"
     @classmethod
     def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class UNetTwoMerger(BaseTwoMerger):
+class ModelTwoMerger(BaseTwoMerger):
     MODEL_TYPE = "diffusion_models"
     @classmethod
     def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class CLIPTwoMerger(BaseTwoMerger):
+class TextEncoderTwoMerger(BaseTwoMerger):
     MODEL_TYPE = "text_encoders"
     @classmethod
     def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
@@ -150,11 +150,11 @@ class CheckpointThreeMerger(BaseThreeMerger):
     MODEL_TYPE = "checkpoints"
     @classmethod
     def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class UNetThreeMerger(BaseThreeMerger):
+class ModelThreeMerger(BaseThreeMerger):
     MODEL_TYPE = "diffusion_models"
     @classmethod
     def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class CLIPThreeMerger(BaseThreeMerger):
+class TextEncoderThreeMerger(BaseThreeMerger):
     MODEL_TYPE = "text_encoders"
     @classmethod
     def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
@@ -168,6 +168,6 @@ class EmbeddingThreeMerger(BaseThreeMerger):
     def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
 
 __all__ = [
-    "CheckpointTwoMerger", "UNetTwoMerger", "CLIPTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
-    "CheckpointThreeMerger", "UNetThreeMerger", "CLIPThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger"
+    "CheckpointTwoMerger", "ModelTwoMerger", "TextEncoderTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
+    "CheckpointThreeMerger", "ModelThreeMerger", "TextEncoderThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger"
 ]
