@@ -1,10 +1,12 @@
 import os
+import re
 import torch
 import folder_paths
 import comfy.utils
 from safetensors.torch import save_file
 from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
 from .merger_utils import MemoryEfficientSafeOpen
+
 
 def load_documentation_from_file(filename):
     """Loads documentation from a markdown file in the ../docs/ directory."""
@@ -15,6 +17,33 @@ def load_documentation_from_file(filename):
             return f.read()
     except FileNotFoundError:
         return f"# Documentation File Not Found\n\nPlease ensure `{filename}` exists in the `docs` directory of the custom node."
+
+
+def _compile_patterns(pattern_string):
+    """Compiles whitespace-separated regex patterns into a list of compiled patterns.
+    
+    Returns empty list if pattern_string is empty or whitespace-only.
+    Raises ValueError if any pattern is invalid regex.
+    """
+    if not pattern_string or not pattern_string.strip():
+        return []
+    
+    patterns = []
+    for pattern in pattern_string.split():
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error as e:
+            raise ValueError(f"Invalid regex pattern '{pattern}': {e}")
+    return patterns
+
+
+def _matches_any_pattern(key, patterns):
+    """Returns True if key matches any of the compiled regex patterns (substring search)."""
+    for pattern in patterns:
+        if pattern.search(key):
+            return True
+    return False
+
 
 # --- UI Dictionary Helper Functions ---
 def _create_two_model_inputs(model_folder_name):
@@ -31,7 +60,10 @@ def _create_two_model_inputs(model_folder_name):
         "output_filename": ("STRING", {"default": "merged_2_model"}),
         "save_dtype": (["fp32", "fp16", "bf16"],),
         "process_device": (["cuda", "cpu"],),
+        "exclude_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers keep Model A only"}),
+        "discard_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers removed from output"}),
     }}
+
 
 def _create_three_model_inputs(model_folder_name):
     return {"required": {
@@ -49,7 +81,10 @@ def _create_three_model_inputs(model_folder_name):
         "output_filename": ("STRING", {"default": "merged_3_model"}),
         "save_dtype": (["fp32", "fp16", "bf16"],),
         "process_device": (["cuda", "cpu"],),
+        "exclude_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers keep Model A only"}),
+        "discard_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers removed from output"}),
     }}
+
 
 # --- Base Classes for Backend Logic ONLY ---
 class MergerLogic:
@@ -75,15 +110,17 @@ class MergerLogic:
         mismatch_mode = MissingTensorBehavior(mismatch_mode_str)
         recipe_params['mismatch_mode'] = mismatch_mode
         
+        # Compile filter patterns
+        exclude_patterns = _compile_patterns(recipe_params.get('exclude_patterns', ''))
+        discard_patterns = _compile_patterns(recipe_params.get('discard_patterns', ''))
+        
         # Pre-compute key differences for logging
         primary_keys = set(all_keys)
-        mismatch_report = {}
         for name, handler in handlers.items():
             if name != primary_model_name:
                 secondary_keys = set(handler.keys())
                 missing = primary_keys - secondary_keys
                 extra = secondary_keys - primary_keys
-                mismatch_report[name] = {"missing": missing, "extra": extra}
                 if missing:
                     print(f"[Merger] {name} is missing {len(missing)} keys present in Model A")
                 if extra:
@@ -98,14 +135,29 @@ class MergerLogic:
         process_dtype = recipe_params.get('dtype', torch.float32)
         
         skipped_keys = 0
+        excluded_keys = 0
+        discarded_keys = 0
         error_keys = []
         
         for key in all_keys:
-            # Pre-load Model A's tensor - this is always required and serves as reference
+            # Check discard patterns first - skip entirely
+            if _matches_any_pattern(key, discard_patterns):
+                discarded_keys += 1
+                pbar.update(1)
+                continue
+            
+            # Pre-load Model A's tensor
             tensor_a = primary_handler.get_tensor(key).to(device=process_device, dtype=process_dtype)
             
+            # Check exclude patterns - use Model A only, no merge
+            if _matches_any_pattern(key, exclude_patterns):
+                merged_state_dict[key] = tensor_a.to(save_torch_dtype).cpu().clone()
+                excluded_keys += 1
+                pbar.update(1)
+                continue
+            
             # Pass tensor_a metadata to recipes for zeros mode and fallback
-            recipe_params['_tensor_a'] = tensor_a  # For operations that need reference
+            recipe_params['_tensor_a'] = tensor_a
             recipe_params['_tensor_a_shape'] = tensor_a.shape
             recipe_params['_tensor_a_dtype'] = tensor_a.dtype
             
@@ -114,15 +166,13 @@ class MergerLogic:
                 result = recipe.merge()
             except MissingTensorError as e:
                 if mismatch_mode == MissingTensorBehavior.ERROR:
-                    # Re-raise to fail the entire merge
                     raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
-                # This shouldn't happen in skip/zeros mode, but handle gracefully
                 result = None
                 error_keys.append(key)
             
             # Handle None result (mismatch occurred with skip mode)
             if result is None:
-                result = tensor_a  # Use pre-loaded Model A tensor
+                result = tensor_a
                 skipped_keys += 1
             
             if isinstance(result, dict):
@@ -135,6 +185,11 @@ class MergerLogic:
             del recipe_params['_tensor_a']
             pbar.update(1)
         
+        # Log summary
+        if excluded_keys > 0:
+            print(f"[Merger] Excluded {excluded_keys} keys from merge (kept Model A only)")
+        if discarded_keys > 0:
+            print(f"[Merger] Discarded {discarded_keys} keys from output")
         if skipped_keys > 0:
             print(f"[Merger] Used Model A's values for {skipped_keys} keys due to mismatches")
         if error_keys:
@@ -149,11 +204,12 @@ class MergerLogic:
         save_file(merged_state_dict, output_path, metadata=metadata)
         return (f"{output_filename}.safetensors",)
 
+
 class BaseTwoMerger(MergerLogic):
     FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
     RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
 
-    def merge(self, execution_mode, model_a, model_b, calc_mode, mismatch_mode, alpha, beta, gamma, seed, output_filename, save_dtype, process_device):
+    def merge(self, execution_mode, model_a, model_b, calc_mode, mismatch_mode, alpha, beta, gamma, seed, output_filename, save_dtype, process_device, exclude_patterns, discard_patterns):
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return ("Documentation mode active. No merge performed.", doc)
@@ -163,17 +219,19 @@ class BaseTwoMerger(MergerLogic):
             "mismatch_mode": mismatch_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
-            "device": process_device, "dtype": torch.float32
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename, = self._execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, self.MODEL_TYPE)
         return (filename, doc)
 
+
 class BaseThreeMerger(MergerLogic):
     FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
     RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
 
-    def merge(self, execution_mode, model_a, model_b, model_c, calc_mode, mismatch_mode, alpha, beta, gamma, delta, seed, output_filename, save_dtype, process_device):
+    def merge(self, execution_mode, model_a, model_b, model_c, calc_mode, mismatch_mode, alpha, beta, gamma, delta, seed, output_filename, save_dtype, process_device, exclude_patterns, discard_patterns):
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return ("Documentation mode active. No merge performed.", doc)
@@ -183,11 +241,13 @@ class BaseThreeMerger(MergerLogic):
             "mismatch_mode": mismatch_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
-            "device": process_device, "dtype": torch.float32
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename, = self._execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, self.MODEL_TYPE)
         return (filename, doc)
+
 
 # --- Concrete 2-Model Nodes ---
 class CheckpointTwoMerger(BaseTwoMerger):

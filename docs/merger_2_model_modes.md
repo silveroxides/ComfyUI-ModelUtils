@@ -59,3 +59,29 @@ When merging models with different layer structures (e.g., fine-tuned models wit
 - Cross-architecture experiments
 
 **Note:** Extra layers in Model B that don't exist in Model A are currently ignored. The output will always have the same layer structure as Model A.
+
+---
+
+## Layer Filtering (Regex Patterns)
+
+Use regex patterns to control which layers are merged:
+
+### `exclude_patterns`
+Layers matching any pattern will **keep Model A's values only** (no merge).
+
+### `discard_patterns`
+Layers matching any pattern will be **removed entirely** from the output.
+
+**Pattern format:**
+- Whitespace-separated regex patterns
+- Patterns use **substring matching** (not full match)
+- Example: `text_model lora` matches any key containing "text_model" OR "lora"
+- Example: `layer\.[0-5]\.` matches layers 0-5 using regex syntax
+
+**Pattern Examples:**
+| Pattern | Matches |
+|---------|---------|
+| `text_model` | All text encoder layers |
+| `\.norm` | All normalization layers |
+| `attn\.(q\|k\|v)` | Query, key, value attention weights |
+| `block\.[0-9]\.` | Blocks 0-9 |
