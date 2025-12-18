@@ -41,3 +41,26 @@
 - **Alpha:** Weights the comparison between Model B (`0.0`) and Model C (`1.0`).
 - **Beta:** A multiplier for the final extracted dissimilar features.
 - **Gamma:** A bias exponent for the similarity calculation.
+
+---
+
+## Layer Mismatch Handling
+
+When merging models with different layer structures, the `mismatch_mode` parameter controls behavior:
+
+| Mode | Behavior |
+|------|----------|
+| `skip` | Missing layers in B/C use A's values **(default)** |
+| `zeros` | Missing layers in B/C are treated as zeros |
+| `error` | Fail if any layer is missing |
+
+**Special case for B - C subtraction (Add-Difference, Train-Difference):**
+- If **both** B and C have the layer: Normal subtraction is performed
+- If **either** B or C is missing the layer: The difference is treated as `None` (no contribution from this layer), and Model A's value is used
+
+**Common scenarios:**
+- Merging a fine-tuned model with added/removed layers
+- Extracting style differences between models with slightly different architectures
+- Combining partial LoRAs or adapters
+
+**Note:** Extra layers in Models B/C that don't exist in Model A are currently ignored. The output will always have the same layer structure as Model A.

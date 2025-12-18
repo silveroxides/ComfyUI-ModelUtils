@@ -3,7 +3,7 @@ import torch
 import folder_paths
 import comfy.utils
 from safetensors.torch import save_file
-from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES
+from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior
 from .merger_utils import MemoryEfficientSafeOpen
 
 def load_documentation_from_file(filename):
@@ -23,6 +23,7 @@ def _create_two_model_inputs(model_folder_name):
         "model_a": (["None"] + folder_paths.get_filename_list(model_folder_name),),
         "model_b": (["None"] + folder_paths.get_filename_list(model_folder_name),),
         "calc_mode": ([m.name for m in TWO_MODEL_MODES],),
+        "mismatch_mode": (["skip", "zeros", "error"], {"default": "skip"}),
         "alpha": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
         "beta": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
         "gamma": ("FLOAT", {"default": 0.99, "min": 0.0, "max": 1.0, "step": 0.001}),
@@ -39,6 +40,7 @@ def _create_three_model_inputs(model_folder_name):
         "model_b": (["None"] + folder_paths.get_filename_list(model_folder_name),),
         "model_c": (["None"] + folder_paths.get_filename_list(model_folder_name),),
         "calc_mode": ([m.name for m in THREE_MODEL_MODES],),
+        "mismatch_mode": (["skip", "zeros", "error"], {"default": "skip"}),
         "alpha": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
         "beta": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
         "gamma": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
@@ -56,26 +58,64 @@ class MergerLogic:
         if not calc_mode_class: raise ValueError(f"Calc mode '{calc_mode}' not found.")
         primary_model_name = model_names.get('model_a')
         if not primary_model_name or primary_model_name == "None": raise ValueError("Model A is required to run the merge.")
+        
         handlers = {}
         for name in model_names.values():
             if name and name != "None":
                 path = folder_paths.get_full_path(model_type, name)
                 if not path: raise FileNotFoundError(f"Model '{name}' not found.")
                 handlers[name] = MemoryEfficientSafeOpen(path)
+        
         all_keys = handlers[primary_model_name].keys()
         metadata = handlers[primary_model_name].header.get("__metadata__", {})
+        
+        # Convert mismatch_mode string to enum
+        mismatch_mode_str = recipe_params.get('mismatch_mode', 'skip')
+        mismatch_mode = MissingTensorBehavior(mismatch_mode_str)
+        recipe_params['mismatch_mode'] = mismatch_mode
+        
+        # Log mismatched keys for debugging
+        primary_keys = set(all_keys)
+        for name, handler in handlers.items():
+            if name != primary_model_name:
+                secondary_keys = set(handler.keys())
+                missing_in_secondary = primary_keys - secondary_keys
+                extra_in_secondary = secondary_keys - primary_keys
+                if missing_in_secondary:
+                    print(f"[Merger] {name} is missing {len(missing_in_secondary)} keys present in Model A")
+                if extra_in_secondary:
+                    print(f"[Merger] {name} has {len(extra_in_secondary)} extra keys not in Model A (ignored)")
+        
         merged_state_dict = {}
         pbar = comfy.utils.ProgressBar(len(all_keys))
         save_dtype = recipe_params.pop('save_dtype')
         save_torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(save_dtype)
-        recipe_params.update({"handlers": handlers}) # Add handlers, device and dtype are already in
+        recipe_params.update({"handlers": handlers})
+        process_device = recipe_params.get('device', 'cpu')
+        
+        skipped_keys = 0
         for key in all_keys:
             recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
             result = recipe.merge()
+            
+            # Handle None result (mismatch occurred with skip mode)
+            if result is None:
+                # Fall back to Model A's value
+                result = handlers[primary_model_name].get_tensor(key).to(
+                    device=process_device, dtype=torch.float32
+                )
+                skipped_keys += 1
+            
             if isinstance(result, dict):
-                for r_key, r_tensor in result.items(): merged_state_dict[r_key] = r_tensor.to(save_torch_dtype).cpu().clone()
-            else: merged_state_dict[key] = result.to(save_torch_dtype).cpu().clone()
+                for r_key, r_tensor in result.items():
+                    merged_state_dict[r_key] = r_tensor.to(save_torch_dtype).cpu().clone()
+            else:
+                merged_state_dict[key] = result.to(save_torch_dtype).cpu().clone()
             pbar.update(1)
+        
+        if skipped_keys > 0:
+            print(f"[Merger] Used Model A's values for {skipped_keys} keys due to mismatches")
+        
         for handler in handlers.values(): handler.__exit__(None, None, None)
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
         output_dir = folder_paths.get_folder_paths(output_folder)[0]
@@ -89,13 +129,14 @@ class BaseTwoMerger(MergerLogic):
     FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
     RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
 
-    def merge(self, execution_mode, model_a, model_b, calc_mode, alpha, beta, gamma, seed, output_filename, save_dtype, process_device):
+    def merge(self, execution_mode, model_a, model_b, calc_mode, mismatch_mode, alpha, beta, gamma, seed, output_filename, save_dtype, process_device):
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return ("Documentation mode active. No merge performed.", doc)
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32
@@ -108,13 +149,14 @@ class BaseThreeMerger(MergerLogic):
     FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
     RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
 
-    def merge(self, execution_mode, model_a, model_b, model_c, calc_mode, alpha, beta, gamma, delta, seed, output_filename, save_dtype, process_device):
+    def merge(self, execution_mode, model_a, model_b, model_c, calc_mode, mismatch_mode, alpha, beta, gamma, delta, seed, output_filename, save_dtype, process_device):
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return ("Documentation mode active. No merge performed.", doc)
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32

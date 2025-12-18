@@ -78,3 +78,29 @@ class MemoryEfficientSafeOpen:
             return byte_tensor.view(torch.float8_e4m3fn).reshape(shape)
         else:
             raise ValueError(f"Unsupported float8 type: {dtype_str}. Your PyTorch version may be too old.")
+
+
+def get_union_keys(*handlers):
+    """Returns the union of all tensor keys across multiple model handlers.
+    
+    Useful when you want to iterate over all unique keys present in any model.
+    """
+    all_keys = set()
+    for handler in handlers:
+        if handler is not None:
+            all_keys.update(handler.keys())
+    return sorted(all_keys)
+
+
+def get_intersection_keys(*handlers):
+    """Returns only keys present in ALL model handlers.
+    
+    Useful when you want to iterate only over keys that exist in every model.
+    """
+    handlers = [h for h in handlers if h is not None]
+    if not handlers:
+        return []
+    all_keys = set(handlers[0].keys())
+    for handler in handlers[1:]:
+        all_keys &= set(handler.keys())
+    return sorted(all_keys)

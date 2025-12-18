@@ -40,3 +40,22 @@
 - **Alpha:** The Rank (dimension) for the LoRA's standard layers.
 - **Beta:** The Rank (dimension) specifically for 3x3 convolution layers.
 - **Gamma:** The clamp quantile for weight values. `0.99` is a typical value to prevent outlier weights from dominating.
+
+---
+
+## Layer Mismatch Handling
+
+When merging models with different layer structures (e.g., fine-tuned models with added/removed layers, or LoRAs with partial layer coverage), the `mismatch_mode` parameter controls behavior:
+
+| Mode | Behavior |
+|------|----------|
+| `skip` | Missing layers in B use A's values **(default)** |
+| `zeros` | Missing layers in B are treated as zeros |
+| `error` | Fail if any layer is missing |
+
+**Common scenarios:**
+- Merging a fine-tuned model with added/removed layers
+- Combining LoRA-extracted differences with base models
+- Cross-architecture experiments
+
+**Note:** Extra layers in Model B that don't exist in Model A are currently ignored. The output will always have the same layer structure as Model A.

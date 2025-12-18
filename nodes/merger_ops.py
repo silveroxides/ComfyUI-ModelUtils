@@ -1,6 +1,19 @@
 import torch
 import scipy.ndimage
 import torch.nn.functional as F
+from enum import Enum
+
+
+class MissingTensorBehavior(Enum):
+    """Controls behavior when a tensor key is missing from a model."""
+    ERROR = "error"      # Raise exception (strict mode)
+    SKIP = "skip"        # Return None, let caller handle
+    ZEROS = "zeros"      # Return zeros tensor matching shape from primary model
+
+
+class MissingTensorError(Exception):
+    """Raised when a tensor is missing and behavior is ERROR."""
+    pass
 
 # ################# #
 # MERGE OPERATORS
@@ -34,29 +47,62 @@ class Operation:
         return self.merge_func(self)
 
 class LoadTensor(Operation):
-    def __init__(self, key, model_name, handlers, device, dtype):
+    def __init__(self, key, model_name, handlers, device, dtype,
+                 on_missing=MissingTensorBehavior.ERROR, fallback_shape=None, fallback_dtype=None):
         super().__init__(key)
         self.model_name = model_name
         self.handlers = handlers
         self.device = device
         self.dtype = dtype
+        self.on_missing = on_missing
+        self.fallback_shape = fallback_shape
+        self.fallback_dtype = fallback_dtype
 
     def merge(self) -> torch.Tensor:
         if self.model_name not in self.handlers:
             raise ValueError(f"Model '{self.model_name}' is required for this mode but was not provided.")
-        return self.handlers[self.model_name].get_tensor(self.key).to(device=self.device, dtype=self.dtype)
+        
+        handler = self.handlers[self.model_name]
+        if self.key not in handler.keys():
+            if self.on_missing == MissingTensorBehavior.ERROR:
+                raise MissingTensorError(
+                    f"Key '{self.key}' not found in model '{self.model_name}'"
+                )
+            elif self.on_missing == MissingTensorBehavior.SKIP:
+                return None
+            elif self.on_missing == MissingTensorBehavior.ZEROS:
+                if self.fallback_shape is None:
+                    raise ValueError(
+                        f"Cannot create zeros for '{self.key}' without fallback_shape"
+                    )
+                dtype = self.fallback_dtype if self.fallback_dtype else self.dtype
+                return torch.zeros(self.fallback_shape, device=self.device, dtype=dtype)
+        
+        return handler.get_tensor(self.key).to(device=self.device, dtype=self.dtype)
 
 class Multiply(Operation):
     def __init__(self, key, alpha, *sources):
         super().__init__(key, *sources)
         self.alpha = alpha
     def oper(self, a) -> torch.Tensor:
+        if a is None:
+            return None
         return a * self.alpha
+
+
 class Add(Operation):
     def oper(self, a, b) -> torch.Tensor:
+        if a is None:
+            return b
+        if b is None:
+            return a
         return a + b
+
+
 class Sub(Operation):
     def oper(self, a, b) -> torch.Tensor:
+        if a is None or b is None:
+            return None  # Cannot compute difference with missing operand
         return a - b
 
 class SVD(Operation):
@@ -142,9 +188,11 @@ class WeightSum(CalcMode):
     models_used = ['A', 'B']
     param_docs = {'alpha': 'Interpolation weight. 0.0 is 100% Model A, 1.0 is 100% Model B.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_b = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         if kwargs['alpha'] >= 1: return b
         if kwargs['alpha'] <= 0: return a
         c = Multiply(key, 1 - kwargs['alpha'], a)
@@ -156,10 +204,12 @@ class AddDifference(CalcMode):
     models_used = ['A', 'B', 'C']
     param_docs = {'alpha': 'Multiplier for the (B - C) difference.', 'beta': 'Smoothing (0=Off, 1=On).'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
-        c = LoadTensor(key, kwargs['model_c'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_bc = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
+        c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         diff = Sub(key, b, c)
         if kwargs['beta'] == 1: diff = Smooth(key, diff)
         diffm = Multiply(key, kwargs['alpha'], diff)
@@ -170,10 +220,12 @@ class TrainDifference(CalcMode):
     models_used = ['A', 'B', 'C']
     param_docs = {'alpha': 'Multiplier for the calculated difference.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
-        c = LoadTensor(key, kwargs['model_c'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_bc = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
+        c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         diff = TrainDiff(key, a, b, c)
         diffm = Multiply(key, kwargs['alpha'], diff)
         return Add(key, a, diffm)
@@ -183,10 +235,12 @@ class InterpDifference(CalcMode):
     models_used = ['A', 'B']
     param_docs = {'alpha': 'Curve strength.', 'beta': 'Style (0=Similarity, 1=Difference).', 'gamma': 'Mix (0=Random, 1=Linear).'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        if key.startswith('cond_stage_model.transformer.text_model.embeddings'): return LoadTensor(key, kwargs['model_a'], **loader_args)
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_b = {**loader_args_a, "on_missing": mismatch_mode}
+        if key.startswith('cond_stage_model.transformer.text_model.embeddings'): return LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         return InterpolateDifference(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
 class Extract(CalcMode):
     name = 'Extract-Features'
@@ -194,10 +248,12 @@ class Extract(CalcMode):
     models_used = ['A', 'B', 'C']
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Similarity vs dissimilarity.', 'gamma': 'Similarity bias.', 'delta': 'Multiplier for final features.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
-        c = LoadTensor(key, kwargs['model_c'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_bc = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
+        c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = ExtractOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'] * 15, a, b, c)
         multiplied = Multiply(key, kwargs['delta'], extracted)
         return Add(key, a, multiplied)
@@ -207,10 +263,12 @@ class AddDisimilarity(CalcMode):
     models_used = ['A', 'B', 'C']
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Multiplier for final features.', 'gamma': 'Similarity bias.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
-        c = LoadTensor(key, kwargs['model_c'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_bc = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
+        c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = Similarities(key, kwargs['alpha'], 1, kwargs['gamma'] * 15, b, c)
         multiplied = Multiply(key, kwargs['beta'], extracted)
         return Add(key, a, multiplied)
@@ -220,22 +278,26 @@ class PowerUp(CalcMode):
     models_used = ['A', 'B']
     param_docs = {'alpha': 'Dropout rate (proportion of weights from B to *drop*).', 'beta': 'Multiplier for the final difference.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_b = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         deltahat = PowerUpOp(key, kwargs['alpha'], kwargs['seed'], a, b)
         res = Multiply(key, kwargs['beta'], deltahat)
         return Add(key, a, res)
-class SVD(CalcMode):
+class SVDMode(CalcMode):
     name = 'SVD LoRA Extraction'
     description = 'Extracts the difference between B and A into a LoRA file.'
     models_used = ['A', 'B']
     param_docs = {'alpha': 'Rank for standard layers.', 'beta': 'Rank for 3x3 conv layers.', 'gamma': 'Clamp quantile for weights.'}
     def create_recipe(self, key, **kwargs):
-        loader_args = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
-        a = LoadTensor(key, kwargs['model_a'], **loader_args)
-        b = LoadTensor(key, kwargs['model_b'], **loader_args)
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+        loader_args_b = {**loader_args_a, "on_missing": mismatch_mode}
+        a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         return SVD(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
 
-TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVD()]
+TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVDMode()]
 THREE_MODEL_MODES = [AddDifference(), TrainDifference(), Extract(), AddDisimilarity()]
