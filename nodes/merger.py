@@ -3,7 +3,7 @@ import torch
 import folder_paths
 import comfy.utils
 from safetensors.torch import save_file
-from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior
+from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
 from .merger_utils import MemoryEfficientSafeOpen
 
 def load_documentation_from_file(filename):
@@ -66,25 +66,28 @@ class MergerLogic:
                 if not path: raise FileNotFoundError(f"Model '{name}' not found.")
                 handlers[name] = MemoryEfficientSafeOpen(path)
         
-        all_keys = handlers[primary_model_name].keys()
-        metadata = handlers[primary_model_name].header.get("__metadata__", {})
+        primary_handler = handlers[primary_model_name]
+        all_keys = primary_handler.keys()
+        metadata = primary_handler.header.get("__metadata__", {})
         
         # Convert mismatch_mode string to enum
         mismatch_mode_str = recipe_params.get('mismatch_mode', 'skip')
         mismatch_mode = MissingTensorBehavior(mismatch_mode_str)
         recipe_params['mismatch_mode'] = mismatch_mode
         
-        # Log mismatched keys for debugging
+        # Pre-compute key differences for logging
         primary_keys = set(all_keys)
+        mismatch_report = {}
         for name, handler in handlers.items():
             if name != primary_model_name:
                 secondary_keys = set(handler.keys())
-                missing_in_secondary = primary_keys - secondary_keys
-                extra_in_secondary = secondary_keys - primary_keys
-                if missing_in_secondary:
-                    print(f"[Merger] {name} is missing {len(missing_in_secondary)} keys present in Model A")
-                if extra_in_secondary:
-                    print(f"[Merger] {name} has {len(extra_in_secondary)} extra keys not in Model A (ignored)")
+                missing = primary_keys - secondary_keys
+                extra = secondary_keys - primary_keys
+                mismatch_report[name] = {"missing": missing, "extra": extra}
+                if missing:
+                    print(f"[Merger] {name} is missing {len(missing)} keys present in Model A")
+                if extra:
+                    print(f"[Merger] {name} has {len(extra)} extra keys not in Model A (ignored)")
         
         merged_state_dict = {}
         pbar = comfy.utils.ProgressBar(len(all_keys))
@@ -92,18 +95,34 @@ class MergerLogic:
         save_torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(save_dtype)
         recipe_params.update({"handlers": handlers})
         process_device = recipe_params.get('device', 'cpu')
+        process_dtype = recipe_params.get('dtype', torch.float32)
         
         skipped_keys = 0
+        error_keys = []
+        
         for key in all_keys:
-            recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
-            result = recipe.merge()
+            # Pre-load Model A's tensor - this is always required and serves as reference
+            tensor_a = primary_handler.get_tensor(key).to(device=process_device, dtype=process_dtype)
+            
+            # Pass tensor_a metadata to recipes for zeros mode and fallback
+            recipe_params['_tensor_a'] = tensor_a  # For operations that need reference
+            recipe_params['_tensor_a_shape'] = tensor_a.shape
+            recipe_params['_tensor_a_dtype'] = tensor_a.dtype
+            
+            try:
+                recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
+                result = recipe.merge()
+            except MissingTensorError as e:
+                if mismatch_mode == MissingTensorBehavior.ERROR:
+                    # Re-raise to fail the entire merge
+                    raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
+                # This shouldn't happen in skip/zeros mode, but handle gracefully
+                result = None
+                error_keys.append(key)
             
             # Handle None result (mismatch occurred with skip mode)
             if result is None:
-                # Fall back to Model A's value
-                result = handlers[primary_model_name].get_tensor(key).to(
-                    device=process_device, dtype=torch.float32
-                )
+                result = tensor_a  # Use pre-loaded Model A tensor
                 skipped_keys += 1
             
             if isinstance(result, dict):
@@ -111,10 +130,15 @@ class MergerLogic:
                     merged_state_dict[r_key] = r_tensor.to(save_torch_dtype).cpu().clone()
             else:
                 merged_state_dict[key] = result.to(save_torch_dtype).cpu().clone()
+            
+            # Clean up tensor_a reference to allow GC
+            del recipe_params['_tensor_a']
             pbar.update(1)
         
         if skipped_keys > 0:
             print(f"[Merger] Used Model A's values for {skipped_keys} keys due to mismatches")
+        if error_keys:
+            print(f"[Merger] Unexpected errors on {len(error_keys)} keys: {error_keys[:5]}{'...' if len(error_keys) > 5 else ''}")
         
         for handler in handlers.values(): handler.__exit__(None, None, None)
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
