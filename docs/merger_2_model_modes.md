@@ -40,3 +40,48 @@
 - **Alpha:** The Rank (dimension) for the LoRA's standard layers.
 - **Beta:** The Rank (dimension) specifically for 3x3 convolution layers.
 - **Gamma:** The clamp quantile for weight values. `0.99` is a typical value to prevent outlier weights from dominating.
+
+---
+
+## Layer Mismatch Handling
+
+When merging models with different layer structures (e.g., fine-tuned models with added/removed layers, or LoRAs with partial layer coverage), the `mismatch_mode` parameter controls behavior:
+
+| Mode | Behavior |
+|------|----------|
+| `skip` | Missing layers in B use A's values **(default)** |
+| `zeros` | Missing layers in B are treated as zeros |
+| `error` | Fail if any layer is missing |
+
+**Common scenarios:**
+- Merging a fine-tuned model with added/removed layers
+- Combining LoRA-extracted differences with base models
+- Cross-architecture experiments
+
+**Note:** Extra layers in Model B that don't exist in Model A are currently ignored. The output will always have the same layer structure as Model A.
+
+---
+
+## Layer Filtering (Regex Patterns)
+
+Use regex patterns to control which layers are merged:
+
+### `exclude_patterns`
+Layers matching any pattern will **keep Model A's values only** (no merge).
+
+### `discard_patterns`
+Layers matching any pattern will be **removed entirely** from the output.
+
+**Pattern format:**
+- Whitespace-separated regex patterns
+- Patterns use **substring matching** (not full match)
+- Example: `text_model lora` matches any key containing "text_model" OR "lora"
+- Example: `layer\.[0-5]\.` matches layers 0-5 using regex syntax
+
+**Pattern Examples:**
+| Pattern | Matches |
+|---------|---------|
+| `text_model` | All text encoder layers |
+| `\.norm` | All normalization layers |
+| `attn\.(q\|k\|v)` | Query, key, value attention weights |
+| `block\.[0-9]\.` | Blocks 0-9 |
