@@ -22,7 +22,10 @@ from .nodes.merger import (
 from .nodes.lora_extract import (
     LoRASaveFromFile, LoRACheckpointSaveFromFile
 )
-from .nodes.lycoris_extract import LyCORISExtractFromFile
+from .nodes.lycoris_extract import (
+    LyCORISExtractFixed, LyCORISExtractThreshold,
+    LyCORISExtractRatio, LyCORISExtractQuantile, LyCORISExtractFull
+)
 
 
 class ModelUtilsExtension(ComfyExtension):
@@ -47,9 +50,11 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Extraction
             LoRASaveFromFile, LoRACheckpointSaveFromFile,
             # LyCORIS Extraction
-            LyCORISExtractFromFile,
+            LyCORISExtractFixed, LyCORISExtractThreshold,
+            LyCORISExtractRatio, LyCORISExtractQuantile, LyCORISExtractFull,
         ]
 
 
 async def comfy_entrypoint() -> ModelUtilsExtension:
     return ModelUtilsExtension()
+

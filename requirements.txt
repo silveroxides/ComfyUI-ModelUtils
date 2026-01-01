@@ -1,1 +1,1 @@
-lycoris
+lycoris-lora
