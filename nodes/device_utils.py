@@ -44,10 +44,10 @@ class DeviceCapabilities:
 def get_device_capabilities(device: Optional[torch.device] = None) -> DeviceCapabilities:
     """
     Analyze device capabilities for optimal I/O configuration.
-    
+
     Args:
         device: Target device (default: ComfyUI's torch device)
-        
+
     Returns:
         DeviceCapabilities dataclass with recommended settings
     """
@@ -56,14 +56,14 @@ def get_device_capabilities(device: Optional[torch.device] = None) -> DeviceCapa
             device = get_torch_device()
         else:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     device_type = device.type if hasattr(device, 'type') else 'cpu'
-    
+
     # Get RAM info
     ram_info = psutil.virtual_memory()
     total_ram_gb = ram_info.total / (1024**3)
     free_ram_gb = ram_info.available / (1024**3)
-    
+
     # Get VRAM info
     if device_type == 'cuda' and torch.cuda.is_available():
         if COMFY_AVAILABLE:
@@ -85,10 +85,10 @@ def get_device_capabilities(device: Optional[torch.device] = None) -> DeviceCapa
         free_vram_gb = 0
         supports_pinned = False
         supports_async = False
-    
+
     # CPU cores
     cpu_cores = os.cpu_count() or 4
-    
+
     # Recommended workers based on hardware
     if device_type == 'cuda':
         # GPU: fewer workers since I/O is not the bottleneck
@@ -96,13 +96,13 @@ def get_device_capabilities(device: Optional[torch.device] = None) -> DeviceCapa
     else:
         # CPU: more workers for parallel I/O
         recommended_workers = min(8, cpu_cores)
-    
+
     # Max tensor size: leave headroom for operations
     if device_type == 'cuda':
         max_tensor_gb = min(free_vram_gb * 0.8, free_ram_gb * 0.5)
     else:
         max_tensor_gb = free_ram_gb * 0.6
-    
+
     return DeviceCapabilities(
         device_type=device_type,
         total_vram_gb=total_vram_gb,
@@ -132,26 +132,26 @@ def can_fit_in_memory(
 ) -> Tuple[bool, str]:
     """
     Check if models can fit in available memory.
-    
+
     Args:
         model_paths: List of model file paths
         device: Target device
         safety_factor: Fraction of free memory to use (default 0.8)
-        
+
     Returns:
         (can_fit, reason_message)
     """
     caps = get_device_capabilities(device)
-    
+
     total_size = sum(estimate_model_size(p) for p in model_paths)
-    
+
     if caps.device_type == 'cuda':
         available = caps.free_vram_gb * safety_factor
         mem_type = "VRAM"
     else:
         available = caps.free_ram_gb * safety_factor
         mem_type = "RAM"
-    
+
     if total_size <= available:
         return True, f"OK: {total_size:.2f}GB needed, {available:.2f}GB {mem_type} available"
     else:
@@ -164,11 +164,11 @@ def prepare_for_large_operation(
 ) -> bool:
     """
     Prepare device for a large memory operation by freeing resources.
-    
+
     Args:
         estimated_memory_gb: Estimated memory needed in GB
         device: Target device
-        
+
     Returns:
         True if preparation succeeded
     """
@@ -177,12 +177,12 @@ def prepare_for_large_operation(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return True
-    
+
     if device is None:
         device = get_torch_device()
-    
+
     memory_bytes = int(estimated_memory_gb * 1024**3)
-    
+
     # Use ComfyUI's free_memory which unloads models intelligently
     try:
         free_memory(memory_bytes, device)
@@ -195,7 +195,7 @@ def prepare_for_large_operation(
 def cleanup_after_operation():
     """Clean up memory after a large operation."""
     gc.collect()
-    
+
     if COMFY_AVAILABLE:
         soft_empty_cache()
     elif torch.cuda.is_available():
@@ -209,35 +209,35 @@ def get_optimal_workers(
 ) -> int:
     """
     Calculate optimal number of I/O workers based on model size and device.
-    
+
     Args:
         model_size_gb: Model size in GB
         caps: Pre-calculated device capabilities (optional)
-        
+
     Returns:
         Recommended number of workers
     """
     if caps is None:
         caps = get_device_capabilities()
-    
+
     # For very large models, fewer workers to avoid memory pressure
     if model_size_gb > caps.free_ram_gb * 0.5:
         return max(1, caps.recommended_workers // 2)
-    
+
     # For small models, use more workers
     if model_size_gb < 2.0:
         return min(8, caps.cpu_cores)
-    
+
     return caps.recommended_workers
 
 
 def get_processing_device_string(prefer_cuda: bool = True) -> str:
     """
     Get the best available processing device as a string.
-    
+
     Args:
         prefer_cuda: Prefer CUDA over CPU if available
-        
+
     Returns:
         Device string ('cuda', 'mps', 'cpu')
     """

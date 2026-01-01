@@ -26,11 +26,11 @@ def _get_metakeys(model_name: str, model_type: str) -> tuple[str, str]:
         header_size = struct.unpack("<Q", f.read(8))[0]
         header_json = f.read(header_size).decode("utf-8")
     header = json.loads(header_json)
-    
+
     # Extract metadata and layer shapes from header
     metadata = header.pop("__metadata__", {})
     metadata_str = str(metadata)
-    
+
     layer_shapes = ""
     keys = [k for k in header.keys()]
     pbar = comfy.utils.ProgressBar(len(keys))
@@ -40,7 +40,7 @@ def _get_metakeys(model_name: str, model_type: str) -> tuple[str, str]:
         name_shape = f"{layer_name}, {shape}\n"
         layer_shapes += name_shape
         pbar.update(1)
-    
+
     return metadata_str, layer_shapes
 
 

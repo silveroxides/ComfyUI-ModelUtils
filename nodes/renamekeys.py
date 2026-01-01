@@ -10,7 +10,7 @@ from .merger_utils import MemoryEfficientSafeOpen
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
 
-def _rename_keys(model_name: str, model_type: str, old_keys_str: str, 
+def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
                  new_keys_str: str, output_filename: str) -> str:
     """Shared logic for all RenameKeys nodes."""
     model_path = folder_paths.get_full_path_or_raise(model_type, model_name)
@@ -56,7 +56,7 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     save_file(renamed_tensors, output_path, metadata)
-    
+
     # Cleanup after operation
     del renamed_tensors
     cleanup_after_operation()
@@ -87,9 +87,9 @@ class ModelRenameKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, diffusionmodel_name: str, old_keys: str, 
+    def execute(cls, diffusionmodel_name: str, old_keys: str,
                 new_keys: str, output_filename: str) -> io.NodeOutput:
-        path = _rename_keys(diffusionmodel_name, "diffusion_models", 
+        path = _rename_keys(diffusionmodel_name, "diffusion_models",
                            old_keys, new_keys, output_filename)
         return io.NodeOutput(path)
 
@@ -117,9 +117,9 @@ class TextEncoderRenameKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, textencoder_name: str, old_keys: str, 
+    def execute(cls, textencoder_name: str, old_keys: str,
                 new_keys: str, output_filename: str) -> io.NodeOutput:
-        path = _rename_keys(textencoder_name, "text_encoders", 
+        path = _rename_keys(textencoder_name, "text_encoders",
                            old_keys, new_keys, output_filename)
         return io.NodeOutput(path)
 
@@ -147,9 +147,9 @@ class LoRARenameKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name: str, old_keys: str, 
+    def execute(cls, lora_name: str, old_keys: str,
                 new_keys: str, output_filename: str) -> io.NodeOutput:
-        path = _rename_keys(lora_name, "loras", 
+        path = _rename_keys(lora_name, "loras",
                            old_keys, new_keys, output_filename)
         return io.NodeOutput(path)
 
@@ -177,9 +177,9 @@ class CheckpointRenameKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, ckpt_name: str, old_keys: str, 
+    def execute(cls, ckpt_name: str, old_keys: str,
                 new_keys: str, output_filename: str) -> io.NodeOutput:
-        path = _rename_keys(ckpt_name, "checkpoints", 
+        path = _rename_keys(ckpt_name, "checkpoints",
                            old_keys, new_keys, output_filename)
         return io.NodeOutput(path)
 
@@ -207,8 +207,8 @@ class EmbeddingRenameKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, embedding: str, old_keys: str, 
+    def execute(cls, embedding: str, old_keys: str,
                 new_keys: str, output_filename: str) -> io.NodeOutput:
-        path = _rename_keys(embedding, "embeddings", 
+        path = _rename_keys(embedding, "embeddings",
                            old_keys, new_keys, output_filename)
         return io.NodeOutput(path)

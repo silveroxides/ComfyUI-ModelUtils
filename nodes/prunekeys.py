@@ -11,7 +11,7 @@ from .merger_utils import MemoryEfficientSafeOpen
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
 
-def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str, 
+def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
                 use_regex: bool, output_filename: str) -> str:
     """Shared logic for all PruneKeys nodes."""
     model_path = folder_paths.get_full_path_or_raise(model_type, model_name)
@@ -62,7 +62,7 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     save_file(pruned_tensors, output_path, metadata)
-    
+
     # Cleanup after operation
     del pruned_tensors
     cleanup_after_operation()
@@ -93,9 +93,9 @@ class ModelPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, diffusionmodel_name: str, keys_to_prune: str, 
+    def execute(cls, diffusionmodel_name: str, keys_to_prune: str,
                 use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(diffusionmodel_name, "diffusion_models", 
+        path = _prune_keys(diffusionmodel_name, "diffusion_models",
                           keys_to_prune, use_regex, output_filename)
         return io.NodeOutput(path)
 
@@ -123,9 +123,9 @@ class TextEncoderPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, textencoder_name: str, keys_to_prune: str, 
+    def execute(cls, textencoder_name: str, keys_to_prune: str,
                 use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(textencoder_name, "text_encoders", 
+        path = _prune_keys(textencoder_name, "text_encoders",
                           keys_to_prune, use_regex, output_filename)
         return io.NodeOutput(path)
 
@@ -153,9 +153,9 @@ class LoRAPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name: str, keys_to_prune: str, 
+    def execute(cls, lora_name: str, keys_to_prune: str,
                 use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(lora_name, "loras", 
+        path = _prune_keys(lora_name, "loras",
                           keys_to_prune, use_regex, output_filename)
         return io.NodeOutput(path)
 
@@ -183,9 +183,9 @@ class CheckpointPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, ckpt_name: str, keys_to_prune: str, 
+    def execute(cls, ckpt_name: str, keys_to_prune: str,
                 use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(ckpt_name, "checkpoints", 
+        path = _prune_keys(ckpt_name, "checkpoints",
                           keys_to_prune, use_regex, output_filename)
         return io.NodeOutput(path)
 
@@ -213,8 +213,8 @@ class EmbeddingPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, embedding: str, keys_to_prune: str, 
+    def execute(cls, embedding: str, keys_to_prune: str,
                 use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(embedding, "embeddings", 
+        path = _prune_keys(embedding, "embeddings",
                           keys_to_prune, use_regex, output_filename)
         return io.NodeOutput(path)
