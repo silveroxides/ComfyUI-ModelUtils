@@ -143,6 +143,59 @@ def _compute_rank(S: torch.Tensor, mode: str, mode_param: float,
 # SVD Extraction Functions
 # =============================================================================
 
+def _svd_extract_linear_lowrank(
+    weight: torch.Tensor,
+    rank: int,
+    device: str,
+    clamp_quantile: float = 0.99,
+) -> tuple:
+    """
+    Low-rank SVD decomposition using svd_lowrank for fixed rank extraction.
+    
+    Much faster than full SVD when rank << min(m, n) because it only computes
+    the top-k singular values using randomized algorithms.
+    
+    Returns:
+        (lora_down, lora_up, diff), "low rank" or (weight, "full")
+    """
+    weight = weight.to(device=device, dtype=torch.float32)
+    out_dim, in_dim = weight.shape
+    
+    # Clamp rank to valid range
+    max_possible_rank = min(out_dim, in_dim)
+    rank = max(1, min(rank, max_possible_rank - 1))
+    
+    # Check if decomposition is worthwhile
+    if rank >= max_possible_rank // 2:
+        return weight, "full"
+    
+    # Use svd_lowrank for faster low-rank approximation
+    # niter controls accuracy (higher = more accurate but slower)
+    try:
+        U, S, V = torch.svd_lowrank(weight, q=rank, niter=2)
+        # U: [out_dim, rank], S: [rank], V: [in_dim, rank]
+        Vh = V.T  # [rank, in_dim]
+    except Exception as e:
+        raise RuntimeError(f"svd_lowrank failed: {e}")
+    
+    # Clamp outliers
+    if clamp_quantile < 1.0 and len(S) > 0:
+        try:
+            max_val = torch.quantile(S, clamp_quantile)
+            S = S.clamp(max=max_val)
+        except RuntimeError:
+            pass
+    
+    # Construct LoRA matrices
+    lora_up = U @ torch.diag(S)  # [out_dim, rank]
+    lora_down = Vh               # [rank, in_dim]
+    
+    # Compute reconstruction diff
+    diff = weight - (lora_up @ lora_down)
+    
+    return (lora_down, lora_up, diff), "low rank"
+
+
 def _svd_extract_linear(
     weight: torch.Tensor,
     mode: str,
@@ -154,19 +207,29 @@ def _svd_extract_linear(
     """
     SVD decomposition for linear layers.
 
+    For fixed rank mode, uses svd_lowrank which is much faster.
+    For adaptive modes, uses full SVD to analyze all singular values.
+
     Returns:
         (lora_down, lora_up, rank), "low rank" or (weight, "full")
     """
     weight = weight.to(device=device, dtype=torch.float32)
     out_dim, in_dim = weight.shape
+    
+    # For fixed rank, use the faster svd_lowrank
+    if mode == "fixed" and mode_param > 0:
+        target_rank = int(mode_param)
+        if max_rank is not None:
+            target_rank = min(target_rank, max_rank)
+        return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile)
 
-    # SVD decomposition
+    # For adaptive modes, use full SVD to analyze singular values
     try:
         U, S, Vh = linalg.svd(weight, full_matrices=False)
     except Exception as e:
         raise RuntimeError(f"SVD failed: {e}")
 
-    # Compute rank
+    # Compute rank based on mode
     rank = _compute_rank(S, mode, mode_param, max_rank)
 
     # Check if decomposition is worthwhile
@@ -546,7 +609,7 @@ def _get_model_inputs():
 
 def _get_common_inputs():
     return [
-        io.Boolean.Input("chunk_large_layers", default=True,
+        io.Boolean.Input("chunk_large_layers", default=False,
                         tooltip="Split large fused layers (QKV, MLP) into chunks"),
         io.Float.Input("clamp_quantile", default=0.99, min=0.5, max=1.0, step=0.01,
                       tooltip="Clamp outlier singular values"),
