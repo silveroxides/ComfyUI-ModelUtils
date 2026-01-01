@@ -47,6 +47,106 @@ def _matches_any_pattern(key: str, patterns: list) -> bool:
     return False
 
 
+def _detect_fused_layer(key: str, shape: tuple) -> int:
+    """
+    Detect if a layer is a fused QKV/KV/MLP layer and return the number of chunks.
+    
+    Returns:
+        Number of chunks (2, 3, 4) or 1 if not a fused layer
+    """
+    if len(shape) != 2:
+        return 1
+    
+    out_dim, in_dim = shape
+    key_lower = key.lower()
+    
+    # QKV layers (3 chunks: Q, K, V)
+    if "qkv" in key_lower:
+        if out_dim % 3 == 0 and out_dim // 3 >= in_dim // 4:
+            return 3
+    
+    # KV layers (2 chunks: K, V) - some architectures use this
+    if "kv" in key_lower and "qkv" not in key_lower:
+        if out_dim % 2 == 0:
+            return 2
+    
+    # MLP layers with fused gate/up (2 chunks) - e.g., linear1 in Flux
+    if "linear1" in key_lower or "gate_up" in key_lower or "mlp.0" in key_lower:
+        if out_dim % 2 == 0 and out_dim >= in_dim * 2:
+            return 2
+    
+    # Large layers that might benefit from chunking (heuristic)
+    # If output dim is very large relative to input
+    if out_dim > in_dim * 2 and out_dim % 2 == 0:
+        return 2
+    
+    return 1
+
+
+def _extract_chunked_layer(
+    weight_diff: torch.Tensor,
+    num_chunks: int,
+    mode: str,
+    mode_param: float,
+    process_device: str,
+    save_torch_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Extract LoRA from a fused layer by chunking, extracting each chunk, and recombining.
+    
+    Returns:
+        (lora_up, lora_down, rank) concatenated from all chunks
+    """
+    out_dim, in_dim = weight_diff.shape
+    chunk_size = out_dim // num_chunks
+    
+    all_lora_up = []
+    all_lora_down = []
+    
+    for i in range(num_chunks):
+        chunk = weight_diff[i * chunk_size:(i + 1) * chunk_size, :]
+        
+        # Extract this chunk with fixed mode (dynamic modes fail on large tensors)
+        try:
+            result, decompose_mode = extract_linear(
+                chunk,
+                mode=mode,
+                mode_param=int(mode_param) if mode == "fixed" else mode_param,
+                device=process_device,
+            )
+        except RuntimeError:
+            # Fallback to fixed mode
+            fallback_rank = min(64, min(chunk.shape[0], chunk.shape[1]) // 4)
+            fallback_rank = max(1, fallback_rank)
+            result, decompose_mode = extract_linear(
+                chunk,
+                mode="fixed",
+                mode_param=fallback_rank,
+                device=process_device,
+            )
+        
+        if decompose_mode == "full":
+            # Can't concatenate full diffs as LoRA, use as-is
+            return None, None, 0
+        
+        extract_a, extract_b, _ = result
+        all_lora_down.append(extract_a)  # [rank, in_dim]
+        all_lora_up.append(extract_b)    # [chunk_size, rank]
+    
+    # Concatenate lora_up along output dimension
+    # Each lora_up is [chunk_size, rank], concat to [out_dim, rank]
+    combined_lora_up = torch.cat(all_lora_up, dim=0)
+    
+    # For lora_down, we need to handle differently
+    # Each lora_down is [rank, in_dim] - we can average them or use the first
+    # Using average maintains information from all chunks
+    combined_lora_down = torch.stack(all_lora_down, dim=0).mean(dim=0)
+    
+    rank = combined_lora_down.shape[0]
+    
+    return combined_lora_up, combined_lora_down, rank
+
+
 def lycoris_extract_from_files(
     model_a_path: str,
     model_b_path: str,
@@ -61,6 +161,7 @@ def lycoris_extract_from_files(
     use_cp: bool = True,
     use_sparse_bias: bool = False,
     sparsity: float = 0.98,
+    chunk_fused_layers: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Memory-efficient LyCORIS extraction by streaming tensors from safetensors files.
@@ -79,6 +180,7 @@ def lycoris_extract_from_files(
         use_cp: Use CP decomposition for 3x3 convolutions
         use_sparse_bias: Enable sparse bias storage
         sparsity: Sparsity threshold for sparse bias (0-1)
+        chunk_fused_layers: Split large fused layers (QKV, MLP) into chunks for extraction
     """
     if not LYCORIS_AVAILABLE:
         raise ImportError("lycoris library not installed. Install with: pip install lycoris-lora")
@@ -182,17 +284,73 @@ def lycoris_extract_from_files(
                         mode_param=int(linear_param) if mode == "fixed" else linear_param,
                         device=process_device,
                     )
-                
-                if decompose_mode == "full":
-                    output_sd[f"{lora_name}.diff"] = weight_diff.to(save_torch_dtype).cpu()
-                    full_weights += 1
-                elif decompose_mode == "low rank":
-                    extract_a, extract_b, diff = result
+            except Exception as e:
+                error_str = str(e).lower()
+                if "quantile" in error_str and "too large" in error_str:
+                    # Check if we should use chunked extraction
+                    if chunk_fused_layers and not is_conv:
+                        num_chunks = _detect_fused_layer(key, weight_diff.shape)
+                        if num_chunks > 1:
+                            print(f"[LyCORIS Extract] Chunked extraction for {key}: {num_chunks} chunks")
+                            try:
+                                lora_up, lora_down, rank = _extract_chunked_layer(
+                                    weight_diff, num_chunks, mode, linear_param,
+                                    process_device, save_torch_dtype
+                                )
+                                if lora_up is not None:
+                                    output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu()
+                                    output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu()
+                                    output_sd[f"{lora_name}.alpha"] = torch.tensor([rank]).to(save_torch_dtype)
+                                    low_rank_weights += 1
+                                    del weight_diff
+                                    pbar.update(1)
+                                    continue
+                            except Exception as e_chunk:
+                                print(f"[LyCORIS Extract] Chunked extraction failed: {e_chunk}")
                     
-                    # CP decomposition for 3x3 convs
-                    if is_conv and not is_linear_conv and use_cp:
-                        if extract_a.ndim == 4 and extract_a.shape[2] > 1:
-                            dim = extract_a.size(0)
+                    # Fallback: use fixed mode with reasonable rank for large tensors
+                    fallback_rank = min(64, min(weight_diff.shape[0], weight_diff.shape[1]) // 4)
+                    fallback_rank = max(1, fallback_rank)
+                    print(f"[LyCORIS Extract] Large tensor fallback for {key}: using fixed rank {fallback_rank}")
+                    try:
+                        if is_conv:
+                            result, decompose_mode = extract_conv(
+                                weight_diff,
+                                mode="fixed",
+                                mode_param=fallback_rank,
+                                device=process_device,
+                                is_cp=use_cp and not is_linear_conv,
+                            )
+                        else:
+                            result, decompose_mode = extract_linear(
+                                weight_diff,
+                                mode="fixed",
+                                mode_param=fallback_rank,
+                                device=process_device,
+                            )
+                    except Exception as e2:
+                        print(f"[LyCORIS Extract] Could not extract for {key}: {e2}")
+                        del weight_diff
+                        pbar.update(1)
+                        continue
+                else:
+                    print(f"[LyCORIS Extract] Could not extract for {key}: {e}")
+                    del weight_diff
+                    pbar.update(1)
+                    continue
+            
+            # Process extraction result
+            if decompose_mode == "full":
+                output_sd[f"{lora_name}.diff"] = weight_diff.to(save_torch_dtype).cpu()
+                full_weights += 1
+            elif decompose_mode == "low rank":
+                extract_a, extract_b, diff = result
+                
+                # CP decomposition for 3x3 convs
+                if is_conv and not is_linear_conv and use_cp:
+                    if extract_a.ndim == 4 and extract_a.shape[2] > 1:
+                        dim = extract_a.size(0)
+                        try:
                             (extract_c, extract_a_new, _), _ = extract_conv(
                                 extract_a.transpose(0, 1),
                                 "fixed",
@@ -204,28 +362,35 @@ def lycoris_extract_from_files(
                             extract_c = extract_c.transpose(0, 1)
                             output_sd[f"{lora_name}.lora_mid.weight"] = extract_c.to(save_torch_dtype).cpu()
                             extract_a = extract_a_new
-                    
-                    output_sd[f"{lora_name}.lora_down.weight"] = extract_a.to(save_torch_dtype).cpu()
-                    output_sd[f"{lora_name}.lora_up.weight"] = extract_b.to(save_torch_dtype).cpu()
-                    output_sd[f"{lora_name}.alpha"] = torch.tensor([extract_a.shape[0]]).to(save_torch_dtype)
-                    
-                    # Sparse bias storage
-                    if use_sparse_bias and diff is not None:
+                        except Exception:
+                            pass  # Skip CP decomposition on error
+                
+                output_sd[f"{lora_name}.lora_down.weight"] = extract_a.to(save_torch_dtype).cpu()
+                output_sd[f"{lora_name}.lora_up.weight"] = extract_b.to(save_torch_dtype).cpu()
+                output_sd[f"{lora_name}.alpha"] = torch.tensor([extract_a.shape[0]]).to(save_torch_dtype)
+                
+                # Sparse bias storage
+                if use_sparse_bias and diff is not None:
+                    try:
                         diff_flat = diff.detach().cpu().reshape(extract_b.size(0), -1)
                         abs_diff = torch.abs(diff_flat)
-                        threshold = float(torch.quantile(abs_diff, sparsity))
+                        # Use numpy for large tensor quantile
+                        if abs_diff.numel() > 10_000_000:
+                            import numpy as np
+                            threshold = float(np.quantile(abs_diff.numpy().flatten(), sparsity))
+                        else:
+                            threshold = float(torch.quantile(abs_diff, sparsity))
                         sparse_diff = diff_flat.masked_fill(abs_diff < threshold, 0).to_sparse().coalesce()
                         
                         if sparse_diff._nnz() > 0:
                             output_sd[f"{lora_name}.bias_indices"] = sparse_diff.indices().to(torch.int16)
                             output_sd[f"{lora_name}.bias_values"] = sparse_diff.values().to(save_torch_dtype)
                             output_sd[f"{lora_name}.bias_size"] = torch.tensor(diff_flat.shape).to(torch.int16)
-                    
-                    low_rank_weights += 1
-                    del extract_a, extract_b, diff
+                    except Exception:
+                        pass  # Skip sparse bias on error
                 
-            except Exception as e:
-                print(f"[LyCORIS Extract] Could not extract for {key}: {e}")
+                low_rank_weights += 1
+                del extract_a, extract_b, diff
             
             del weight_diff
             pbar.update(1)
@@ -286,6 +451,9 @@ def _get_common_optional_inputs():
                         tooltip="Enable sparse bias storage for residual error compensation"),
         io.Float.Input("sparsity", default=0.98, min=0.0, max=1.0, step=0.01,
                       tooltip="Sparsity threshold for sparse bias (higher = more sparse, smaller file)"),
+        io.Boolean.Input("chunk_fused_layers", default=True,
+                        tooltip="Split large fused layers (QKV, MLP) into chunks for extraction. "
+                                "Helps with large models like Flux. Disable for simple fixed-rank fallback."),
         io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip",
                       tooltip="How to handle missing keys or shape mismatches"),
         io.String.Input("output_filename", default="extracted_lycoris",
@@ -323,8 +491,8 @@ class LyCORISExtractFixed(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, use_cp, use_sparse_bias,
-                sparsity, mismatch_mode, output_filename, save_dtype, process_device,
-                skip_patterns) -> io.NodeOutput:
+                sparsity, chunk_fused_layers, mismatch_mode, output_filename, save_dtype,
+                process_device, skip_patterns) -> io.NodeOutput:
         if not LYCORIS_AVAILABLE:
             raise ImportError("lycoris library not installed. Install with: pip install lycoris-lora")
         
@@ -345,6 +513,7 @@ class LyCORISExtractFixed(io.ComfyNode):
             use_cp=use_cp,
             use_sparse_bias=use_sparse_bias,
             sparsity=sparsity,
+            chunk_fused_layers=chunk_fused_layers,
         )
         
         return io.NodeOutput(_save_lycoris(output_sd, output_filename))
@@ -375,8 +544,8 @@ class LyCORISExtractThreshold(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_a, model_b, linear_threshold, conv_threshold, use_cp, 
-                use_sparse_bias, sparsity, mismatch_mode, output_filename, save_dtype,
-                process_device, skip_patterns) -> io.NodeOutput:
+                use_sparse_bias, sparsity, chunk_fused_layers, mismatch_mode, output_filename,
+                save_dtype, process_device, skip_patterns) -> io.NodeOutput:
         if not LYCORIS_AVAILABLE:
             raise ImportError("lycoris library not installed. Install with: pip install lycoris-lora")
         
@@ -397,6 +566,7 @@ class LyCORISExtractThreshold(io.ComfyNode):
             use_cp=use_cp,
             use_sparse_bias=use_sparse_bias,
             sparsity=sparsity,
+            chunk_fused_layers=chunk_fused_layers,
         )
         
         return io.NodeOutput(_save_lycoris(output_sd, output_filename))
@@ -427,8 +597,8 @@ class LyCORISExtractRatio(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, use_cp, use_sparse_bias,
-                sparsity, mismatch_mode, output_filename, save_dtype, process_device,
-                skip_patterns) -> io.NodeOutput:
+                sparsity, chunk_fused_layers, mismatch_mode, output_filename, save_dtype,
+                process_device, skip_patterns) -> io.NodeOutput:
         if not LYCORIS_AVAILABLE:
             raise ImportError("lycoris library not installed. Install with: pip install lycoris-lora")
         
@@ -449,6 +619,7 @@ class LyCORISExtractRatio(io.ComfyNode):
             use_cp=use_cp,
             use_sparse_bias=use_sparse_bias,
             sparsity=sparsity,
+            chunk_fused_layers=chunk_fused_layers,
         )
         
         return io.NodeOutput(_save_lycoris(output_sd, output_filename))
@@ -479,8 +650,8 @@ class LyCORISExtractQuantile(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, use_cp, 
-                use_sparse_bias, sparsity, mismatch_mode, output_filename, save_dtype,
-                process_device, skip_patterns) -> io.NodeOutput:
+                use_sparse_bias, sparsity, chunk_fused_layers, mismatch_mode, output_filename,
+                save_dtype, process_device, skip_patterns) -> io.NodeOutput:
         if not LYCORIS_AVAILABLE:
             raise ImportError("lycoris library not installed. Install with: pip install lycoris-lora")
         
@@ -501,6 +672,7 @@ class LyCORISExtractQuantile(io.ComfyNode):
             use_cp=use_cp,
             use_sparse_bias=use_sparse_bias,
             sparsity=sparsity,
+            chunk_fused_layers=chunk_fused_layers,
         )
         
         return io.NodeOutput(_save_lycoris(output_sd, output_filename))
