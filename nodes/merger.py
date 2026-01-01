@@ -8,6 +8,9 @@ from comfy_api.latest import io
 from safetensors.torch import save_file
 from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
 from .merger_utils import MemoryEfficientSafeOpen
+from .device_utils import (
+    estimate_model_size, prepare_for_large_operation, cleanup_after_operation
+)
 
 
 def load_documentation_from_file(filename):
@@ -58,6 +61,21 @@ class MergerLogic:
         primary_model_name = model_names.get('model_a')
         if not primary_model_name or primary_model_name == "None":
             raise ValueError("Model A is required to run the merge.")
+        
+        # Prepare memory before heavy operation
+        total_size_gb = 0
+        model_paths = []
+        for name in model_names.values():
+            if name and name != "None":
+                path = folder_paths.get_full_path(model_type, name)
+                if path:
+                    total_size_gb += estimate_model_size(path)
+                    model_paths.append(path)
+        
+        if total_size_gb > 0:
+            process_device = recipe_params.get('device', 'cpu')
+            print(f"[Merger] Preparing memory for {total_size_gb:.2f}GB merge operation...")
+            prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
         
         handlers = {}
         for name in model_names.values():
@@ -163,6 +181,7 @@ class MergerLogic:
         
         for handler in handlers.values():
             handler.__exit__(None, None, None)
+        
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
         # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
         output_dir = folder_paths.get_folder_paths(output_folder)[-1]
@@ -170,6 +189,11 @@ class MergerLogic:
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
         save_file(merged_state_dict, output_path, metadata=metadata)
+        
+        # Cleanup after heavy operation
+        del merged_state_dict
+        cleanup_after_operation()
+        
         return f"{output_filename}.safetensors"
 
 

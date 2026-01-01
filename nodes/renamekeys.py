@@ -4,7 +4,10 @@ import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
-from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
+from safetensors import safe_open
+from .utils import convert_pt_to_safetensors
+from .merger_utils import MemoryEfficientSafeOpen
+from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
 
 def _rename_keys(model_name: str, model_type: str, old_keys_str: str, 
@@ -22,7 +25,13 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
     else:
         model_path_to_load = model_path
 
-    model_weights, metadata = load_metadata_from_safetensors(model_path_to_load)
+    # Prepare memory before operation
+    model_size_gb = estimate_model_size(model_path_to_load)
+    prepare_for_large_operation(model_size_gb * 1.2)
+
+    # Get metadata from safe_open (header only, no tensor loading)
+    with safe_open(model_path_to_load, framework="pt", device="cpu") as f:
+        metadata = f.metadata() or {}
 
     old_keys = [key.strip() for key in old_keys_str.strip().split('\n') if key.strip()]
     new_keys = [key.strip() for key in new_keys_str.strip().split('\n') if key.strip()]
@@ -32,19 +41,25 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
 
     key_map = dict(zip(old_keys, new_keys))
 
-    original_keys = list(model_weights.keys())
+    # Stream tensors and rename on the fly
     renamed_tensors = {}
-    pbar = comfy.utils.ProgressBar(len(original_keys))
-    for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
-        new_key = key_map.get(key, key)
-        renamed_tensors[new_key] = model_weights[key]
-        pbar.update(1)
+    with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+        original_keys = handler.keys()
+        pbar = comfy.utils.ProgressBar(len(original_keys))
+        for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
+            new_key = key_map.get(key, key)
+            renamed_tensors[new_key] = handler.get_tensor(key)
+            pbar.update(1)
 
     # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
     model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     save_file(renamed_tensors, output_path, metadata)
+    
+    # Cleanup after operation
+    del renamed_tensors
+    cleanup_after_operation()
 
     return output_path
 

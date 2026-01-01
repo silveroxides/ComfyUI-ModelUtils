@@ -1,1 +1,1 @@
-lycoris-lora
+# No external dependencies required
