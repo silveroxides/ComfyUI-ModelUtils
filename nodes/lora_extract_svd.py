@@ -540,8 +540,8 @@ def extract_lora_from_files(
                             weight_diff, num_chunks, mode, linear_param, device, linear_max_rank
                         )
                         if lora_up is not None:
-                            output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu()
-                            output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu()
+                            output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
+                            output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
                             output_sd[f"{lora_name}.alpha"] = torch.tensor([rank]).to(save_torch_dtype)
                             stats["chunked"] += 1
                             del weight_diff
@@ -556,12 +556,12 @@ def extract_lora_from_files(
 
             # Store result
             if mode_str == "full":
-                output_sd[f"{lora_name}.diff"] = weight_diff.to(save_torch_dtype).cpu()
+                output_sd[f"{lora_name}.diff"] = weight_diff.to(save_torch_dtype).cpu().contiguous()
                 stats["full"] += 1
             else:
                 lora_down, lora_up, _ = result
-                output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu()
-                output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu()
+                output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
+                output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
                 output_sd[f"{lora_name}.alpha"] = torch.tensor([lora_down.shape[0]]).to(save_torch_dtype)
                 stats["extracted"] += 1
 
