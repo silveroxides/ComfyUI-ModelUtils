@@ -3,6 +3,7 @@ import re
 import torch
 import folder_paths
 import comfy.utils
+from comfy_api.latest import io
 from safetensors.torch import save_file
 from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
 from .merger_utils import MemoryEfficientSafeOpen
@@ -45,60 +46,24 @@ def _matches_any_pattern(key, patterns):
     return False
 
 
-# --- UI Dictionary Helper Functions ---
-def _create_two_model_inputs(model_folder_name):
-    return {"required": {
-        "execution_mode": (["MERGE", "DOCUMENTATION ONLY"],),
-        "model_a": (["None"] + folder_paths.get_filename_list(model_folder_name),),
-        "model_b": (["None"] + folder_paths.get_filename_list(model_folder_name),),
-        "calc_mode": ([m.name for m in TWO_MODEL_MODES],),
-        "mismatch_mode": (["skip", "zeros", "error"], {"default": "skip"}),
-        "alpha": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "beta": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "gamma": ("FLOAT", {"default": 0.99, "min": 0.0, "max": 1.0, "step": 0.001}),
-        "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-        "output_filename": ("STRING", {"default": "merged_2_model"}),
-        "save_dtype": (["fp32", "fp16", "bf16"],),
-        "process_device": (["cuda", "cpu"],),
-        "exclude_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers keep Model A only"}),
-        "discard_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers removed from output"}),
-    }}
-
-
-def _create_three_model_inputs(model_folder_name):
-    return {"required": {
-        "execution_mode": (["MERGE", "DOCUMENTATION ONLY"],),
-        "model_a": (["None"] + folder_paths.get_filename_list(model_folder_name),),
-        "model_b": (["None"] + folder_paths.get_filename_list(model_folder_name),),
-        "model_c": (["None"] + folder_paths.get_filename_list(model_folder_name),),
-        "calc_mode": ([m.name for m in THREE_MODEL_MODES],),
-        "mismatch_mode": (["skip", "zeros", "error"], {"default": "skip"}),
-        "alpha": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "beta": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "gamma": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "delta": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 3.0, "step": 0.01}),
-        "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-        "output_filename": ("STRING", {"default": "merged_3_model"}),
-        "save_dtype": (["fp32", "fp16", "bf16"],),
-        "process_device": (["cuda", "cpu"],),
-        "exclude_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers keep Model A only"}),
-        "discard_patterns": ("STRING", {"default": "", "multiline": True, "placeholder": "Regex patterns (space-separated) - matching layers removed from output"}),
-    }}
-
-
-# --- Base Classes for Backend Logic ONLY ---
 class MergerLogic:
-    def _execute_merge(self, model_names, calc_mode, all_modes, recipe_params, model_type):
+    """Shared merge execution logic for all merger nodes."""
+    
+    @staticmethod
+    def execute_merge(model_names, calc_mode, all_modes, recipe_params, model_type):
         calc_mode_class = next((m for m in all_modes if m.name == calc_mode), None)
-        if not calc_mode_class: raise ValueError(f"Calc mode '{calc_mode}' not found.")
+        if not calc_mode_class:
+            raise ValueError(f"Calc mode '{calc_mode}' not found.")
         primary_model_name = model_names.get('model_a')
-        if not primary_model_name or primary_model_name == "None": raise ValueError("Model A is required to run the merge.")
+        if not primary_model_name or primary_model_name == "None":
+            raise ValueError("Model A is required to run the merge.")
         
         handlers = {}
         for name in model_names.values():
             if name and name != "None":
                 path = folder_paths.get_full_path(model_type, name)
-                if not path: raise FileNotFoundError(f"Model '{name}' not found.")
+                if not path:
+                    raise FileNotFoundError(f"Model '{name}' not found.")
                 handlers[name] = MemoryEfficientSafeOpen(path)
         
         primary_handler = handlers[primary_model_name]
@@ -195,24 +160,58 @@ class MergerLogic:
         if error_keys:
             print(f"[Merger] Unexpected errors on {len(error_keys)} keys: {error_keys[:5]}{'...' if len(error_keys) > 5 else ''}")
         
-        for handler in handlers.values(): handler.__exit__(None, None, None)
+        for handler in handlers.values():
+            handler.__exit__(None, None, None)
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
         output_dir = folder_paths.get_folder_paths(output_folder)[0]
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
         save_file(merged_state_dict, output_path, metadata=metadata)
-        return (f"{output_filename}.safetensors",)
+        return f"{output_filename}.safetensors"
 
 
-class BaseTwoMerger(MergerLogic):
-    FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
-    RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
+# --- Two-Model Merger Nodes ---
 
-    def merge(self, execution_mode, model_a, model_b, calc_mode, mismatch_mode, alpha, beta, gamma, seed, output_filename, save_dtype, process_device, exclude_patterns, discard_patterns):
+class CheckpointTwoMerger(io.ComfyNode):
+    MODEL_TYPE = "checkpoints"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CheckpointTwoMerger",
+            display_name="Merge Checkpoints (2 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_2_checkpoint"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
-            return ("Documentation mode active. No merge performed.", doc)
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
@@ -223,18 +222,265 @@ class BaseTwoMerger(MergerLogic):
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
-        filename, = self._execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, self.MODEL_TYPE)
-        return (filename, doc)
+        filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
 
 
-class BaseThreeMerger(MergerLogic):
-    FUNCTION = "merge"; CATEGORY = "ModelUtils/Merging"
-    RETURN_TYPES = ("STRING", "STRING",); RETURN_NAMES = ("output_filename", "documentation",)
+class ModelTwoMerger(io.ComfyNode):
+    MODEL_TYPE = "diffusion_models"
 
-    def merge(self, execution_mode, model_a, model_b, model_c, calc_mode, mismatch_mode, alpha, beta, gamma, delta, seed, output_filename, save_dtype, process_device, exclude_patterns, discard_patterns):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ModelTwoMerger",
+            display_name="Merge Models (2 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_2_model"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_2_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class TextEncoderTwoMerger(io.ComfyNode):
+    MODEL_TYPE = "text_encoders"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TextEncoderTwoMerger",
+            display_name="Merge Text Encoders (2 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_2_textencoder"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_2_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class LoRATwoMerger(io.ComfyNode):
+    MODEL_TYPE = "loras"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRATwoMerger",
+            display_name="Merge LoRAs (2 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("loras")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("loras")),
+                io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_2_lora"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_2_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class EmbeddingTwoMerger(io.ComfyNode):
+    MODEL_TYPE = "embeddings"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="EmbeddingTwoMerger",
+            display_name="Merge Embeddings (2 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("embeddings")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("embeddings")),
+                io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_2_embedding"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_2_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+# --- Three-Model Merger Nodes ---
+
+class CheckpointThreeMerger(io.ComfyNode):
+    MODEL_TYPE = "checkpoints"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CheckpointThreeMerger",
+            display_name="Merge Checkpoints (3 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_3_checkpoint"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
-            return ("Documentation mode active. No merge performed.", doc)
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
@@ -245,55 +491,225 @@ class BaseThreeMerger(MergerLogic):
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
-        filename, = self._execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, self.MODEL_TYPE)
-        return (filename, doc)
+        filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
 
 
-# --- Concrete 2-Model Nodes ---
-class CheckpointTwoMerger(BaseTwoMerger):
-    MODEL_TYPE = "checkpoints"
-    @classmethod
-    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class ModelTwoMerger(BaseTwoMerger):
+class ModelThreeMerger(io.ComfyNode):
     MODEL_TYPE = "diffusion_models"
-    @classmethod
-    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class TextEncoderTwoMerger(BaseTwoMerger):
-    MODEL_TYPE = "text_encoders"
-    @classmethod
-    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class LoRATwoMerger(BaseTwoMerger):
-    MODEL_TYPE = "loras"
-    @classmethod
-    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
-class EmbeddingTwoMerger(BaseTwoMerger):
-    MODEL_TYPE = "embeddings"
-    @classmethod
-    def INPUT_TYPES(s): return _create_two_model_inputs(s.MODEL_TYPE)
 
-# --- Concrete 3-Model Nodes ---
-class CheckpointThreeMerger(BaseThreeMerger):
-    MODEL_TYPE = "checkpoints"
     @classmethod
-    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class ModelThreeMerger(BaseThreeMerger):
-    MODEL_TYPE = "diffusion_models"
-    @classmethod
-    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class TextEncoderThreeMerger(BaseThreeMerger):
-    MODEL_TYPE = "text_encoders"
-    @classmethod
-    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class LoRAThreeMerger(BaseThreeMerger):
-    MODEL_TYPE = "loras"
-    @classmethod
-    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
-class EmbeddingThreeMerger(BaseThreeMerger):
-    MODEL_TYPE = "embeddings"
-    @classmethod
-    def INPUT_TYPES(s): return _create_three_model_inputs(s.MODEL_TYPE)
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ModelThreeMerger",
+            display_name="Merge Models (3 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_3_model"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
 
-__all__ = [
-    "CheckpointTwoMerger", "ModelTwoMerger", "TextEncoderTwoMerger", "LoRATwoMerger", "EmbeddingTwoMerger",
-    "CheckpointThreeMerger", "ModelThreeMerger", "TextEncoderThreeMerger", "LoRAThreeMerger", "EmbeddingThreeMerger"
-]
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_3_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class TextEncoderThreeMerger(io.ComfyNode):
+    MODEL_TYPE = "text_encoders"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TextEncoderThreeMerger",
+            display_name="Merge Text Encoders (3 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_3_textencoder"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_3_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class LoRAThreeMerger(io.ComfyNode):
+    MODEL_TYPE = "loras"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRAThreeMerger",
+            display_name="Merge LoRAs (3 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("loras")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("loras")),
+                io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("loras")),
+                io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_3_lora"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_3_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)
+
+
+class EmbeddingThreeMerger(io.ComfyNode):
+    MODEL_TYPE = "embeddings"
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="EmbeddingThreeMerger",
+            display_name="Merge Embeddings (3 Models)",
+            category="ModelUtils/Merging",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"]),
+                io.Combo.Input("model_a", options=["None"] + folder_paths.get_filename_list("embeddings")),
+                io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("embeddings")),
+                io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("embeddings")),
+                io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.String.Input("output_filename", default="merged_3_embedding"),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
+                io.Combo.Input("process_device", options=["cuda", "cpu"]),
+                io.String.Input("exclude_patterns", default="", multiline=True),
+                io.String.Input("discard_patterns", default="", multiline=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
+                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
+                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+        doc = load_documentation_from_file('merger_3_model_modes.md')
+        if execution_mode == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", doc)
+
+        recipe_params = {
+            "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
+            "mismatch_mode": mismatch_mode,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
+            "output_filename": output_filename, "save_dtype": save_dtype,
+            "device": process_device, "dtype": torch.float32,
+            "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+        }
+        model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
+        filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
+        return io.NodeOutput(filename, doc)

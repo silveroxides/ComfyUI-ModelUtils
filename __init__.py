@@ -1,57 +1,52 @@
-from .nodes import *
+from typing_extensions import override
+from comfy_api.latest import ComfyExtension, io
 
-NODE_CLASS_MAPPINGS = {
-    "ModelMetaKeys": ModelMetaKeys,
-    "TextEncoderMetaKeys": TextEncoderMetaKeys,
-    "LoRAMetaKeys": LoRAMetaKeys,
-    "CheckpointMetaKeys": CheckpointMetaKeys,
-    "EmbeddingMetaKeys": EmbeddingMetaKeys,
-    "ModelRenameKeys": ModelRenameKeys,
-    "TextEncoderRenameKeys": TextEncoderRenameKeys,
-    "LoRARenameKeys": LoRARenameKeys,
-    "CheckpointRenameKeys": CheckpointRenameKeys,
-    "EmbeddingRenameKeys": EmbeddingRenameKeys,
-    "ModelPruneKeys": ModelPruneKeys,
-    "TextEncoderPruneKeys": TextEncoderPruneKeys,
-    "LoRAPruneKeys": LoRAPruneKeys,
-    "CheckpointPruneKeys": CheckpointPruneKeys,
-    "EmbeddingPruneKeys": EmbeddingPruneKeys,
-    "ModelTwoMerger": ModelTwoMerger,
-    "TextEncoderTwoMerger": TextEncoderTwoMerger,
-    "LoRATwoMerger": LoRATwoMerger,
-    "CheckpointTwoMerger": CheckpointTwoMerger,
-    "EmbeddingTwoMerger": EmbeddingTwoMerger,
-    "ModelThreeMerger": ModelThreeMerger,
-    "TextEncoderThreeMerger": TextEncoderThreeMerger,
-    "LoRAThreeMerger": LoRAThreeMerger,
-    "CheckpointThreeMerger": CheckpointThreeMerger,
-    "EmbeddingThreeMerger": EmbeddingThreeMerger,
-}
+from .nodes.metakeys import (
+    ModelMetaKeys, TextEncoderMetaKeys, LoRAMetaKeys,
+    CheckpointMetaKeys, EmbeddingMetaKeys
+)
+from .nodes.renamekeys import (
+    ModelRenameKeys, TextEncoderRenameKeys, LoRARenameKeys,
+    CheckpointRenameKeys, EmbeddingRenameKeys
+)
+from .nodes.prunekeys import (
+    ModelPruneKeys, TextEncoderPruneKeys, LoRAPruneKeys,
+    CheckpointPruneKeys, EmbeddingPruneKeys
+)
+from .nodes.merger import (
+    ModelTwoMerger, TextEncoderTwoMerger, LoRATwoMerger,
+    CheckpointTwoMerger, EmbeddingTwoMerger,
+    ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
+    CheckpointThreeMerger, EmbeddingThreeMerger
+)
+from .nodes.lora_extract import (
+    LoRASaveFromFile, LoRACheckpointSaveFromFile
+)
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ModelMetaKeys": "Get Diffusion Model Metadata & Keys",
-    "TextEncoderMetaKeys": "Get Text Encoder Metadata & Keys",
-    "LoRAMetaKeys": "Get LoRA Metadata & Keys",
-    "CheckpointMetaKeys": "Get Checkpoint Metadata & Keys",
-    "EmbeddingMetaKeys": "Get Embedding Metadata & Keys",
-    "ModelRenameKeys": "ModelRenameKeys",
-    "TextEncoderRenameKeys": "TextEncoderRenameKeys",
-    "LoRARenameKeys": "LoRARenameKeys",
-    "CheckpointRenameKeys": "CheckpointRenameKeys",
-    "EmbeddingRenameKeys": "EmbeddingRenameKeys",
-    "ModelPruneKeys": "ModelPruneKeys",
-    "TextEncoderPruneKeys": "TextEncoderPruneKeys",
-    "LoRAPruneKeys": "LoRAPruneKeys",
-    "CheckpointPruneKeys": "Prune Checkpoint Keys",
-    "EmbeddingPruneKeys": "Prune Embedding Keys",
-    "ModelTwoMerger": "Merge Models (2 Models)",
-    "TextEncoderTwoMerger": "Merge Text Encoders (2 Models)",
-    "LoRATwoMerger": "Merge LoRAs (2 Models)",
-    "CheckpointTwoMerger": "Merge Checkpoints (2 Models)",
-    "EmbeddingTwoMerger": "Merge Embeddings (2 Models)",
-    "ModelThreeMerger": "Merge Models (3 Models)",
-    "TextEncoderThreeMerger": "Merge Text Encoders (3 Models)",
-    "LoRAThreeMerger": "Merge LoRAs (3 Models)",
-    "CheckpointThreeMerger": "Merge Checkpoints (3 Models)",
-    "EmbeddingThreeMerger": "Merge Embeddings (3 Models)",
-}
+
+class ModelUtilsExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [
+            # MetaKeys
+            ModelMetaKeys, TextEncoderMetaKeys, LoRAMetaKeys,
+            CheckpointMetaKeys, EmbeddingMetaKeys,
+            # RenameKeys
+            ModelRenameKeys, TextEncoderRenameKeys, LoRARenameKeys,
+            CheckpointRenameKeys, EmbeddingRenameKeys,
+            # PruneKeys
+            ModelPruneKeys, TextEncoderPruneKeys, LoRAPruneKeys,
+            CheckpointPruneKeys, EmbeddingPruneKeys,
+            # Two-Model Mergers
+            ModelTwoMerger, TextEncoderTwoMerger, LoRATwoMerger,
+            CheckpointTwoMerger, EmbeddingTwoMerger,
+            # Three-Model Mergers
+            ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
+            CheckpointThreeMerger, EmbeddingThreeMerger,
+            # LoRA Extraction
+            LoRASaveFromFile, LoRACheckpointSaveFromFile,
+        ]
+
+
+async def comfy_entrypoint() -> ModelUtilsExtension:
+    return ModelUtilsExtension()
