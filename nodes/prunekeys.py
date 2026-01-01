@@ -1,127 +1,199 @@
 import os
 import re
 import folder_paths
-from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
+from comfy_api.latest import io
 from safetensors.torch import save_file
+from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
 
-class BasePruneKeys:
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("output_path",)
-    FUNCTION = "prune_keys"
-    CATEGORY = "ModelUtils/Keys"
-    DESCRIPTION = "Loads a model, removes specified keys, and saves it as a new safetensors file."
 
-    def _prune_keys(self, model_name, model_type, keys_to_prune_str, use_regex, output_filename):
-        model_path = folder_paths.get_full_path_or_raise(model_type, model_name)
+def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str, 
+                use_regex: bool, output_filename: str) -> str:
+    """Shared logic for all PruneKeys nodes."""
+    model_path = folder_paths.get_full_path_or_raise(model_type, model_name)
 
-        if model_path.endswith(('.pt', '.pth', '.bin', '.ckpt')):
-            temp_safe_path = model_path + ".safetensors"
-            if not os.path.exists(temp_safe_path):
-                conversion_successful, error_message = convert_pt_to_safetensors(model_path, temp_safe_path)
-                if not conversion_successful:
-                    raise Exception(f"Conversion failed: {error_message}")
-            model_path_to_load = temp_safe_path
+    if model_path.endswith(('.pt', '.pth', '.bin', '.ckpt')):
+        temp_safe_path = model_path + ".safetensors"
+        if not os.path.exists(temp_safe_path):
+            conversion_successful, error_message = convert_pt_to_safetensors(model_path, temp_safe_path)
+            if not conversion_successful:
+                raise Exception(f"Conversion failed: {error_message}")
+        model_path_to_load = temp_safe_path
+    else:
+        model_path_to_load = model_path
+
+    model_weights, metadata = load_metadata_from_safetensors(model_path_to_load)
+
+    patterns = [p.strip() for p in keys_to_prune_str.strip().split('\n') if p.strip()]
+
+    if not patterns:
+        raise ValueError("No keys/patterns provided to prune.")
+
+    pruned_tensors = {}
+    for key, tensor in model_weights.items():
+        is_match = False
+        if use_regex:
+            if any(re.search(pattern, key) for pattern in patterns):
+                is_match = True
         else:
-            model_path_to_load = model_path
+            if any(pattern in key for pattern in patterns):
+                is_match = True
 
-        model_weights, metadata = load_metadata_from_safetensors(model_path_to_load)
+        if not is_match:
+            pruned_tensors[key] = tensor
 
-        patterns = [p.strip() for p in keys_to_prune_str.strip().split('\n') if p.strip()]
+    model_dir = folder_paths.get_folder_paths(model_type)[0]
+    output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
-        if not patterns:
-            raise ValueError("No keys/patterns provided to prune.")
+    save_file(pruned_tensors, output_path, metadata)
 
-        pruned_tensors = {}
-        for key, tensor in model_weights.items():
-            is_match = False
-            if use_regex:
-                if any(re.search(pattern, key) for pattern in patterns):
-                    is_match = True
-            else:
-                if any(pattern in key for pattern in patterns):
-                    is_match = True
+    return output_path
 
-            if not is_match:
-                pruned_tensors[key] = tensor
 
-        model_dir = folder_paths.get_folder_paths(model_type)[0]
-        output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
-
-        save_file(pruned_tensors, output_path, metadata)
-
-        return (output_path,)
-
-class ModelPruneKeys(BasePruneKeys):
+class ModelPruneKeys(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "diffusionmodel_name": (folder_paths.get_filename_list("diffusion_models"), ),
-                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
-                "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_model"}),
-            }
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ModelPruneKeys",
+            display_name="Prune Diffusion Model Keys",
+            category="ModelUtils/Keys",
+            description="Loads a diffusion model, removes specified keys, and saves it as a new safetensors file.",
+            inputs=[
+                io.Combo.Input(
+                    "diffusionmodel_name",
+                    options=folder_paths.get_filename_list("diffusion_models"),
+                ),
+                io.String.Input("keys_to_prune", multiline=True, default=""),
+                io.Boolean.Input("use_regex", default=False),
+                io.String.Input("output_filename", default="pruned_model"),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_path"),
+            ],
+        )
 
-    def prune_keys(self, diffusionmodel_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(diffusionmodel_name, "diffusion_models", keys_to_prune, use_regex, output_filename)
-
-class TextEncoderPruneKeys(BasePruneKeys):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "textencoder_name": (folder_paths.get_filename_list("text_encoders"), ),
-                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
-                "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_textencoder"}),
-            }
-        }
+    def execute(cls, diffusionmodel_name: str, keys_to_prune: str, 
+                use_regex: bool, output_filename: str) -> io.NodeOutput:
+        path = _prune_keys(diffusionmodel_name, "diffusion_models", 
+                          keys_to_prune, use_regex, output_filename)
+        return io.NodeOutput(path)
 
-    def prune_keys(self, textencoder_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(textencoder_name, "text_encoders", keys_to_prune, use_regex, output_filename)
 
-class LoRAPruneKeys(BasePruneKeys):
+class TextEncoderPruneKeys(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "lora_name": (folder_paths.get_filename_list("loras"), ),
-                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
-                "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_lora"}),
-            }
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TextEncoderPruneKeys",
+            display_name="Prune Text Encoder Keys",
+            category="ModelUtils/Keys",
+            description="Loads a text encoder, removes specified keys, and saves it as a new safetensors file.",
+            inputs=[
+                io.Combo.Input(
+                    "textencoder_name",
+                    options=folder_paths.get_filename_list("text_encoders"),
+                ),
+                io.String.Input("keys_to_prune", multiline=True, default=""),
+                io.Boolean.Input("use_regex", default=False),
+                io.String.Input("output_filename", default="pruned_textencoder"),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_path"),
+            ],
+        )
 
-    def prune_keys(self, lora_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(lora_name, "loras", keys_to_prune, use_regex, output_filename)
-
-class CheckpointPruneKeys(BasePruneKeys):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
-                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
-                "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_checkpoint"}),
-            }
-        }
+    def execute(cls, textencoder_name: str, keys_to_prune: str, 
+                use_regex: bool, output_filename: str) -> io.NodeOutput:
+        path = _prune_keys(textencoder_name, "text_encoders", 
+                          keys_to_prune, use_regex, output_filename)
+        return io.NodeOutput(path)
 
-    def prune_keys(self, ckpt_name, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(ckpt_name, "checkpoints", keys_to_prune, use_regex, output_filename)
 
-class EmbeddingPruneKeys(BasePruneKeys):
+class LoRAPruneKeys(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "embedding": (folder_paths.get_filename_list("embeddings"), ),
-                "keys_to_prune": ("STRING", {"multiline": True, "default": ""}),
-                "use_regex": ("BOOLEAN", {"default": False}),
-                "output_filename": ("STRING", {"default": "pruned_embedding"}),
-            }
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRAPruneKeys",
+            display_name="Prune LoRA Keys",
+            category="ModelUtils/Keys",
+            description="Loads a LoRA, removes specified keys, and saves it as a new safetensors file.",
+            inputs=[
+                io.Combo.Input(
+                    "lora_name",
+                    options=folder_paths.get_filename_list("loras"),
+                ),
+                io.String.Input("keys_to_prune", multiline=True, default=""),
+                io.Boolean.Input("use_regex", default=False),
+                io.String.Input("output_filename", default="pruned_lora"),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_path"),
+            ],
+        )
 
-    def prune_keys(self, embedding, keys_to_prune, use_regex, output_filename):
-        return self._prune_keys(embedding, "embeddings", keys_to_prune, use_regex, output_filename)
+    @classmethod
+    def execute(cls, lora_name: str, keys_to_prune: str, 
+                use_regex: bool, output_filename: str) -> io.NodeOutput:
+        path = _prune_keys(lora_name, "loras", 
+                          keys_to_prune, use_regex, output_filename)
+        return io.NodeOutput(path)
+
+
+class CheckpointPruneKeys(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CheckpointPruneKeys",
+            display_name="Prune Checkpoint Keys",
+            category="ModelUtils/Keys",
+            description="Loads a checkpoint, removes specified keys, and saves it as a new safetensors file.",
+            inputs=[
+                io.Combo.Input(
+                    "ckpt_name",
+                    options=folder_paths.get_filename_list("checkpoints"),
+                ),
+                io.String.Input("keys_to_prune", multiline=True, default=""),
+                io.Boolean.Input("use_regex", default=False),
+                io.String.Input("output_filename", default="pruned_checkpoint"),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_path"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, ckpt_name: str, keys_to_prune: str, 
+                use_regex: bool, output_filename: str) -> io.NodeOutput:
+        path = _prune_keys(ckpt_name, "checkpoints", 
+                          keys_to_prune, use_regex, output_filename)
+        return io.NodeOutput(path)
+
+
+class EmbeddingPruneKeys(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="EmbeddingPruneKeys",
+            display_name="Prune Embedding Keys",
+            category="ModelUtils/Keys",
+            description="Loads an embedding, removes specified keys, and saves it as a new safetensors file.",
+            inputs=[
+                io.Combo.Input(
+                    "embedding",
+                    options=folder_paths.get_filename_list("embeddings"),
+                ),
+                io.String.Input("keys_to_prune", multiline=True, default=""),
+                io.Boolean.Input("use_regex", default=False),
+                io.String.Input("output_filename", default="pruned_embedding"),
+            ],
+            outputs=[
+                io.String.Output(display_name="output_path"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, embedding: str, keys_to_prune: str, 
+                use_regex: bool, output_filename: str) -> io.NodeOutput:
+        path = _prune_keys(embedding, "embeddings", 
+                          keys_to_prune, use_regex, output_filename)
+        return io.NodeOutput(path)
