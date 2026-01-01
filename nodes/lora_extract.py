@@ -51,12 +51,15 @@ def extract_lora(diff, rank):
 
 
 def _compile_patterns(pattern_string: str) -> list:
-    """Compiles whitespace-separated regex patterns into a list of compiled patterns."""
+    """Compiles newline/whitespace-separated regex patterns into a list of compiled patterns."""
     if not pattern_string or not pattern_string.strip():
         return []
     
     patterns = []
     for pattern in pattern_string.split():
+        pattern = pattern.strip()
+        if not pattern:
+            continue
         try:
             patterns.append(re.compile(pattern))
         except re.error as e:
@@ -77,13 +80,12 @@ def extract_lora_from_files(
     model_b_path: str,
     rank: int,
     lora_type: str,
-    bias_diff: bool,
     prefix_lora: str,
     process_device: str,
     save_dtype: str,
-    exclude_patterns_str: str = "",
-    discard_patterns_str: str = "",
+    skip_patterns_str: str = "",
     mismatch_mode: str = "skip",
+    include_biases: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Memory-efficient LoRA extraction by streaming tensors from safetensors files.
@@ -92,14 +94,13 @@ def extract_lora_from_files(
         model_a_path: Path to the finetuned/modified model
         model_b_path: Path to the base/original model  
         rank: LoRA rank for SVD decomposition
-        lora_type: "standard" for LoRA, "full_diff" for full difference
-        bias_diff: Whether to include bias differences
+        lora_type: "standard" for LoRA (only 2D+ weights), "full_diff" for full difference
         prefix_lora: Prefix for LoRA keys (e.g., "diffusion_model.")
         process_device: Device for processing ("cuda" or "cpu")
         save_dtype: Output dtype ("fp16", "bf16", "fp32")
-        exclude_patterns_str: Regex patterns to exclude from extraction (use model A only)
-        discard_patterns_str: Regex patterns to discard entirely (no output)
-        mismatch_mode: "skip" (use model A), "zeros" (use zeros), "error" (raise error)
+        skip_patterns_str: Regex patterns for layers to skip (no LoRA extracted)
+        mismatch_mode: "skip" (ignore), "zeros" (use model A), "error" (raise error)
+        include_biases: Whether to include bias differences (only for full_diff mode)
     
     Returns:
         Dictionary of LoRA tensors
@@ -114,8 +115,7 @@ def extract_lora_from_files(
     }.get(save_dtype, torch.float16)
     
     # Compile patterns
-    exclude_patterns = _compile_patterns(exclude_patterns_str)
-    discard_patterns = _compile_patterns(discard_patterns_str)
+    skip_patterns = _compile_patterns(skip_patterns_str)
     
     # Open both files with memory-efficient handler
     handler_a = MemoryEfficientSafeOpen(model_a_path)
@@ -127,7 +127,10 @@ def extract_lora_from_files(
         
         # Get all weight keys from model A (primary)
         all_weight_keys = [k for k in keys_a if k.endswith(".weight")]
-        all_bias_keys = [k for k in keys_a if k.endswith(".bias")] if bias_diff else []
+        # Only process biases in full_diff mode with include_biases=True
+        all_bias_keys = []
+        if lora_type == "full_diff" and include_biases:
+            all_bias_keys = [k for k in keys_a if k.endswith(".bias")]
         
         # Log key differences
         missing_in_b = keys_a - keys_b
@@ -140,27 +143,17 @@ def extract_lora_from_files(
         pbar = comfy.utils.ProgressBar(len(all_weight_keys) + len(all_bias_keys))
         
         # Stats
-        skipped_keys = 0
-        excluded_keys = 0
-        discarded_keys = 0
+        skipped_by_pattern = 0
+        skipped_by_mismatch = 0
+        skipped_1d_weights = 0
         shape_mismatch_keys = 0
         
         for key in tqdm(all_weight_keys, desc="Extracting LoRA weights", unit="layers"):
             lora_key = key[:-7]  # Remove ".weight"
             
-            # Check discard patterns first - skip entirely
-            if _matches_any_pattern(key, discard_patterns):
-                discarded_keys += 1
-                pbar.update(1)
-                continue
-            
-            # Load model A tensor
-            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
-            
-            # Check exclude patterns - skip extraction, no output for this key
-            if _matches_any_pattern(key, exclude_patterns):
-                excluded_keys += 1
-                del tensor_a
+            # Check skip patterns - skip entirely, no LoRA for this layer
+            if _matches_any_pattern(key, skip_patterns):
+                skipped_by_pattern += 1
                 pbar.update(1)
                 continue
             
@@ -169,111 +162,112 @@ def extract_lora_from_files(
                 if mismatch_mode == "error":
                     raise ValueError(f"Key '{key}' not found in model B (mismatch_mode='error')")
                 elif mismatch_mode == "skip":
-                    skipped_keys += 1
-                    del tensor_a
+                    skipped_by_mismatch += 1
                     pbar.update(1)
                     continue
-                # zeros mode: use tensor_a as-is (diff with zeros = tensor_a)
+                # zeros mode: load tensor A (diff with zeros = tensor_a)
+                tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 weight_diff = tensor_a
+                del tensor_a
             else:
+                # Load both tensors
+                tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 
                 # Check shape mismatch
                 if tensor_a.shape != tensor_b.shape:
-                    del tensor_b
+                    del tensor_a, tensor_b
                     if mismatch_mode == "error":
                         raise ValueError(f"Shape mismatch for '{key}': {tensor_a.shape} vs {tensor_b.shape}")
                     elif mismatch_mode == "skip":
                         shape_mismatch_keys += 1
-                        del tensor_a
                         pbar.update(1)
                         continue
                     # zeros mode: use tensor_a as-is
+                    tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                     weight_diff = tensor_a
+                    del tensor_a
                 else:
                     # Compute difference: finetuned - base
                     weight_diff = tensor_a - tensor_b
-                    del tensor_b
-            
-            del tensor_a
+                    del tensor_a, tensor_b
             
             if lora_type == "standard":
+                # Standard LoRA: Only decompose 2D+ weights, skip 1D entirely
                 if weight_diff.ndim < 2:
-                    # 1D weights (e.g., LayerNorm) - store as diff if bias_diff enabled
-                    if bias_diff:
-                        output_sd[f"{prefix_lora}{lora_key}.diff"] = weight_diff.to(save_torch_dtype).cpu()
-                else:
-                    try:
-                        lora_up, lora_down = extract_lora(weight_diff, rank)
-                        output_sd[f"{prefix_lora}{lora_key}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu()
-                        output_sd[f"{prefix_lora}{lora_key}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu()
-                    except Exception as e:
-                        print(f"[LoRA Extract] Could not extract LoRA for {key}: {e}")
+                    skipped_1d_weights += 1
+                    del weight_diff
+                    pbar.update(1)
+                    continue
+                
+                try:
+                    lora_up, lora_down = extract_lora(weight_diff, rank)
+                    output_sd[f"{prefix_lora}{lora_key}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu()
+                    output_sd[f"{prefix_lora}{lora_key}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu()
+                except Exception as e:
+                    print(f"[LoRA Extract] Could not extract LoRA for {key}: {e}")
             
             elif lora_type == "full_diff":
+                # Full diff: Store all weight differences
                 output_sd[f"{prefix_lora}{lora_key}.diff"] = weight_diff.to(save_torch_dtype).cpu()
             
             del weight_diff
             pbar.update(1)
         
-        # Process bias keys
-        for key in tqdm(all_bias_keys, desc="Extracting LoRA biases", unit="layers"):
+        # Process bias keys (only in full_diff mode with include_biases=True)
+        for key in tqdm(all_bias_keys, desc="Extracting bias differences", unit="layers"):
             lora_key = key[:-5]  # Remove ".bias"
             
-            # Check discard patterns
-            if _matches_any_pattern(key, discard_patterns):
-                discarded_keys += 1
+            # Check skip patterns
+            if _matches_any_pattern(key, skip_patterns):
+                skipped_by_pattern += 1
                 pbar.update(1)
                 continue
-            
-            # Check exclude patterns
-            if _matches_any_pattern(key, exclude_patterns):
-                excluded_keys += 1
-                pbar.update(1)
-                continue
-            
-            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
             
             if key not in keys_b:
                 if mismatch_mode == "error":
                     raise ValueError(f"Key '{key}' not found in model B (mismatch_mode='error')")
                 elif mismatch_mode == "skip":
-                    skipped_keys += 1
-                    del tensor_a
+                    skipped_by_mismatch += 1
                     pbar.update(1)
                     continue
+                # zeros mode
+                tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 bias_diff_tensor = tensor_a
+                del tensor_a
             else:
+                tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
                 
                 if tensor_a.shape != tensor_b.shape:
-                    del tensor_b
+                    del tensor_a, tensor_b
                     if mismatch_mode == "error":
                         raise ValueError(f"Shape mismatch for '{key}': {tensor_a.shape} vs {tensor_b.shape}")
                     elif mismatch_mode == "skip":
                         shape_mismatch_keys += 1
-                        del tensor_a
                         pbar.update(1)
                         continue
+                    # zeros mode
+                    tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
                     bias_diff_tensor = tensor_a
+                    del tensor_a
                 else:
                     bias_diff_tensor = tensor_a - tensor_b
-                    del tensor_b
+                    del tensor_a, tensor_b
             
-            del tensor_a
             output_sd[f"{prefix_lora}{lora_key}.diff_b"] = bias_diff_tensor.to(save_torch_dtype).cpu()
             del bias_diff_tensor
             pbar.update(1)
         
         # Log summary
-        if excluded_keys > 0:
-            print(f"[LoRA Extract] Excluded {excluded_keys} keys from extraction")
-        if discarded_keys > 0:
-            print(f"[LoRA Extract] Discarded {discarded_keys} keys from output")
-        if skipped_keys > 0:
-            print(f"[LoRA Extract] Skipped {skipped_keys} keys (missing in model B)")
+        if skipped_by_pattern > 0:
+            print(f"[LoRA Extract] Skipped {skipped_by_pattern} keys (matched skip patterns)")
+        if skipped_by_mismatch > 0:
+            print(f"[LoRA Extract] Skipped {skipped_by_mismatch} keys (missing in model B)")
         if shape_mismatch_keys > 0:
             print(f"[LoRA Extract] Skipped {shape_mismatch_keys} keys (shape mismatch)")
+        if skipped_1d_weights > 0:
+            print(f"[LoRA Extract] Skipped {skipped_1d_weights} 1D weights (cannot SVD decompose)")
     
     finally:
         handler_a.__exit__(None, None, None)
@@ -313,20 +307,19 @@ class LoRASaveFromFile(io.ComfyNode):
                 io.Int.Input("rank", default=64, min=1, max=4096, step=1,
                             tooltip="LoRA rank - higher preserves more detail but increases size"),
                 io.Combo.Input("lora_type", options=["standard", "full_diff"], default="standard",
-                              tooltip="standard: SVD decomposition to lora_up/lora_down, full_diff: raw weight differences"),
-                io.Boolean.Input("bias_diff", default=True,
-                                tooltip="Include bias differences in the LoRA"),
+                              tooltip="standard: SVD to lora_up/down (proper LoRA format), "
+                                      "full_diff: raw weight differences (.diff format)"),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip",
                               tooltip="How to handle missing keys or shape mismatches between models"),
+                io.Boolean.Input("include_biases", default=False,
+                              tooltip="Include bias differences (only applies to full_diff mode)"),
                 io.String.Input("output_filename", default="extracted_lora",
                                tooltip="Output filename (without extension)"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda",
                               tooltip="Device for SVD computation"),
-                io.String.Input("exclude_patterns", default="", multiline=True,
-                               tooltip="Regex patterns to exclude from extraction (one per line, whitespace-separated)"),
-                io.String.Input("discard_patterns", default="", multiline=True,
-                               tooltip="Regex patterns to discard entirely (no output for matching keys)"),
+                io.String.Input("skip_patterns", default="", multiline=True,
+                               tooltip="Regex patterns for layers to skip (no LoRA extracted for matching keys)"),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -341,13 +334,12 @@ class LoRASaveFromFile(io.ComfyNode):
         model_b: str,
         rank: int,
         lora_type: str,
-        bias_diff: bool,
         mismatch_mode: str,
+        include_biases: bool,
         output_filename: str,
         save_dtype: str,
         process_device: str,
-        exclude_patterns: str,
-        discard_patterns: str,
+        skip_patterns: str,
     ) -> io.NodeOutput:
         # Get full paths
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -359,13 +351,12 @@ class LoRASaveFromFile(io.ComfyNode):
             model_b_path=model_b_path,
             rank=rank,
             lora_type=lora_type,
-            bias_diff=bias_diff,
             prefix_lora="diffusion_model.",
             process_device=process_device,
             save_dtype=save_dtype,
-            exclude_patterns_str=exclude_patterns,
-            discard_patterns_str=discard_patterns,
+            skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode,
+            include_biases=include_biases,
         )
         
         if not output_sd:
@@ -409,20 +400,19 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
                 io.Int.Input("rank", default=64, min=1, max=4096, step=1,
                             tooltip="LoRA rank - higher preserves more detail but increases size"),
                 io.Combo.Input("lora_type", options=["standard", "full_diff"], default="standard",
-                              tooltip="standard: SVD decomposition, full_diff: raw weight differences"),
-                io.Boolean.Input("bias_diff", default=True,
-                                tooltip="Include bias differences in the LoRA"),
+                              tooltip="standard: SVD to lora_up/down (proper LoRA format), "
+                                      "full_diff: raw weight differences (.diff format)"),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip",
                               tooltip="How to handle missing keys or shape mismatches between models"),
+                io.Boolean.Input("include_biases", default=False,
+                              tooltip="Include bias differences (only applies to full_diff mode)"),
                 io.String.Input("output_filename", default="extracted_lora",
                                tooltip="Output filename (without extension)"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda",
                               tooltip="Device for SVD computation"),
-                io.String.Input("exclude_patterns", default="", multiline=True,
-                               tooltip="Regex patterns to exclude from extraction"),
-                io.String.Input("discard_patterns", default="", multiline=True,
-                               tooltip="Regex patterns to discard entirely"),
+                io.String.Input("skip_patterns", default="", multiline=True,
+                               tooltip="Regex patterns for layers to skip (no LoRA extracted for matching keys)"),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -437,13 +427,12 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
         checkpoint_b: str,
         rank: int,
         lora_type: str,
-        bias_diff: bool,
         mismatch_mode: str,
+        include_biases: bool,
         output_filename: str,
         save_dtype: str,
         process_device: str,
-        exclude_patterns: str,
-        discard_patterns: str,
+        skip_patterns: str,
     ) -> io.NodeOutput:
         # Get full paths
         checkpoint_a_path = folder_paths.get_full_path_or_raise("checkpoints", checkpoint_a)
@@ -469,13 +458,12 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
                 model_b_path=checkpoint_b_path,
                 rank=rank,
                 lora_type=lora_type,
-                bias_diff=bias_diff,
                 prefix_lora="diffusion_model.",
                 process_device=process_device,
                 save_dtype=save_dtype,
-                exclude_patterns_str=exclude_patterns,
-                discard_patterns_str=discard_patterns,
+                skip_patterns_str=skip_patterns,
                 mismatch_mode=mismatch_mode,
+                include_biases=include_biases,
             )
             output_sd.update(model_lora)
         

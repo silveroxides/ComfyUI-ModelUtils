@@ -1,18 +1,33 @@
+import mmap
 import json
 import struct
 import torch
 
+
 class MemoryEfficientSafeOpen:
-    def __init__(self, filename, device='cpu'):
+    """Memory-efficient safetensors file reader with optional mmap zero-copy support.
+    
+    When mmap_mode=True, tensor data is read directly from disk via memory-mapped file,
+    avoiding intermediate copying. This is especially efficient for large models.
+    """
+    
+    def __init__(self, filename, device='cpu', mmap_mode=True):
         self.filename = filename
         self.device = device
+        self.mmap_mode = mmap_mode
         self.header, self.header_size = self._read_header()
         self.file = open(filename, "rb")
+        self.mmap_obj = None
+
+        if self.mmap_mode:
+            self.mmap_obj = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.mmap_obj:
+            self.mmap_obj.close()
         self.file.close()
 
     def keys(self):
@@ -25,10 +40,21 @@ class MemoryEfficientSafeOpen:
         metadata = self.header[key]
         offset_start, offset_end = metadata["data_offsets"]
 
-        tensor_bytes = None
-        if offset_start != offset_end:
-            self.file.seek(self.header_size + 8 + offset_start)
-            tensor_bytes = self.file.read(offset_end - offset_start)
+        if self.mmap_mode and self.mmap_obj:
+            if offset_start != offset_end:
+                # Calculate absolute offset in file
+                start = self.header_size + 8 + offset_start
+                end = self.header_size + 8 + offset_end
+                # Create tensor from memory view (zero-copy)
+                # Note: This tensor is valid only while the file/mmap is open
+                tensor_bytes = memoryview(self.mmap_obj)[start:end]
+            else:
+                tensor_bytes = None
+        else:
+            tensor_bytes = None
+            if offset_start != offset_end:
+                self.file.seek(self.header_size + 8 + offset_start)
+                tensor_bytes = self.file.read(offset_end - offset_start)
 
         return self._deserialize_tensor(tensor_bytes, metadata)
 

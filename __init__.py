@@ -22,6 +22,7 @@ from .nodes.merger import (
 from .nodes.lora_extract import (
     LoRASaveFromFile, LoRACheckpointSaveFromFile
 )
+from .nodes.lycoris_extract import LyCORISExtractFromFile
 
 
 class ModelUtilsExtension(ComfyExtension):
@@ -45,6 +46,8 @@ class ModelUtilsExtension(ComfyExtension):
             CheckpointThreeMerger, EmbeddingThreeMerger,
             # LoRA Extraction
             LoRASaveFromFile, LoRACheckpointSaveFromFile,
+            # LyCORIS Extraction
+            LyCORISExtractFromFile,
         ]
 
 
