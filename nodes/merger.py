@@ -3,6 +3,7 @@ import re
 import torch
 import folder_paths
 import comfy.utils
+from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
@@ -104,7 +105,7 @@ class MergerLogic:
         discarded_keys = 0
         error_keys = []
         
-        for key in all_keys:
+        for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
             # Check discard patterns first - skip entirely
             if _matches_any_pattern(key, discard_patterns):
                 discarded_keys += 1
@@ -163,7 +164,8 @@ class MergerLogic:
         for handler in handlers.values():
             handler.__exit__(None, None, None)
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        output_dir = folder_paths.get_folder_paths(output_folder)[0]
+        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
+        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")

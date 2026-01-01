@@ -1,5 +1,7 @@
 import os
 import folder_paths
+import comfy.utils
+from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
@@ -32,11 +34,14 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
 
     original_keys = list(model_weights.keys())
     renamed_tensors = {}
-    for key in original_keys:
+    pbar = comfy.utils.ProgressBar(len(original_keys))
+    for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
         new_key = key_map.get(key, key)
         renamed_tensors[new_key] = model_weights[key]
+        pbar.update(1)
 
-    model_dir = folder_paths.get_folder_paths(model_type)[0]
+    # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
+    model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     save_file(renamed_tensors, output_path, metadata)

@@ -5,9 +5,11 @@ This node loads two models from files and extracts a LoRA by computing the diffe
 without requiring the full models to be loaded into GPU memory via ComfyUI's model management.
 """
 import os
+import re
 import torch
 import folder_paths
 import comfy.utils
+from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from .merger_utils import MemoryEfficientSafeOpen
@@ -48,6 +50,28 @@ def extract_lora(diff, rank):
     return (U, Vh)
 
 
+def _compile_patterns(pattern_string: str) -> list:
+    """Compiles whitespace-separated regex patterns into a list of compiled patterns."""
+    if not pattern_string or not pattern_string.strip():
+        return []
+    
+    patterns = []
+    for pattern in pattern_string.split():
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error as e:
+            raise ValueError(f"Invalid regex pattern '{pattern}': {e}")
+    return patterns
+
+
+def _matches_any_pattern(key: str, patterns: list) -> bool:
+    """Returns True if key matches any of the compiled regex patterns (substring search)."""
+    for pattern in patterns:
+        if pattern.search(key):
+            return True
+    return False
+
+
 def extract_lora_from_files(
     model_a_path: str,
     model_b_path: str,
@@ -57,6 +81,9 @@ def extract_lora_from_files(
     prefix_lora: str,
     process_device: str,
     save_dtype: str,
+    exclude_patterns_str: str = "",
+    discard_patterns_str: str = "",
+    mismatch_mode: str = "skip",
 ) -> dict[str, torch.Tensor]:
     """
     Memory-efficient LoRA extraction by streaming tensors from safetensors files.
@@ -70,6 +97,9 @@ def extract_lora_from_files(
         prefix_lora: Prefix for LoRA keys (e.g., "diffusion_model.")
         process_device: Device for processing ("cuda" or "cpu")
         save_dtype: Output dtype ("fp16", "bf16", "fp32")
+        exclude_patterns_str: Regex patterns to exclude from extraction (use model A only)
+        discard_patterns_str: Regex patterns to discard entirely (no output)
+        mismatch_mode: "skip" (use model A), "zeros" (use zeros), "error" (raise error)
     
     Returns:
         Dictionary of LoRA tensors
@@ -83,6 +113,10 @@ def extract_lora_from_files(
         "bf16": torch.bfloat16
     }.get(save_dtype, torch.float16)
     
+    # Compile patterns
+    exclude_patterns = _compile_patterns(exclude_patterns_str)
+    discard_patterns = _compile_patterns(discard_patterns_str)
+    
     # Open both files with memory-efficient handler
     handler_a = MemoryEfficientSafeOpen(model_a_path)
     handler_b = MemoryEfficientSafeOpen(model_b_path)
@@ -91,34 +125,77 @@ def extract_lora_from_files(
         keys_a = set(handler_a.keys())
         keys_b = set(handler_b.keys())
         
-        # Only process keys that exist in both models
-        common_keys = keys_a & keys_b
-        weight_keys = [k for k in common_keys if k.endswith(".weight")]
-        bias_keys = [k for k in common_keys if k.endswith(".bias")] if bias_diff else []
+        # Get all weight keys from model A (primary)
+        all_weight_keys = [k for k in keys_a if k.endswith(".weight")]
+        all_bias_keys = [k for k in keys_a if k.endswith(".bias")] if bias_diff else []
         
         # Log key differences
         missing_in_b = keys_a - keys_b
         extra_in_b = keys_b - keys_a
         if missing_in_b:
-            print(f"[LoRA Extract] {len(missing_in_b)} keys in model A not in model B (skipped)")
+            print(f"[LoRA Extract] {len(missing_in_b)} keys in model A not in model B")
         if extra_in_b:
             print(f"[LoRA Extract] {len(extra_in_b)} keys in model B not in model A (ignored)")
         
-        pbar = comfy.utils.ProgressBar(len(weight_keys) + len(bias_keys))
+        pbar = comfy.utils.ProgressBar(len(all_weight_keys) + len(all_bias_keys))
         
-        for key in weight_keys:
-            # Load tensors one at a time
-            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
-            tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
-            
-            # Compute difference: finetuned - base
-            weight_diff = tensor_a - tensor_b
-            
-            # Clean up immediately
-            del tensor_a, tensor_b
-            
-            # Extract LoRA key name
+        # Stats
+        skipped_keys = 0
+        excluded_keys = 0
+        discarded_keys = 0
+        shape_mismatch_keys = 0
+        
+        for key in tqdm(all_weight_keys, desc="Extracting LoRA weights", unit="layers"):
             lora_key = key[:-7]  # Remove ".weight"
+            
+            # Check discard patterns first - skip entirely
+            if _matches_any_pattern(key, discard_patterns):
+                discarded_keys += 1
+                pbar.update(1)
+                continue
+            
+            # Load model A tensor
+            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
+            
+            # Check exclude patterns - skip extraction, no output for this key
+            if _matches_any_pattern(key, exclude_patterns):
+                excluded_keys += 1
+                del tensor_a
+                pbar.update(1)
+                continue
+            
+            # Check if key exists in model B
+            if key not in keys_b:
+                if mismatch_mode == "error":
+                    raise ValueError(f"Key '{key}' not found in model B (mismatch_mode='error')")
+                elif mismatch_mode == "skip":
+                    skipped_keys += 1
+                    del tensor_a
+                    pbar.update(1)
+                    continue
+                # zeros mode: use tensor_a as-is (diff with zeros = tensor_a)
+                weight_diff = tensor_a
+            else:
+                tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
+                
+                # Check shape mismatch
+                if tensor_a.shape != tensor_b.shape:
+                    del tensor_b
+                    if mismatch_mode == "error":
+                        raise ValueError(f"Shape mismatch for '{key}': {tensor_a.shape} vs {tensor_b.shape}")
+                    elif mismatch_mode == "skip":
+                        shape_mismatch_keys += 1
+                        del tensor_a
+                        pbar.update(1)
+                        continue
+                    # zeros mode: use tensor_a as-is
+                    weight_diff = tensor_a
+                else:
+                    # Compute difference: finetuned - base
+                    weight_diff = tensor_a - tensor_b
+                    del tensor_b
+            
+            del tensor_a
             
             if lora_type == "standard":
                 if weight_diff.ndim < 2:
@@ -140,18 +217,63 @@ def extract_lora_from_files(
             pbar.update(1)
         
         # Process bias keys
-        for key in bias_keys:
-            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
-            tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
-            
-            bias_diff_tensor = tensor_a - tensor_b
-            del tensor_a, tensor_b
-            
+        for key in tqdm(all_bias_keys, desc="Extracting LoRA biases", unit="layers"):
             lora_key = key[:-5]  # Remove ".bias"
-            output_sd[f"{prefix_lora}{lora_key}.diff_b"] = bias_diff_tensor.to(save_torch_dtype).cpu()
             
+            # Check discard patterns
+            if _matches_any_pattern(key, discard_patterns):
+                discarded_keys += 1
+                pbar.update(1)
+                continue
+            
+            # Check exclude patterns
+            if _matches_any_pattern(key, exclude_patterns):
+                excluded_keys += 1
+                pbar.update(1)
+                continue
+            
+            tensor_a = handler_a.get_tensor(key).to(device=process_device, dtype=torch.float32)
+            
+            if key not in keys_b:
+                if mismatch_mode == "error":
+                    raise ValueError(f"Key '{key}' not found in model B (mismatch_mode='error')")
+                elif mismatch_mode == "skip":
+                    skipped_keys += 1
+                    del tensor_a
+                    pbar.update(1)
+                    continue
+                bias_diff_tensor = tensor_a
+            else:
+                tensor_b = handler_b.get_tensor(key).to(device=process_device, dtype=torch.float32)
+                
+                if tensor_a.shape != tensor_b.shape:
+                    del tensor_b
+                    if mismatch_mode == "error":
+                        raise ValueError(f"Shape mismatch for '{key}': {tensor_a.shape} vs {tensor_b.shape}")
+                    elif mismatch_mode == "skip":
+                        shape_mismatch_keys += 1
+                        del tensor_a
+                        pbar.update(1)
+                        continue
+                    bias_diff_tensor = tensor_a
+                else:
+                    bias_diff_tensor = tensor_a - tensor_b
+                    del tensor_b
+            
+            del tensor_a
+            output_sd[f"{prefix_lora}{lora_key}.diff_b"] = bias_diff_tensor.to(save_torch_dtype).cpu()
             del bias_diff_tensor
             pbar.update(1)
+        
+        # Log summary
+        if excluded_keys > 0:
+            print(f"[LoRA Extract] Excluded {excluded_keys} keys from extraction")
+        if discarded_keys > 0:
+            print(f"[LoRA Extract] Discarded {discarded_keys} keys from output")
+        if skipped_keys > 0:
+            print(f"[LoRA Extract] Skipped {skipped_keys} keys (missing in model B)")
+        if shape_mismatch_keys > 0:
+            print(f"[LoRA Extract] Skipped {shape_mismatch_keys} keys (shape mismatch)")
     
     finally:
         handler_a.__exit__(None, None, None)
@@ -194,11 +316,17 @@ class LoRASaveFromFile(io.ComfyNode):
                               tooltip="standard: SVD decomposition to lora_up/lora_down, full_diff: raw weight differences"),
                 io.Boolean.Input("bias_diff", default=True,
                                 tooltip="Include bias differences in the LoRA"),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip",
+                              tooltip="How to handle missing keys or shape mismatches between models"),
                 io.String.Input("output_filename", default="extracted_lora",
                                tooltip="Output filename (without extension)"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda",
                               tooltip="Device for SVD computation"),
+                io.String.Input("exclude_patterns", default="", multiline=True,
+                               tooltip="Regex patterns to exclude from extraction (one per line, whitespace-separated)"),
+                io.String.Input("discard_patterns", default="", multiline=True,
+                               tooltip="Regex patterns to discard entirely (no output for matching keys)"),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -214,9 +342,12 @@ class LoRASaveFromFile(io.ComfyNode):
         rank: int,
         lora_type: str,
         bias_diff: bool,
+        mismatch_mode: str,
         output_filename: str,
         save_dtype: str,
         process_device: str,
+        exclude_patterns: str,
+        discard_patterns: str,
     ) -> io.NodeOutput:
         # Get full paths
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -232,6 +363,9 @@ class LoRASaveFromFile(io.ComfyNode):
             prefix_lora="diffusion_model.",
             process_device=process_device,
             save_dtype=save_dtype,
+            exclude_patterns_str=exclude_patterns,
+            discard_patterns_str=discard_patterns,
+            mismatch_mode=mismatch_mode,
         )
         
         if not output_sd:
@@ -278,11 +412,17 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
                               tooltip="standard: SVD decomposition, full_diff: raw weight differences"),
                 io.Boolean.Input("bias_diff", default=True,
                                 tooltip="Include bias differences in the LoRA"),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip",
+                              tooltip="How to handle missing keys or shape mismatches between models"),
                 io.String.Input("output_filename", default="extracted_lora",
                                tooltip="Output filename (without extension)"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda",
                               tooltip="Device for SVD computation"),
+                io.String.Input("exclude_patterns", default="", multiline=True,
+                               tooltip="Regex patterns to exclude from extraction"),
+                io.String.Input("discard_patterns", default="", multiline=True,
+                               tooltip="Regex patterns to discard entirely"),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -298,9 +438,12 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
         rank: int,
         lora_type: str,
         bias_diff: bool,
+        mismatch_mode: str,
         output_filename: str,
         save_dtype: str,
         process_device: str,
+        exclude_patterns: str,
+        discard_patterns: str,
     ) -> io.NodeOutput:
         # Get full paths
         checkpoint_a_path = folder_paths.get_full_path_or_raise("checkpoints", checkpoint_a)
@@ -330,6 +473,9 @@ class LoRACheckpointSaveFromFile(io.ComfyNode):
                 prefix_lora="diffusion_model.",
                 process_device=process_device,
                 save_dtype=save_dtype,
+                exclude_patterns_str=exclude_patterns,
+                discard_patterns_str=discard_patterns,
+                mismatch_mode=mismatch_mode,
             )
             output_sd.update(model_lora)
         

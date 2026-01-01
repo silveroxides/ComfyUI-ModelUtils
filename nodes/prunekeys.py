@@ -1,6 +1,8 @@
 import os
 import re
 import folder_paths
+import comfy.utils
+from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
@@ -29,7 +31,8 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
         raise ValueError("No keys/patterns provided to prune.")
 
     pruned_tensors = {}
-    for key, tensor in model_weights.items():
+    pbar = comfy.utils.ProgressBar(len(model_weights))
+    for key, tensor in tqdm(model_weights.items(), desc="Pruning keys", unit="keys"):
         is_match = False
         if use_regex:
             if any(re.search(pattern, key) for pattern in patterns):
@@ -40,8 +43,10 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
 
         if not is_match:
             pruned_tensors[key] = tensor
+        pbar.update(1)
 
-    model_dir = folder_paths.get_folder_paths(model_type)[0]
+    # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
+    model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     save_file(pruned_tensors, output_path, metadata)

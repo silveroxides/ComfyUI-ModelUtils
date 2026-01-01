@@ -1,5 +1,7 @@
 import os
 import folder_paths
+import comfy.utils
+from tqdm import tqdm
 from comfy_api.latest import io
 from .utils import convert_pt_to_safetensors, load_metadata_from_safetensors
 
@@ -21,11 +23,13 @@ def _get_metakeys(model_name: str, model_type: str) -> tuple[str, str]:
 
     model_weights, metadata = load_metadata_from_safetensors(model_path)
     metadata_str = str(metadata)
-    for layer_name, tensor in model_weights.items():
+    pbar = comfy.utils.ProgressBar(len(model_weights))
+    for layer_name, tensor in tqdm(model_weights.items(), desc="Reading layer shapes", unit="layers"):
         shape = str(tensor.shape)
         shape = shape.replace("torch.Size(", "").replace(")", "")
         name_shape = f"{layer_name}, {shape}\n"
         layer_shapes += name_shape
+        pbar.update(1)
     return metadata_str, layer_shapes
 
 
