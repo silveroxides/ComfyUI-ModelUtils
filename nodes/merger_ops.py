@@ -61,7 +61,7 @@ class LoadTensor(Operation):
     def merge(self) -> torch.Tensor:
         if self.model_name not in self.handlers:
             raise ValueError(f"Model '{self.model_name}' is required for this mode but was not provided.")
-        
+
         handler = self.handlers[self.model_name]
         if self.key not in handler.keys():
             if self.on_missing == MissingTensorBehavior.ERROR:
@@ -77,7 +77,7 @@ class LoadTensor(Operation):
                     )
                 dtype = self.fallback_dtype if self.fallback_dtype else self.dtype
                 return torch.zeros(self.fallback_shape, device=self.device, dtype=dtype)
-        
+
         return handler.get_tensor(self.key).to(device=self.device, dtype=self.dtype)
 
 class Multiply(Operation):
@@ -200,7 +200,7 @@ class InterpolateDifference(Operation):
 class CalcMode:
     name = 'calcmode'; description = 'description'; models_used = []; param_docs = {}
     def create_recipe(self, key, **kwargs) -> Operation: raise NotImplementedError
-    
+
     @staticmethod
     def _get_secondary_loader_args(kwargs, mismatch_mode):
         """Helper to build loader args for secondary models (B, C) with fallback support."""
@@ -219,13 +219,13 @@ class CalcMode:
 
 class PreloadedTensor(Operation):
     """Returns a pre-loaded tensor instead of loading from file.
-    
+
     Used when Model A's tensor is pre-loaded in the merge loop.
     """
     def __init__(self, key, tensor):
         super().__init__(key)
         self.tensor = tensor
-    
+
     def merge(self) -> torch.Tensor:
         return self.tensor
 
@@ -236,17 +236,17 @@ class WeightSum(CalcMode):
     param_docs = {'alpha': 'Interpolation weight. 0.0 is 100% Model A, 1.0 is 100% Model B.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         # Use pre-loaded tensor_a if available
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        
+
         if kwargs['alpha'] >= 1: return b
         if kwargs['alpha'] <= 0: return a
         c = Multiply(key, 1 - kwargs['alpha'], a)
@@ -261,13 +261,13 @@ class AddDifference(CalcMode):
     param_docs = {'alpha': 'Multiplier for the (B - C) difference.', 'beta': 'Smoothing (0=Off, 1=On).'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_bc = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
@@ -284,13 +284,13 @@ class TrainDifference(CalcMode):
     param_docs = {'alpha': 'Multiplier for the calculated difference.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_bc = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
@@ -304,17 +304,17 @@ class InterpDifference(CalcMode):
     param_docs = {'alpha': 'Curve strength.', 'beta': 'Style (0=Similarity, 1=Difference).', 'gamma': 'Mix (0=Random, 1=Linear).'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         # Skip certain keys entirely
         if key.startswith('cond_stage_model.transformer.text_model.embeddings'):
             return a
-        
+
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         return InterpolateDifference(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
@@ -327,13 +327,13 @@ class Extract(CalcMode):
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Similarity vs dissimilarity.', 'gamma': 'Similarity bias.', 'delta': 'Multiplier for final features.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_bc = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
@@ -349,13 +349,13 @@ class AddDisimilarity(CalcMode):
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Multiplier for final features.', 'gamma': 'Similarity bias.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_bc = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
@@ -371,13 +371,13 @@ class PowerUp(CalcMode):
     param_docs = {'alpha': 'Dropout rate (proportion of weights from B to *drop*).', 'beta': 'Multiplier for the final difference.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         deltahat = PowerUpOp(key, kwargs['alpha'], kwargs['seed'], a, b)
@@ -392,13 +392,13 @@ class SVDMode(CalcMode):
     param_docs = {'alpha': 'Rank for standard layers.', 'beta': 'Rank for 3x3 conv layers.', 'gamma': 'Clamp quantile for weights.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
-        
+
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
         else:
             loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
             a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
-        
+
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         return SVD(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)

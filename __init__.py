@@ -19,8 +19,9 @@ from .nodes.merger import (
     ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
     CheckpointThreeMerger, EmbeddingThreeMerger
 )
-from .nodes.lora_extract import (
-    LoRASaveFromFile, LoRACheckpointSaveFromFile
+from .nodes.lora_extract_svd import (
+    LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
+    LoRAExtractKnee, LoRAExtractFrobenius
 )
 
 
@@ -44,9 +45,11 @@ class ModelUtilsExtension(ComfyExtension):
             ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
             CheckpointThreeMerger, EmbeddingThreeMerger,
             # LoRA Extraction
-            LoRASaveFromFile, LoRACheckpointSaveFromFile,
+            LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
+            LoRAExtractKnee, LoRAExtractFrobenius,
         ]
 
 
 async def comfy_entrypoint() -> ModelUtilsExtension:
     return ModelUtilsExtension()
+
