@@ -1,0 +1,600 @@
+{
+  "id": "e07ecc9b-30b9-45e4-9ed6-5fbb7e510257",
+  "revision": 0,
+  "last_node_id": 31,
+  "last_link_id": 19,
+  "nodes": [
+    {
+      "id": 16,
+      "type": "PreviewAny",
+      "pos": [
+        -3608,
+        200
+      ],
+      "size": [
+        832,
+        232
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 18
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 17,
+      "type": "ModelMetaKeys",
+      "pos": [
+        -2800,
+        504
+      ],
+      "size": [
+        346.253515625,
+        78
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "keys",
+          "type": "STRING",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "ModelMetaKeys"
+      },
+      "widgets_values": [
+        "flux2-dev.safetensors"
+      ]
+    },
+    {
+      "id": 18,
+      "type": "TextEncoderMetaKeys",
+      "pos": [
+        -3176,
+        680
+      ],
+      "size": [
+        329.4234375,
+        78
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "links": [
+            15
+          ]
+        },
+        {
+          "name": "keys",
+          "type": "STRING",
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "TextEncoderMetaKeys"
+      },
+      "widgets_values": [
+        "clip_l.safetensors"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "CheckpointMetaKeys",
+      "pos": [
+        -3168,
+        512
+      ],
+      "size": [
+        317.6724609375,
+        78
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "links": [
+            12
+          ]
+        },
+        {
+          "name": "keys",
+          "type": "STRING",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "CheckpointMetaKeys"
+      },
+      "widgets_values": [
+        "unsorted\\v1-5-pruned-emaonly.safetensors"
+      ]
+    },
+    {
+      "id": 21,
+      "type": "LoRAMetaKeys",
+      "pos": [
+        -2800,
+        680
+      ],
+      "size": [
+        277.0943359375,
+        78
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "keys",
+          "type": "STRING",
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "LoRAMetaKeys"
+      },
+      "widgets_values": [
+        "Chroma\\FlatAnimeStyle_Chroma.safetensors"
+      ]
+    },
+    {
+      "id": 24,
+      "type": "PreviewAny",
+      "pos": [
+        -2728,
+        216
+      ],
+      "size": [
+        512,
+        200
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 17
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 25,
+      "type": "PreviewAny",
+      "pos": [
+        -2816,
+        832
+      ],
+      "size": [
+        736,
+        248
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 19
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 27,
+      "type": "PreviewAny",
+      "pos": [
+        -3496,
+        848
+      ],
+      "size": [
+        632,
+        224
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 16
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 28,
+      "type": "PreviewAny",
+      "pos": [
+        -3600,
+        664
+      ],
+      "size": [
+        352,
+        136
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 15
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 29,
+      "type": "PreviewAny",
+      "pos": [
+        -2408,
+        648
+      ],
+      "size": [
+        360,
+        120
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 14
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 30,
+      "type": "PreviewAny",
+      "pos": [
+        -3576,
+        480
+      ],
+      "size": [
+        336,
+        128
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 12
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 31,
+      "type": "PreviewAny",
+      "pos": [
+        -2368,
+        472
+      ],
+      "size": [
+        328,
+        120
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 13
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    }
+  ],
+  "links": [
+    [
+      12,
+      19,
+      0,
+      30,
+      0,
+      "STRING"
+    ],
+    [
+      13,
+      17,
+      0,
+      31,
+      0,
+      "STRING"
+    ],
+    [
+      14,
+      21,
+      0,
+      29,
+      0,
+      "STRING"
+    ],
+    [
+      15,
+      18,
+      0,
+      28,
+      0,
+      "STRING"
+    ],
+    [
+      16,
+      18,
+      1,
+      27,
+      0,
+      "STRING"
+    ],
+    [
+      17,
+      17,
+      1,
+      24,
+      0,
+      "STRING"
+    ],
+    [
+      18,
+      19,
+      1,
+      16,
+      0,
+      "STRING"
+    ],
+    [
+      19,
+      21,
+      1,
+      25,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.9070294784580497,
+      "offset": [
+        3855.323424397858,
+        -56.106573378634465
+      ]
+    },
+    "frontendVersion": "1.37.2",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

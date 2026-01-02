@@ -1,0 +1,583 @@
+{
+  "id": "e07ecc9b-30b9-45e4-9ed6-5fbb7e510257",
+  "revision": 0,
+  "last_node_id": 46,
+  "last_link_id": 31,
+  "nodes": [
+    {
+      "id": 35,
+      "type": "LoRAMetaKeys",
+      "pos": [
+        -3136,
+        512
+      ],
+      "size": [
+        376,
+        78
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "keys",
+          "type": "STRING",
+          "links": [
+            21,
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "LoRAMetaKeys"
+      },
+      "widgets_values": [
+        "qwen\\gmqwen_k8_piid_4step.safetensors"
+      ]
+    },
+    {
+      "id": 36,
+      "type": "LoRARenameKeys",
+      "pos": [
+        -2856,
+        864
+      ],
+      "size": [
+        320,
+        190
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "old_keys",
+          "type": "STRING",
+          "widget": {
+            "name": "old_keys"
+          },
+          "link": 27
+        },
+        {
+          "name": "new_keys",
+          "type": "STRING",
+          "widget": {
+            "name": "new_keys"
+          },
+          "link": 28
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_path",
+          "type": "STRING",
+          "links": [
+            31
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfyui_modelutils",
+        "ver": "eef737706127fe4a2c28172ab706e92318e0dc60",
+        "Node name for S&R": "LoRARenameKeys"
+      },
+      "widgets_values": [
+        "qwen\\gmqwen_k8_piid_4step.safetensors",
+        "",
+        "",
+        "gmqwen_k8_piid_4step"
+      ]
+    },
+    {
+      "id": 37,
+      "type": "PreviewAny",
+      "pos": [
+        -3792,
+        920
+      ],
+      "size": [
+        592,
+        384
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 21
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 40,
+      "type": "RegexReplace",
+      "pos": [
+        -3400,
+        568
+      ],
+      "size": [
+        210,
+        292
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string",
+          "type": "STRING",
+          "widget": {
+            "name": "string"
+          },
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            23,
+            25
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "RegexReplace"
+      },
+      "widgets_values": [
+        "",
+        ",\\s\\[.+$",
+        "",
+        true,
+        true,
+        false,
+        0
+      ]
+    },
+    {
+      "id": 41,
+      "type": "PreviewAny",
+      "pos": [
+        -3784,
+        528
+      ],
+      "size": [
+        360,
+        328
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 23
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 42,
+      "type": "RegexReplace",
+      "pos": [
+        -3176,
+        1016
+      ],
+      "size": [
+        288,
+        292
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string",
+          "type": "STRING",
+          "widget": {
+            "name": "string"
+          },
+          "link": 26
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            28,
+            30
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "RegexReplace"
+      },
+      "widgets_values": [
+        "",
+        "^(\\w+)",
+        "diffusion_model.\\1",
+        true,
+        true,
+        false,
+        0
+      ]
+    },
+    {
+      "id": 43,
+      "type": "RegexReplace",
+      "pos": [
+        -3152,
+        648
+      ],
+      "size": [
+        288,
+        292
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string",
+          "type": "STRING",
+          "widget": {
+            "name": "string"
+          },
+          "link": 25
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            26,
+            27,
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "RegexReplace"
+      },
+      "widgets_values": [
+        "",
+        "^(proj_out.+|norm_out.+)$\\n",
+        "",
+        true,
+        true,
+        false,
+        0
+      ]
+    },
+    {
+      "id": 44,
+      "type": "PreviewAny",
+      "pos": [
+        -2832,
+        632
+      ],
+      "size": [
+        640,
+        192
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 29
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 45,
+      "type": "PreviewAny",
+      "pos": [
+        -2848,
+        1096
+      ],
+      "size": [
+        640,
+        192
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 30
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "id": 46,
+      "type": "PreviewAny",
+      "pos": [
+        -2520,
+        872
+      ],
+      "size": [
+        336,
+        168
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 31
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [
+        null,
+        null,
+        true
+      ]
+    }
+  ],
+  "links": [
+    [
+      21,
+      35,
+      1,
+      37,
+      0,
+      "STRING"
+    ],
+    [
+      22,
+      35,
+      1,
+      40,
+      0,
+      "STRING"
+    ],
+    [
+      23,
+      40,
+      0,
+      41,
+      0,
+      "STRING"
+    ],
+    [
+      25,
+      40,
+      0,
+      43,
+      0,
+      "STRING"
+    ],
+    [
+      26,
+      43,
+      0,
+      42,
+      0,
+      "STRING"
+    ],
+    [
+      27,
+      43,
+      0,
+      36,
+      0,
+      "STRING"
+    ],
+    [
+      28,
+      42,
+      0,
+      36,
+      1,
+      "STRING"
+    ],
+    [
+      29,
+      43,
+      0,
+      44,
+      0,
+      "STRING"
+    ],
+    [
+      30,
+      42,
+      0,
+      45,
+      0,
+      "STRING"
+    ],
+    [
+      31,
+      36,
+      0,
+      46,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 1,
+      "offset": [
+        4191.258750150775,
+        -356.1917593715161
+      ]
+    },
+    "frontendVersion": "1.37.2",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
