@@ -44,9 +44,16 @@ def _index_sv_ratio(S: torch.Tensor, ratio: float) -> int:
     return max(1, min(rank, len(S) - 1))
 
 
-def _index_sv_cumulative(S: torch.Tensor, target: float) -> int:
-    """Cumulative mode - keep enough SVs to reach target % of total."""
-    total = torch.sum(S)
+def _index_sv_cumulative(S: torch.Tensor, target: float, max_rank: int = None) -> int:
+    """Cumulative mode - keep enough SVs to reach target % of total.
+    
+    Calculates relative to max_rank if provided, otherwise relative to full.
+    """
+    if max_rank is not None and max_rank < len(S):
+        total = torch.sum(S[:max_rank])
+    else:
+        total = torch.sum(S)
+    
     if total < 1e-8:
         return 1
     cumsum = torch.cumsum(S, dim=0) / total
@@ -54,13 +61,26 @@ def _index_sv_cumulative(S: torch.Tensor, target: float) -> int:
     return max(1, min(rank, len(S) - 1))
 
 
-def _index_sv_fro(S: torch.Tensor, target: float) -> int:
-    """Frobenius norm mode - preserve target fraction of Frobenius norm."""
-    S_sq = S.pow(2)
-    total_sq = torch.sum(S_sq)
+def _index_sv_fro(S: torch.Tensor, target: float, max_rank: int = None) -> int:
+    """Frobenius norm mode - preserve target fraction of Frobenius norm.
+    
+    Calculates relative to max_rank if provided, otherwise relative to full.
+    This means "retain target% of what's achievable within max_rank".
+    """
+    if max_rank is not None and max_rank < len(S):
+        # Calculate relative to what's achievable within max_rank
+        S_capped = S[:max_rank]
+        S_sq = S_capped.pow(2)
+        total_sq = torch.sum(S_sq)
+    else:
+        S_sq = S.pow(2)
+        total_sq = torch.sum(S_sq)
+    
     if total_sq < 1e-8:
         return 1
-    cumsum = torch.cumsum(S_sq, dim=0) / total_sq
+    
+    # Cumsum of all S (not capped) to find where we reach target
+    cumsum = torch.cumsum(S.pow(2), dim=0) / total_sq
     rank = int(torch.searchsorted(cumsum, target ** 2).item()) + 1
     return max(1, min(rank, len(S) - 1))
 
@@ -122,9 +142,9 @@ def _compute_rank(S: torch.Tensor, mode: str, mode_param: float,
     elif mode == "ratio":
         rank = _index_sv_ratio(S, mode_param)
     elif mode == "quantile" or mode == "sv_cumulative":
-        rank = _index_sv_cumulative(S, mode_param)
+        rank = _index_sv_cumulative(S, mode_param, max_rank)
     elif mode == "sv_fro":
-        rank = _index_sv_fro(S, mode_param)
+        rank = _index_sv_fro(S, mode_param, max_rank)
     elif mode == "sv_knee":
         rank = _index_sv_knee(S)
     elif mode == "sv_cumulative_knee":

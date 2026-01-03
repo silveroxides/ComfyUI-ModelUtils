@@ -284,14 +284,13 @@ def _compute_resize(
     """Compute new rank and alpha based on resize method."""
     
     if dynamic_method == "sv_ratio" and dynamic_param is not None:
-        # Note: _index_sv_ratio uses S[0]*ratio, kohya uses S[0]/ratio
-        # Use kohya convention here for consistency with their tool
+        # Use kohya convention: S[0]/ratio
         min_sv = S[0] / dynamic_param
         new_rank = max(1, int(torch.sum(S > min_sv).item()))
     elif dynamic_method == "sv_cumulative" and dynamic_param is not None:
-        new_rank = _index_sv_cumulative(S, dynamic_param)
+        new_rank = _index_sv_cumulative(S, dynamic_param, max_rank)
     elif dynamic_method == "sv_fro" and dynamic_param is not None:
-        new_rank = _index_sv_fro(S, dynamic_param)
+        new_rank = _index_sv_fro(S, dynamic_param, max_rank)
     else:
         new_rank = max_rank
     
