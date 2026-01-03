@@ -36,10 +36,10 @@ def _index_sv_threshold(S: torch.Tensor, threshold: float) -> int:
 
 
 def _index_sv_ratio(S: torch.Tensor, ratio: float) -> int:
-    """Ratio mode - keep singular values > max(S) * ratio."""
+    """Ratio mode - keep singular values > max(S) / ratio (kohya convention)."""
     if ratio <= 0:
         return len(S) - 1
-    min_sv = S[0] * ratio
+    min_sv = S[0] / ratio
     rank = int(torch.sum(S > min_sv).item())
     return max(1, min(rank, len(S) - 1))
 
@@ -148,12 +148,16 @@ def _svd_extract_linear_lowrank(
     rank: int,
     device: str,
     clamp_quantile: float = 0.99,
+    niter: int = 2,
 ) -> tuple:
     """
     Low-rank SVD decomposition using svd_lowrank for fixed rank extraction.
     
     Much faster than full SVD when rank << min(m, n) because it only computes
     the top-k singular values using randomized algorithms.
+    
+    Args:
+        niter: Power iterations for SVD accuracy (higher = more accurate but slower)
     
     Returns:
         (lora_down, lora_up, diff), "low rank" or (weight, "full")
@@ -170,9 +174,8 @@ def _svd_extract_linear_lowrank(
         return weight, "full"
     
     # Use svd_lowrank for faster low-rank approximation
-    # niter controls accuracy (higher = more accurate but slower)
     try:
-        U, S, V = torch.svd_lowrank(weight, q=rank, niter=2)
+        U, S, V = torch.svd_lowrank(weight, q=rank, niter=niter)
         # U: [out_dim, rank], S: [rank], V: [in_dim, rank]
         Vh = V.T  # [rank, in_dim]
     except Exception as e:
@@ -203,6 +206,7 @@ def _svd_extract_linear(
     device: str,
     max_rank: int = None,
     clamp_quantile: float = 0.99,
+    niter: int = 2,
 ) -> tuple:
     """
     SVD decomposition for linear layers.
@@ -221,7 +225,7 @@ def _svd_extract_linear(
         target_rank = int(mode_param)
         if max_rank is not None:
             target_rank = min(target_rank, max_rank)
-        return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile)
+        return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile, niter)
 
     # For adaptive modes, use full SVD to analyze singular values
     try:
@@ -409,6 +413,7 @@ def extract_lora_from_files(
     skip_patterns_str: str = "",
     mismatch_mode: str = "skip",
     chunk_large_layers: bool = True,
+    svd_niter: int = 2,
 ) -> dict[str, torch.Tensor]:
     """
     Extract LoRA from difference between two models.
@@ -528,7 +533,7 @@ def extract_lora_from_files(
                     )
                 else:
                     result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile
+                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile, svd_niter
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -640,6 +645,8 @@ class LoRAExtractFixed(io.ComfyNode):
                             tooltip="Rank for linear/attention layers"),
                 io.Int.Input("conv_dim", default=32, min=1, max=4096,
                             tooltip="Rank for conv layers"),
+                io.Int.Input("svd_niter", default=2, min=0, max=10,
+                            tooltip="SVD power iterations (higher = more accurate but slower)"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -647,7 +654,7 @@ class LoRAExtractFixed(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_dim, conv_dim, chunk_large_layers,
+    def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
@@ -657,7 +664,7 @@ class LoRAExtractFixed(io.ComfyNode):
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             "lora_unet_", device, save_dtype, linear_dim, conv_dim,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -672,13 +679,17 @@ class LoRAExtractRatio(io.ComfyNode):
             node_id="LoRAExtractRatio",
             display_name="LoRA Extract (Ratio)",
             category="ModelUtils/LoRA",
-            description="Keep singular values > max(S) × ratio.",
+            description="Keep singular values > max(S) / ratio.",
             inputs=[
                 *_get_model_inputs(),
-                io.Float.Input("linear_ratio", default=0.5, min=0.0, max=1.0, step=0.01,
-                              tooltip="Ratio threshold for linear layers"),
-                io.Float.Input("conv_ratio", default=0.5, min=0.0, max=1.0, step=0.01,
-                              tooltip="Ratio threshold for conv layers"),
+                io.Float.Input("linear_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
+                              tooltip="Ratio threshold for linear layers (higher = more SVs kept)"),
+                io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
+                              tooltip="Ratio threshold for conv layers (higher = more SVs kept)"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -686,8 +697,8 @@ class LoRAExtractRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -695,7 +706,7 @@ class LoRAExtractRatio(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -718,6 +729,10 @@ class LoRAExtractQuantile(io.ComfyNode):
                               tooltip="Target cumulative % for linear layers"),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target cumulative % for conv layers"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -725,8 +740,8 @@ class LoRAExtractQuantile(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -734,7 +749,7 @@ class LoRAExtractQuantile(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -755,6 +770,10 @@ class LoRAExtractKnee(io.ComfyNode):
                 *_get_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"],
                               default="sv_knee", tooltip="Knee detection method"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -762,8 +781,8 @@ class LoRAExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -771,7 +790,7 @@ class LoRAExtractKnee(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -794,6 +813,10 @@ class LoRAExtractFrobenius(io.ComfyNode):
                               tooltip="Target Frobenius norm fraction for linear"),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target Frobenius norm fraction for conv"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -801,8 +824,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_target, conv_target, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -810,7 +833,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
