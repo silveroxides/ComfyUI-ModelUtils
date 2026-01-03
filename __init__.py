@@ -23,6 +23,10 @@ from .nodes.lora_extract_svd import (
     LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
     LoRAExtractKnee, LoRAExtractFrobenius
 )
+from .nodes.lora_resize import (
+    LoRAResizeFixed, LoRAResizeRatio,
+    LoRAResizeFrobenius, LoRAResizeCumulative
+)
 
 
 class ModelUtilsExtension(ComfyExtension):
@@ -47,6 +51,9 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Extraction
             LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
             LoRAExtractKnee, LoRAExtractFrobenius,
+            # LoRA Resize
+            LoRAResizeFixed, LoRAResizeRatio,
+            LoRAResizeFrobenius, LoRAResizeCumulative,
         ]
 
 

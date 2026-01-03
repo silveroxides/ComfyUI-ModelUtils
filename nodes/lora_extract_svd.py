@@ -36,10 +36,10 @@ def _index_sv_threshold(S: torch.Tensor, threshold: float) -> int:
 
 
 def _index_sv_ratio(S: torch.Tensor, ratio: float) -> int:
-    """Ratio mode - keep singular values > max(S) * ratio."""
+    """Ratio mode - keep singular values > max(S) / ratio (kohya convention)."""
     if ratio <= 0:
         return len(S) - 1
-    min_sv = S[0] * ratio
+    min_sv = S[0] / ratio
     rank = int(torch.sum(S > min_sv).item())
     return max(1, min(rank, len(S) - 1))
 
@@ -672,13 +672,13 @@ class LoRAExtractRatio(io.ComfyNode):
             node_id="LoRAExtractRatio",
             display_name="LoRA Extract (Ratio)",
             category="ModelUtils/LoRA",
-            description="Keep singular values > max(S) × ratio.",
+            description="Keep singular values > max(S) / ratio.",
             inputs=[
                 *_get_model_inputs(),
-                io.Float.Input("linear_ratio", default=0.5, min=0.0, max=1.0, step=0.01,
-                              tooltip="Ratio threshold for linear layers"),
-                io.Float.Input("conv_ratio", default=0.5, min=0.0, max=1.0, step=0.01,
-                              tooltip="Ratio threshold for conv layers"),
+                io.Float.Input("linear_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
+                              tooltip="Ratio threshold for linear layers (higher = more SVs kept)"),
+                io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
+                              tooltip="Ratio threshold for conv layers (higher = more SVs kept)"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
