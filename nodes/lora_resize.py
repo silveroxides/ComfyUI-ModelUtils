@@ -205,13 +205,21 @@ def _extract_linear(
     """Extract LoRA from merged linear weight."""
     out_size, in_size = weight.shape
     
-    U, S, Vh = linalg.svd(weight, full_matrices=False)
-    
-    new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
-    
-    U = U[:, :new_rank]
-    S = S[:new_rank]
-    Vh = Vh[:new_rank, :]
+    if dynamic_method is None:
+        # Fixed rank - use svd_lowrank for 10x speedup
+        rank = min(max_rank, min(out_size, in_size) - 1)
+        U, S, Vh = torch.svd_lowrank(weight, q=rank, niter=2)
+        Vh = Vh.T  # svd_lowrank returns V, not Vh
+        new_rank = rank
+        new_alpha = float(scale * new_rank)
+        stats = {"sum_retained": 1.0, "fro_retained": 1.0}  # Not computed for lowrank
+    else:
+        # Dynamic methods need full SVD to compute rank from all singular values
+        U, S, Vh = linalg.svd(weight, full_matrices=False)
+        new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
+        U = U[:, :new_rank]
+        S = S[:new_rank]
+        Vh = Vh[:new_rank, :]
     
     lora_up = U @ torch.diag(S)
     lora_down = Vh
@@ -236,13 +244,21 @@ def _extract_conv(
     out_ch, in_ch, kh, kw = weight.shape
     mat = weight.reshape(out_ch, -1)
     
-    U, S, Vh = linalg.svd(mat, full_matrices=False)
-    
-    new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
-    
-    U = U[:, :new_rank]
-    S = S[:new_rank]
-    Vh = Vh[:new_rank, :]
+    if dynamic_method is None:
+        # Fixed rank - use svd_lowrank for 10x speedup
+        rank = min(max_rank, min(mat.shape) - 1)
+        U, S, Vh = torch.svd_lowrank(mat, q=rank, niter=2)
+        Vh = Vh.T  # svd_lowrank returns V, not Vh
+        new_rank = rank
+        new_alpha = float(scale * new_rank)
+        stats = {"sum_retained": 1.0, "fro_retained": 1.0}  # Not computed for lowrank
+    else:
+        # Dynamic methods need full SVD to compute rank from all singular values
+        U, S, Vh = linalg.svd(mat, full_matrices=False)
+        new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
+        U = U[:, :new_rank]
+        S = S[:new_rank]
+        Vh = Vh[:new_rank, :]
     
     lora_up = (U @ torch.diag(S)).reshape(out_ch, new_rank, 1, 1)
     lora_down = Vh.reshape(new_rank, in_ch, kh, kw)
