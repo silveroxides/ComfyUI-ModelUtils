@@ -148,12 +148,16 @@ def _svd_extract_linear_lowrank(
     rank: int,
     device: str,
     clamp_quantile: float = 0.99,
+    niter: int = 2,
 ) -> tuple:
     """
     Low-rank SVD decomposition using svd_lowrank for fixed rank extraction.
     
     Much faster than full SVD when rank << min(m, n) because it only computes
     the top-k singular values using randomized algorithms.
+    
+    Args:
+        niter: Power iterations for SVD accuracy (higher = more accurate but slower)
     
     Returns:
         (lora_down, lora_up, diff), "low rank" or (weight, "full")
@@ -170,9 +174,8 @@ def _svd_extract_linear_lowrank(
         return weight, "full"
     
     # Use svd_lowrank for faster low-rank approximation
-    # niter controls accuracy (higher = more accurate but slower)
     try:
-        U, S, V = torch.svd_lowrank(weight, q=rank, niter=2)
+        U, S, V = torch.svd_lowrank(weight, q=rank, niter=niter)
         # U: [out_dim, rank], S: [rank], V: [in_dim, rank]
         Vh = V.T  # [rank, in_dim]
     except Exception as e:
@@ -203,6 +206,7 @@ def _svd_extract_linear(
     device: str,
     max_rank: int = None,
     clamp_quantile: float = 0.99,
+    niter: int = 2,
 ) -> tuple:
     """
     SVD decomposition for linear layers.
@@ -221,7 +225,7 @@ def _svd_extract_linear(
         target_rank = int(mode_param)
         if max_rank is not None:
             target_rank = min(target_rank, max_rank)
-        return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile)
+        return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile, niter)
 
     # For adaptive modes, use full SVD to analyze singular values
     try:
@@ -409,6 +413,7 @@ def extract_lora_from_files(
     skip_patterns_str: str = "",
     mismatch_mode: str = "skip",
     chunk_large_layers: bool = True,
+    svd_niter: int = 2,
 ) -> dict[str, torch.Tensor]:
     """
     Extract LoRA from difference between two models.
@@ -528,7 +533,7 @@ def extract_lora_from_files(
                     )
                 else:
                     result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile
+                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile, svd_niter
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -640,6 +645,8 @@ class LoRAExtractFixed(io.ComfyNode):
                             tooltip="Rank for linear/attention layers"),
                 io.Int.Input("conv_dim", default=32, min=1, max=4096,
                             tooltip="Rank for conv layers"),
+                io.Int.Input("svd_niter", default=2, min=0, max=10,
+                            tooltip="SVD power iterations (higher = more accurate but slower)"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -647,7 +654,7 @@ class LoRAExtractFixed(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_dim, conv_dim, chunk_large_layers,
+    def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
@@ -657,7 +664,7 @@ class LoRAExtractFixed(io.ComfyNode):
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             "lora_unet_", device, save_dtype, linear_dim, conv_dim,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))

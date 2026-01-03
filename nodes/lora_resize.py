@@ -201,6 +201,7 @@ def _extract_linear(
     dynamic_method: Optional[str],
     dynamic_param: Optional[float],
     scale: float,
+    niter: int = 2,
 ) -> Dict:
     """Extract LoRA from merged linear weight."""
     out_size, in_size = weight.shape
@@ -208,7 +209,7 @@ def _extract_linear(
     if dynamic_method is None:
         # Fixed rank - use svd_lowrank for 10x speedup
         rank = min(max_rank, min(out_size, in_size) - 1)
-        U, S, Vh = torch.svd_lowrank(weight, q=rank, niter=2)
+        U, S, Vh = torch.svd_lowrank(weight, q=rank, niter=niter)
         Vh = Vh.T  # svd_lowrank returns V, not Vh
         new_rank = rank
         new_alpha = float(scale * new_rank)
@@ -239,6 +240,7 @@ def _extract_conv(
     dynamic_method: Optional[str],
     dynamic_param: Optional[float],
     scale: float,
+    niter: int = 2,
 ) -> Dict:
     """Extract LoRA from merged conv weight."""
     out_ch, in_ch, kh, kw = weight.shape
@@ -247,7 +249,7 @@ def _extract_conv(
     if dynamic_method is None:
         # Fixed rank - use svd_lowrank for 10x speedup
         rank = min(max_rank, min(mat.shape) - 1)
-        U, S, Vh = torch.svd_lowrank(mat, q=rank, niter=2)
+        U, S, Vh = torch.svd_lowrank(mat, q=rank, niter=niter)
         Vh = Vh.T  # svd_lowrank returns V, not Vh
         new_rank = rank
         new_alpha = float(scale * new_rank)
@@ -329,7 +331,8 @@ def resize_lora_file(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
-    verbose: bool = True
+    verbose: bool = True,
+    svd_niter: int = 2,
 ) -> str:
     """
     Resize a LoRA file to a new rank.
@@ -343,6 +346,7 @@ def resize_lora_file(
         save_dtype: Output dtype
         output_filename: Output filename (without extension)
         verbose: Print progress info
+        svd_niter: Power iterations for SVD accuracy
     
     Returns:
         Path to saved resized LoRA
@@ -393,10 +397,10 @@ def resize_lora_file(
                 # Merge and re-extract
                 if is_conv:
                     weight = _merge_conv(lora_down, lora_up, device)
-                    result = _extract_conv(weight, new_rank, dynamic_method, dynamic_param, scale)
+                    result = _extract_conv(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
                 else:
                     weight = _merge_linear(lora_down, lora_up, device)
-                    result = _extract_linear(weight, new_rank, dynamic_method, dynamic_param, scale)
+                    result = _extract_linear(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
                 
                 del weight, lora_down, lora_up
                 
@@ -463,6 +467,8 @@ class LoRAResizeFixed(io.ComfyNode):
                               tooltip="LoRA to resize"),
                 io.Int.Input("new_rank", default=64, min=1, max=1024,
                             tooltip="Target rank"),
+                io.Int.Input("svd_niter", default=2, min=0, max=10,
+                            tooltip="SVD power iterations (higher = more accurate but slower)"),
                 io.String.Input("output_filename", default="resized_lora"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
@@ -472,11 +478,11 @@ class LoRAResizeFixed(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, svd_niter, output_filename, save_dtype, device) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
         
-        path = resize_lora_file(lora_path, new_rank, None, None, device, dtype, output_filename)
+        path = resize_lora_file(lora_path, new_rank, None, None, device, dtype, output_filename, svd_niter=svd_niter)
         return io.NodeOutput(path)
 
 
