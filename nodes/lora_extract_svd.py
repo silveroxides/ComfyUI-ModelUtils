@@ -679,6 +679,10 @@ class LoRAExtractRatio(io.ComfyNode):
                               tooltip="Ratio threshold for linear layers (higher = more SVs kept)"),
                 io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
                               tooltip="Ratio threshold for conv layers (higher = more SVs kept)"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -686,8 +690,8 @@ class LoRAExtractRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -695,7 +699,7 @@ class LoRAExtractRatio(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -718,6 +722,10 @@ class LoRAExtractQuantile(io.ComfyNode):
                               tooltip="Target cumulative % for linear layers"),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target cumulative % for conv layers"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -725,8 +733,8 @@ class LoRAExtractQuantile(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -734,7 +742,7 @@ class LoRAExtractQuantile(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -755,6 +763,10 @@ class LoRAExtractKnee(io.ComfyNode):
                 *_get_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"],
                               default="sv_knee", tooltip="Knee detection method"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -762,8 +774,8 @@ class LoRAExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -771,7 +783,7 @@ class LoRAExtractKnee(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
@@ -794,6 +806,10 @@ class LoRAExtractFrobenius(io.ComfyNode):
                               tooltip="Target Frobenius norm fraction for linear"),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target Frobenius norm fraction for conv"),
+                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for linear layers"),
+                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                            tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -801,8 +817,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_target, conv_target, chunk_large_layers,
-                clamp_quantile, min_diff, mismatch_mode, output_filename,
+    def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
+                chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
@@ -810,7 +826,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
-            "lora_unet_", device, save_dtype, None, None,
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
         )
 
