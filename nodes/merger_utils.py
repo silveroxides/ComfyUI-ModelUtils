@@ -28,23 +28,23 @@ except ImportError:
 
 class PinnedTensor:
     """Context manager for automatic pinned memory management.
-    
+
     Usage:
         with PinnedTensor(cpu_tensor) as pinned:
             gpu_tensor = pinned.to('cuda')
         # Memory automatically unpinned after transfer
     """
-    
+
     def __init__(self, tensor: torch.Tensor, auto_pin: bool = True):
         self.tensor = tensor
         self.is_pinned = False
         self.auto_pin = auto_pin and PINNING_AVAILABLE
-        
+
     def __enter__(self) -> torch.Tensor:
         if self.auto_pin and self.tensor.device.type == 'cpu':
             self.is_pinned = pin_memory(self.tensor)
         return self.tensor
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.is_pinned:
             unpin_memory(self.tensor)
@@ -57,12 +57,12 @@ def transfer_to_gpu_pinned(
     dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     """Transfer tensor to GPU using pinned memory for faster transfer.
-    
+
     Args:
         tensor: CPU tensor to transfer
         device: Target GPU device
         dtype: Optional dtype conversion
-        
+
     Returns:
         Tensor on GPU device
     """
@@ -71,7 +71,7 @@ def transfer_to_gpu_pinned(
         if dtype:
             return tensor.to(device=device, dtype=dtype)
         return tensor.to(device=device)
-    
+
     # Pin memory for faster transfer
     was_pinned = pin_memory(tensor)
     try:
@@ -162,7 +162,7 @@ class MemoryEfficientSafeOpen:
                 tensor_bytes = self.file.read(offset_end - offset_start)
 
         return self._deserialize_tensor(tensor_bytes, metadata)
-    
+
     def get_tensor_to_gpu(
         self,
         key: str,
@@ -170,12 +170,12 @@ class MemoryEfficientSafeOpen:
         dtype: Optional[torch.dtype] = None
     ) -> torch.Tensor:
         """Load a tensor and transfer to GPU using pinned memory for faster transfer.
-        
+
         Args:
             key: Tensor key to load
             device: Target GPU device (default 'cuda')
             dtype: Optional dtype conversion
-            
+
         Returns:
             Tensor on GPU device
         """
