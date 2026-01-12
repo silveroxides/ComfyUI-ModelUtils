@@ -25,7 +25,10 @@ from .nodes.lora_extract_svd import (
 )
 from .nodes.lora_resize import (
     LoRAResizeFixed, LoRAResizeRatio,
-    LoRAResizeFrobenius, LoRAResizeCumulative
+    LoRAResizeFrobenius, LoRAResizeCumulative,
+    LoRAResizeViaBaseFixed, LoRAResizeViaBaseRatio,
+    LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
+    LoRAMultiMerge
 )
 
 
@@ -54,6 +57,11 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Resize
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
+            # LoRA Fast Resize (via base model)
+            LoRAResizeViaBaseFixed, LoRAResizeViaBaseRatio,
+            LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
+            # LoRA Multi-Merge
+            LoRAMultiMerge,
         ]
 
 

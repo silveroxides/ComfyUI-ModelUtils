@@ -294,3 +294,28 @@ ComfyUI-ModelUtils/
 | Metadata reading | **100x+** (header only) |
 | Parallel I/O | **2-4x** (ThreadPoolExecutor) |
 | Memory management | Auto-unload models before heavy ops |
+| **LoRA Resize Fast** | **~91x** (merge-to-base extraction) |
+
+---
+
+## Phase 13: Fast LoRA Resize (2026-01-11)
+
+### Summary
+Added fast LoRA resize via base model extraction path, achieving ~91x speedup.
+
+### Changes
+- Added `resize_lora_via_base()` function using extraction code path
+- Added 4 new fast resize nodes requiring base model input
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `nodes/lora_resize.py` | Added `resize_lora_via_base()`, 4 new node classes |
+| `__init__.py` | Registered new nodes |
+
+### New Nodes
+- `LoRAResizeViaBaseFixed` - Fast fixed rank resize
+- `LoRAResizeViaBaseRatio` - Fast SV ratio resize  
+- `LoRAResizeViaBaseFrobenius` - Fast Frobenius resize
+- `LoRAResizeViaBaseCumulative` - Fast cumulative resize
