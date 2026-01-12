@@ -45,6 +45,7 @@ def detect_lora_format(keys: List[str]) -> Dict:
     - Diffusers: *.lora_A.weight, *.lora_B.weight
     - PEFT: base_model.model.*.lora_A/B
     - ComfyUI native: *.lora_down.weight, *.lora_up.weight
+    - Full diff: *.diff, *.diff_b (full weight differences, not low-rank)
     - Flux/SDXL: Various transformer key patterns
 
     Returns:
@@ -57,6 +58,7 @@ def detect_lora_format(keys: List[str]) -> Dict:
         "alpha_suffix": ".alpha",
         "has_alpha": False,
         "key_count": 0,
+        "is_full_diff": False,  # New flag for full diff format
     }
 
     # Check for alpha keys
@@ -64,10 +66,18 @@ def detect_lora_format(keys: List[str]) -> Dict:
     format_info["has_alpha"] = len(alpha_keys) > 0
 
     # Detect format by key patterns
-    sample_keys = keys[:20]  # Check first 20 keys
+    sample_keys = keys[:50]  # Check more keys for full_diff detection
+
+    # Full diff format: *.diff (NOT .lora_down, just straight weight diff)
+    if any(k.endswith('.diff') for k in sample_keys):
+        format_info["format"] = "full_diff"
+        format_info["down_suffix"] = ".diff"  # Used for pairing, but no up
+        format_info["up_suffix"] = None  # No up weight in full diff
+        format_info["alpha_suffix"] = None
+        format_info["is_full_diff"] = True
 
     # Kohya/A1111 format: lora_unet_down_blocks_0_*.lora_down.weight
-    if any('lora_unet_' in k or 'lora_te' in k for k in sample_keys):
+    elif any('lora_unet_' in k or 'lora_te' in k for k in sample_keys):
         format_info["format"] = "kohya"
         format_info["down_suffix"] = ".lora_down.weight"
         format_info["up_suffix"] = ".lora_up.weight"
@@ -103,32 +113,51 @@ def extract_lora_pairs(keys: List[str], format_info: Dict) -> Dict[str, Dict[str
     """
     Group LoRA keys into down/up/alpha pairs.
 
+    For full_diff format, groups .diff and .diff_b keys.
+
     Returns:
         Dict[block_name, {"down": key, "up": key, "alpha": key}]
+        For full_diff: {"diff": key, "diff_b": key}
     """
     down_suffix = format_info["down_suffix"]
     up_suffix = format_info["up_suffix"]
     alpha_suffix = format_info["alpha_suffix"]
+    is_full_diff = format_info.get("is_full_diff", False)
 
     pairs = {}
 
-    for key in keys:
-        if down_suffix in key:
-            block_name = key.replace(down_suffix, "")
-            if block_name not in pairs:
-                pairs[block_name] = {}
-            pairs[block_name]["down"] = key
-        elif up_suffix in key:
-            block_name = key.replace(up_suffix, "")
-            if block_name not in pairs:
-                pairs[block_name] = {}
-            pairs[block_name]["up"] = key
-        elif alpha_suffix in key or key.endswith('.alpha'):
-            # Handle various alpha key formats
-            block_name = key.replace(alpha_suffix, "").replace(".alpha", "")
-            if block_name not in pairs:
-                pairs[block_name] = {}
-            pairs[block_name]["alpha"] = key
+    if is_full_diff:
+        # Full diff format: group .diff and .diff_b
+        for key in keys:
+            if key.endswith('.diff'):
+                block_name = key[:-5]  # Remove .diff
+                if block_name not in pairs:
+                    pairs[block_name] = {}
+                pairs[block_name]["diff"] = key
+            elif key.endswith('.diff_b'):
+                block_name = key[:-7]  # Remove .diff_b
+                if block_name not in pairs:
+                    pairs[block_name] = {}
+                pairs[block_name]["diff_b"] = key
+    else:
+        # Standard LoRA format
+        for key in keys:
+            if down_suffix and down_suffix in key:
+                block_name = key.replace(down_suffix, "")
+                if block_name not in pairs:
+                    pairs[block_name] = {}
+                pairs[block_name]["down"] = key
+            elif up_suffix and up_suffix in key:
+                block_name = key.replace(up_suffix, "")
+                if block_name not in pairs:
+                    pairs[block_name] = {}
+                pairs[block_name]["up"] = key
+            elif alpha_suffix and (alpha_suffix in key or key.endswith('.alpha')):
+                # Handle various alpha key formats
+                block_name = key.replace(alpha_suffix, "").replace(".alpha", "")
+                if block_name not in pairs:
+                    pairs[block_name] = {}
+                pairs[block_name]["alpha"] = key
 
     return pairs
 
@@ -1291,41 +1320,63 @@ def merge_multi_loras_via_base(
                         continue
 
                     block_keys = info["pairs"][block_name]
-                    if "down" not in block_keys or "up" not in block_keys:
-                        continue
+                    is_full_diff = info["format_info"].get("is_full_diff", False)
 
-                    # Load LoRA weights
-                    cpu_down = info["handler"].get_tensor(block_keys["down"])
-                    cpu_up = info["handler"].get_tensor(block_keys["up"])
-                    if device == 'cuda':
-                        lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
-                        lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                    if is_full_diff:
+                        # Full diff format: load .diff directly as the delta
+                        if "diff" not in block_keys:
+                            continue
+
+                        cpu_diff = info["handler"].get_tensor(block_keys["diff"])
+                        if device == 'cuda':
+                            delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
+                        else:
+                            delta = cpu_diff.to(device=device, dtype=torch.float32)
+                        del cpu_diff
+
+                        # Determine conv from shape
+                        is_conv = len(delta.shape) == 4
+
+                        # Apply LoRA weight strength (no alpha scaling for full diff)
+                        effective_scale = info["weight"]
+
                     else:
-                        lora_down = cpu_down.to(device=device, dtype=torch.float32)
-                        lora_up = cpu_up.to(device=device, dtype=torch.float32)
-                    del cpu_down, cpu_up
+                        # Standard LoRA format: compute up @ down
+                        if "down" not in block_keys or "up" not in block_keys:
+                            continue
 
-                    # Get alpha
-                    if "alpha" in block_keys:
-                        alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
-                        layer_alpha = float(alpha_tensor.item())
-                    else:
-                        layer_alpha = float(info["network_dim"])
-                    layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
+                        # Load LoRA weights
+                        cpu_down = info["handler"].get_tensor(block_keys["down"])
+                        cpu_up = info["handler"].get_tensor(block_keys["up"])
+                        if device == 'cuda':
+                            lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
+                            lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                        else:
+                            lora_down = cpu_down.to(device=device, dtype=torch.float32)
+                            lora_up = cpu_up.to(device=device, dtype=torch.float32)
+                        del cpu_down, cpu_up
 
-                    # Apply LoRA weight strength
-                    effective_scale = layer_scale * info["weight"]
+                        # Get alpha
+                        if "alpha" in block_keys:
+                            alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
+                            layer_alpha = float(alpha_tensor.item())
+                        else:
+                            layer_alpha = float(info["network_dim"])
+                        layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
 
-                    # Compute delta
-                    is_conv = len(lora_down.shape) == 4
-                    if is_conv:
-                        in_rank, in_size, kernel_size, k_ = lora_down.shape
-                        out_size, out_rank, _, _ = lora_up.shape
-                        delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
-                        delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
-                    else:
-                        delta = lora_up @ lora_down
-                    del lora_down, lora_up
+                        # Apply LoRA weight strength
+                        effective_scale = layer_scale * info["weight"]
+
+                        # Compute delta
+                        is_conv = len(lora_down.shape) == 4
+                        if is_conv:
+                            in_rank, in_size, kernel_size, k_ = lora_down.shape
+                            out_size, out_rank, _, _ = lora_up.shape
+                            delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
+                            delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
+                        else:
+                            delta = lora_up @ lora_down
+                        del lora_down, lora_up
 
                     # Accumulate
                     if combined_delta is None:
