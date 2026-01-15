@@ -45,6 +45,7 @@ def detect_lora_format(keys: List[str]) -> Dict:
     - Diffusers: *.lora_A.weight, *.lora_B.weight
     - PEFT: base_model.model.*.lora_A/B
     - ComfyUI native: *.lora_down.weight, *.lora_up.weight
+    - HuggingFace: *.lora.down.weight, *.lora.up.weight (dots instead of underscores)
     - Full diff: *.diff, *.diff_b (full weight differences, not low-rank)
     - Flux/SDXL: Various transformer key patterns
 
@@ -96,6 +97,13 @@ def detect_lora_format(keys: List[str]) -> Dict:
         format_info["down_suffix"] = ".lora_A.default.weight"
         format_info["up_suffix"] = ".lora_B.default.weight"
 
+    # HuggingFace format: transformer.*.lora.down.weight (dots instead of underscores)
+    elif any('.lora.down.weight' in k for k in sample_keys):
+        format_info["format"] = "huggingface"
+        format_info["down_suffix"] = ".lora.down.weight"
+        format_info["up_suffix"] = ".lora.up.weight"
+        format_info["alpha_suffix"] = ".alpha"
+
     # ComfyUI native / standard
     elif any('.lora_down.weight' in k for k in sample_keys):
         format_info["format"] = "comfy"
@@ -107,6 +115,7 @@ def detect_lora_format(keys: List[str]) -> Dict:
     format_info["key_count"] = len(down_keys)
 
     return format_info
+
 
 
 def extract_lora_pairs(keys: List[str], format_info: Dict) -> Dict[str, Dict[str, str]]:
@@ -739,8 +748,12 @@ def resize_lora_via_base(
                 if block_name.startswith(prefix):
                     block_name = block_name[len(prefix):]
                     break
+            # Strip trailing .lora suffix (HuggingFace format leaves this after suffix removal)
+            if block_name.endswith(".lora"):
+                block_name = block_name[:-5]
             # Convert dots to underscores (diffusers format uses dots)
             return block_name.replace(".", "_")
+
 
         # Build lookup table: core layer name (underscored) -> original base key
         base_key_lookup = {}
@@ -1262,7 +1275,11 @@ def merge_multi_loras_via_base(
                 if block_name.startswith(prefix):
                     block_name = block_name[len(prefix):]
                     break
+            # Strip trailing .lora suffix (HuggingFace format leaves this after suffix removal)
+            if block_name.endswith(".lora"):
+                block_name = block_name[:-5]
             return block_name.replace(".", "_")
+
 
         # Build base key lookup
         base_key_lookup = {}
@@ -1657,7 +1674,11 @@ def merge_loras_to_model(
                 if result.startswith(prefix):
                     result = result[len(prefix):]
                     break
+            # Strip trailing .lora suffix (HuggingFace format leaves this after suffix removal)
+            if result.endswith(".lora"):
+                result = result[:-5]
             return result.replace(".", "_")
+
 
         # Build LoRA lookup: core layer name (underscored) -> list of (info, block_keys)
         lora_lookup = {}
