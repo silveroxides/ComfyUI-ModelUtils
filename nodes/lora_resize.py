@@ -1790,11 +1790,14 @@ def merge_loras_to_model(
                     else:
                         # No LoRA contribution, copy as-is
                         output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
+                        del cpu_base
                         stats["copied"] += 1
                 else:
                     # Non-weight tensor (bias, norm, etc.), copy as-is
                     output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
+                    del cpu_base
                     stats["copied"] += 1
+
 
                 pbar.update(1)
 
