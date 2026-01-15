@@ -28,7 +28,7 @@ from .nodes.lora_resize import (
     LoRAResizeFrobenius, LoRAResizeCumulative,
     LoRAResizeViaBaseFixed, LoRAResizeViaBaseRatio,
     LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
-    LoRAMultiMerge
+    LoRAMultiMerge, LoRAMergeToModel
 )
 
 
@@ -62,6 +62,8 @@ class ModelUtilsExtension(ComfyExtension):
             LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
             # LoRA Multi-Merge
             LoRAMultiMerge,
+            # LoRA Merge To Model
+            LoRAMergeToModel,
         ]
 
 

@@ -1562,3 +1562,314 @@ class LoRAMultiMerge(io.ComfyNode):
             skip_patterns_str=skip_patterns,
         )
         return io.NodeOutput(path)
+
+
+# =============================================================================
+# LoRA Merge To Model (Save merged model, skip extraction)
+# =============================================================================
+
+def merge_loras_to_model(
+    lora_paths: List[str],
+    lora_weights: List[float],
+    base_model_path: str,
+    device: str,
+    save_dtype: torch.dtype,
+    output_filename: str,
+    skip_patterns_str: str = "",
+    verbose: bool = True,
+) -> str:
+    """
+    Merge multiple LoRAs into a base model and save the result directly.
+
+    Unlike merge_multi_loras_via_base, this function:
+    - Does NOT extract the result back to a LoRA
+    - Saves the merged full model to the base model's directory
+
+    Args:
+        lora_paths: List of paths to LoRA files
+        lora_weights: List of weight strengths (0.0-2.0) for each LoRA
+        base_model_path: Path to base model
+        device: Processing device
+        save_dtype: Output dtype
+        output_filename: Output filename (without extension)
+        skip_patterns_str: Regex patterns for layers to skip
+        verbose: Print progress info
+
+    Returns:
+        Path to saved merged model
+    """
+    # Estimate memory and prepare
+    total_size_gb = estimate_model_size(base_model_path)
+    for lp in lora_paths:
+        total_size_gb += estimate_model_size(lp)
+
+    if verbose:
+        print(f"[LoRA Merge To Model] Preparing memory for {total_size_gb:.2f}GB operation...")
+        print(f"[LoRA Merge To Model] Merging {len(lora_paths)} LoRAs with weights: {lora_weights}")
+    prepare_for_large_operation(total_size_gb * 1.5, torch.device(device))
+
+    # Open all files
+    base_handler = MemoryEfficientSafeOpen(base_model_path)
+    lora_handlers = [MemoryEfficientSafeOpen(lp) for lp in lora_paths]
+
+    try:
+        # Detect format and extract pairs for each LoRA
+        lora_infos = []
+
+        for i, handler in enumerate(lora_handlers):
+            keys = handler.keys()
+            format_info = detect_lora_format(keys)
+            pairs = extract_lora_pairs(keys, format_info)
+            network_dim, network_alpha = detect_lora_rank(handler, pairs)
+            lora_infos.append({
+                "handler": handler,
+                "format_info": format_info,
+                "pairs": pairs,
+                "network_dim": network_dim,
+                "network_alpha": network_alpha,
+                "weight": lora_weights[i],
+            })
+            if verbose:
+                print(f"[LoRA Merge To Model] LoRA {i+1}: {format_info['format']}, {len(pairs)} layers, dim={network_dim}")
+
+        # Common prefixes
+        BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model."]
+        LORA_PREFIXES = [
+            "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+            "lycoris_", "diffusion_model.", "transformer.", "unet."
+        ]
+
+        def extract_core_layer_base(key: str) -> str:
+            result = key
+            if result.endswith(".weight"):
+                result = result[:-7]
+            elif result.endswith(".bias"):
+                result = result[:-5]
+            for prefix in BASE_PREFIXES:
+                if result.startswith(prefix):
+                    result = result[len(prefix):]
+                    break
+            return result
+
+        def extract_core_layer_lora(block_name: str) -> str:
+            result = block_name
+            for prefix in LORA_PREFIXES:
+                if result.startswith(prefix):
+                    result = result[len(prefix):]
+                    break
+            return result.replace(".", "_")
+
+        # Build LoRA lookup: core layer name (underscored) -> list of (info, block_keys)
+        lora_lookup = {}
+        for info in lora_infos:
+            for block_name, block_keys in info["pairs"].items():
+                core = extract_core_layer_lora(block_name)
+                if core not in lora_lookup:
+                    lora_lookup[core] = []
+                lora_lookup[core].append((info, block_keys))
+
+        # Compile skip patterns
+        skip_patterns = _compile_patterns(skip_patterns_str)
+
+        # Preserve metadata from base model
+        base_metadata = base_handler.metadata().copy() if base_handler.metadata() else {}
+        base_metadata["merge_comment"] = f"Merged {len(lora_paths)} LoRAs with weights: {lora_weights}"
+
+        output_sd = {}
+        stats = {"merged": 0, "copied": 0, "skipped": 0}
+        base_keys = list(base_handler.keys())
+        pbar = comfy.utils.ProgressBar(len(base_keys))
+
+        if verbose:
+            print(f"[LoRA Merge To Model] Processing {len(base_keys)} base model keys...")
+
+        with torch.no_grad():
+            for base_key in tqdm(base_keys, desc="Merging to model", unit="keys"):
+                # Check skip patterns
+                if _matches_any_pattern(base_key, skip_patterns):
+                    stats["skipped"] += 1
+                    pbar.update(1)
+                    continue
+
+                # Load base weight
+                cpu_base = base_handler.get_tensor(base_key)
+
+                # Only process weight tensors for LoRA merging
+                if base_key.endswith(".weight"):
+                    core = extract_core_layer_base(base_key)
+                    core_underscored = core.replace(".", "_")
+
+                    # Check if any LoRA contributes to this layer
+                    if core_underscored in lora_lookup:
+                        # Transfer to GPU for computation
+                        if device == 'cuda':
+                            base_weight = transfer_to_gpu_pinned(cpu_base, device, torch.float32)
+                        else:
+                            base_weight = cpu_base.to(device=device, dtype=torch.float32)
+                        del cpu_base
+
+                        # Accumulate deltas from all contributing LoRAs
+                        for info, block_keys in lora_lookup[core_underscored]:
+                            is_full_diff = info["format_info"].get("is_full_diff", False)
+
+                            if is_full_diff:
+                                # Full diff format
+                                if "diff" not in block_keys:
+                                    continue
+                                cpu_diff = info["handler"].get_tensor(block_keys["diff"])
+                                if device == 'cuda':
+                                    delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
+                                else:
+                                    delta = cpu_diff.to(device=device, dtype=torch.float32)
+                                del cpu_diff
+                                effective_scale = info["weight"]
+                            else:
+                                # Standard LoRA format
+                                if "down" not in block_keys or "up" not in block_keys:
+                                    continue
+
+                                cpu_down = info["handler"].get_tensor(block_keys["down"])
+                                cpu_up = info["handler"].get_tensor(block_keys["up"])
+                                if device == 'cuda':
+                                    lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
+                                    lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                                else:
+                                    lora_down = cpu_down.to(device=device, dtype=torch.float32)
+                                    lora_up = cpu_up.to(device=device, dtype=torch.float32)
+                                del cpu_down, cpu_up
+
+                                # Get alpha
+                                if "alpha" in block_keys:
+                                    alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
+                                    layer_alpha = float(alpha_tensor.item())
+                                else:
+                                    layer_alpha = float(info["network_dim"])
+                                layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
+                                effective_scale = layer_scale * info["weight"]
+
+                                # Compute delta
+                                is_conv = len(lora_down.shape) == 4
+                                if is_conv:
+                                    in_rank, in_size, kernel_size, k_ = lora_down.shape
+                                    out_size, out_rank, _, _ = lora_up.shape
+                                    delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
+                                    delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
+                                else:
+                                    delta = lora_up @ lora_down
+                                del lora_down, lora_up
+
+                            # Apply delta to base weight
+                            base_weight = base_weight + effective_scale * delta
+                            del delta
+
+                        # Store merged weight
+                        output_sd[base_key] = base_weight.to(save_dtype).cpu().contiguous()
+                        del base_weight
+                        stats["merged"] += 1
+                    else:
+                        # No LoRA contribution, copy as-is
+                        output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
+                        stats["copied"] += 1
+                else:
+                    # Non-weight tensor (bias, norm, etc.), copy as-is
+                    output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
+                    stats["copied"] += 1
+
+                pbar.update(1)
+
+        if verbose:
+            print(f"[LoRA Merge To Model] Done: {stats['merged']} merged, {stats['copied']} copied, {stats['skipped']} skipped")
+
+        # Save to base model directory
+        base_dir = os.path.dirname(base_model_path)
+        os.makedirs(base_dir, exist_ok=True)
+        output_path = os.path.join(base_dir, f"{output_filename.strip()}.safetensors")
+
+        save_file(output_sd, output_path, base_metadata)
+        print(f"[LoRA Merge To Model] Saved to {output_path}")
+
+        return output_path
+
+    finally:
+        base_handler.__exit__(None, None, None)
+        for handler in lora_handlers:
+            handler.__exit__(None, None, None)
+        cleanup_after_operation()
+
+
+class LoRAMergeToModel(io.ComfyNode):
+    """Merge multiple LoRAs into base model and save as full model."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRAMergeToModel",
+            display_name="LoRA Merge To Model",
+            category="ModelUtils/LoRA/Merge",
+            description="Merge 1-4 LoRAs into a base model and save the result. Saves to base model directory.",
+            inputs=[
+                io.Combo.Input("base_model", options=folder_paths.get_filename_list("diffusion_models"),
+                              tooltip="Base model the LoRAs were trained on"),
+                io.Combo.Input("lora_count", options=["1", "2", "3", "4"], default="2",
+                              tooltip="Number of LoRAs to merge"),
+                # LoRA 1
+                io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"),
+                              tooltip="First LoRA"),
+                io.Float.Input("weight_1", default=1.0, min=0.0, max=2.0, step=0.05,
+                              tooltip="Weight strength for LoRA 1"),
+                # LoRA 2
+                io.Combo.Input("lora_2", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Second LoRA"),
+                io.Float.Input("weight_2", default=1.0, min=0.0, max=2.0, step=0.05,
+                              tooltip="Weight strength for LoRA 2"),
+                # LoRA 3
+                io.Combo.Input("lora_3", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Third LoRA"),
+                io.Float.Input("weight_3", default=1.0, min=0.0, max=2.0, step=0.05,
+                              tooltip="Weight strength for LoRA 3"),
+                # LoRA 4
+                io.Combo.Input("lora_4", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Fourth LoRA"),
+                io.Float.Input("weight_4", default=1.0, min=0.0, max=2.0, step=0.05,
+                              tooltip="Weight strength for LoRA 4"),
+                # Settings
+                io.String.Input("skip_patterns", default="", multiline=True,
+                               tooltip="Regex patterns for layers to skip"),
+                io.String.Input("output_filename", default="merged_model"),
+                io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
+                io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+            ],
+            outputs=[io.String.Output(display_name="output_path")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, base_model, lora_count,
+                lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
+                skip_patterns, output_filename, save_dtype, device) -> io.NodeOutput:
+
+        # Build LoRA list based on count
+        count = int(lora_count)
+        lora_names = [lora_1, lora_2, lora_3, lora_4][:count]
+        lora_weights = [weight_1, weight_2, weight_3, weight_4][:count]
+
+        # Filter out "None" entries
+        valid_loras = [(name, weight) for name, weight in zip(lora_names, lora_weights) if name != "None"]
+        if not valid_loras:
+            raise ValueError("At least one LoRA must be selected")
+
+        lora_names, lora_weights = zip(*valid_loras)
+        lora_paths = [folder_paths.get_full_path_or_raise("loras", name) for name in lora_names]
+        base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+
+        path = merge_loras_to_model(
+            lora_paths=list(lora_paths),
+            lora_weights=list(lora_weights),
+            base_model_path=base_path,
+            device=device,
+            save_dtype=dtype,
+            output_filename=output_filename,
+            skip_patterns_str=skip_patterns,
+        )
+        return io.NodeOutput(path)
