@@ -1625,9 +1625,10 @@ def merge_loras_to_model(
         print(f"[LoRA Merge To Model] Merging {len(lora_paths)} LoRAs with weights: {lora_weights}")
     prepare_for_large_operation(total_size_gb * 1.5, torch.device(device))
 
-    # Open all files
-    base_handler = MemoryEfficientSafeOpen(base_model_path)
+    # Open all files - use low_memory for base model to avoid OS page caching
+    base_handler = MemoryEfficientSafeOpen(base_model_path, low_memory=True)
     lora_handlers = [MemoryEfficientSafeOpen(lp) for lp in lora_paths]
+
 
     try:
         # Detect format and extract pairs for each LoRA

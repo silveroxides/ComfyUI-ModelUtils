@@ -93,6 +93,7 @@ class MemoryEfficientSafeOpen:
 
     Features:
     - mmap mode: Zero-copy tensor access via memory-mapped file
+    - low_memory mode: Direct file reads to minimize OS page cache usage
     - Parallel loading: Multi-threaded tensor reads for 2-4x speedup
     - Sorted batch reads: Keys sorted by file offset for sequential I/O
     - Auto-optimized workers: Adjusts parallelism based on device capabilities
@@ -102,12 +103,15 @@ class MemoryEfficientSafeOpen:
         filename: Path to safetensors file
         device: Target device (default 'cpu')
         mmap_mode: Use memory-mapped file for zero-copy (default True)
+        low_memory: Use direct file reads to minimize memory (overrides mmap_mode)
     """
 
-    def __init__(self, filename: str, device: str = 'cpu', mmap_mode: bool = True):
+    def __init__(self, filename: str, device: str = 'cpu', mmap_mode: bool = True, low_memory: bool = False):
         self.filename = filename
         self.device = device
-        self.mmap_mode = mmap_mode
+        # low_memory mode forces mmap off to avoid OS page caching
+        self.low_memory = low_memory
+        self.mmap_mode = mmap_mode and not low_memory
         self.header, self.header_size = self._read_header()
         self.file = open(filename, "rb")
         self.mmap_obj = None
@@ -122,6 +126,7 @@ class MemoryEfficientSafeOpen:
         if self.mmap_obj:
             self.mmap_obj.close()
         self.file.close()
+
 
     def keys(self) -> List[str]:
         """Return all tensor keys (excluding metadata)."""
@@ -156,12 +161,16 @@ class MemoryEfficientSafeOpen:
             else:
                 tensor_bytes = None
         else:
+            # Non-mmap mode: use pre-allocated bytearray with readinto for minimal copies
             tensor_bytes = None
             if offset_start != offset_end:
                 self.file.seek(self.header_size + 8 + offset_start)
-                tensor_bytes = self.file.read(offset_end - offset_start)
+                # Pre-allocate writable buffer and read directly into it
+                tensor_bytes = bytearray(offset_end - offset_start)
+                self.file.readinto(tensor_bytes)
 
         return self._deserialize_tensor(tensor_bytes, metadata)
+
 
     def get_tensor_to_gpu(
         self,
@@ -276,12 +285,18 @@ class MemoryEfficientSafeOpen:
         if tensor_bytes is None:
             byte_tensor = torch.empty(0, dtype=torch.uint8)
         else:
-            byte_tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=torch.uint8)
+            # Avoid extra copy if already a bytearray (low_memory mode)
+            if isinstance(tensor_bytes, bytearray):
+                byte_tensor = torch.frombuffer(tensor_bytes, dtype=torch.uint8)
+            else:
+                # mmap memoryview needs copy to create writable tensor
+                byte_tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=torch.uint8)
 
         if dtype_str in ["F8_E5M2", "F8_E4M3"]:
             return self._convert_float8(byte_tensor, dtype_str, shape)
 
         return byte_tensor.view(dtype).reshape(shape)
+
 
     @staticmethod
     def _get_torch_dtype(dtype_str):
