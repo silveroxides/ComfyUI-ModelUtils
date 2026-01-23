@@ -19,25 +19,39 @@ class MissingTensorError(Exception):
 # UTILITIES
 # ################# #
 def resize_tensors(tensor1, tensor2):
-    """Pads 1D or 2D tensors to match shapes."""
-    if len(tensor1.shape) not in [1, 2]:
+    """Pads tensors to match shapes (supports up to 4D)."""
+    if tensor1 is None or tensor2 is None:
+        return tensor1, tensor2
+    if tensor1.shape == tensor2.shape:
         return tensor1, tensor2
 
-    # Pad along the last dimension (width)
-    if tensor1.shape[-1] < tensor2.shape[-1]:
-        padding_size = tensor2.shape[-1] - tensor1.shape[-1]
-        tensor1 = F.pad(tensor1, (0, padding_size, 0, 0))
-    elif tensor2.shape[-1] < tensor1.shape[-1]:
-        padding_size = tensor1.shape[-1] - tensor2.shape[-1]
-        tensor2 = F.pad(tensor2, (0, padding_size, 0, 0))
+    dims1 = len(tensor1.shape)
+    dims2 = len(tensor2.shape)
 
-    # Pad along the first dimension (height)
-    if tensor1.shape[0] < tensor2.shape[0]:
-        padding_size = tensor2.shape[0] - tensor1.shape[0]
-        tensor1 = F.pad(tensor1, (0, 0, 0, padding_size))
-    elif tensor2.shape[0] < tensor1.shape[0]:
-        padding_size = tensor1.shape[0] - tensor2.shape[0]
-        tensor2 = F.pad(tensor2, (0, 0, 0, padding_size))
+    if dims1 != dims2 or dims1 > 4 or dims1 == 0:
+        return tensor1, tensor2
+
+    padding1 = []
+    padding2 = []
+
+    # F.pad expects: (last_dim_left, last_dim_right, prev_dim_top, prev_dim_bottom, ...)
+    for i in range(dims1 - 1, -1, -1):
+        s1 = tensor1.shape[i]
+        s2 = tensor2.shape[i]
+        if s1 < s2:
+            padding1.extend([0, s2 - s1])
+            padding2.extend([0, 0])
+        elif s2 < s1:
+            padding1.extend([0, 0])
+            padding2.extend([0, s1 - s2])
+        else:
+            padding1.extend([0, 0])
+            padding2.extend([0, 0])
+
+    if any(p > 0 for p in padding1):
+        tensor1 = F.pad(tensor1, tuple(padding1))
+    if any(p > 0 for p in padding2):
+        tensor2 = F.pad(tensor2, tuple(padding2))
 
     return tensor1, tensor2
 
@@ -123,6 +137,7 @@ class Add(Operation):
             return b
         if b is None:
             return a
+        a, b = resize_tensors(a, b)
         return a + b
 
 
@@ -130,6 +145,7 @@ class Sub(Operation):
     def oper(self, a, b) -> torch.Tensor:
         if a is None or b is None:
             return None  # Cannot compute difference with missing operand
+        a, b = resize_tensors(a, b)
         return a - b
 
 class SVD(Operation):
@@ -139,6 +155,7 @@ class SVD(Operation):
     def oper(self, a, b) -> torch.Tensor:
         if a is None or b is None:
             return None
+        a, b = resize_tensors(a, b)
         diff, weights, conv2d = a - b, {}, len(a.size()) == 4
         kernel_size = None if not conv2d else a.size()[2:4]
         conv2d_3x3 = conv2d and kernel_size != (1, 1)
@@ -168,6 +185,10 @@ class TrainDiff(Operation):
     def oper(self, a, b, c) -> torch.Tensor:
         if a is None or b is None or c is None:
             return None
+        a, b = resize_tensors(a, b)
+        a, c = resize_tensors(a, c)
+        b, c = resize_tensors(b, c)
+
         if torch.allclose(b.float(), c.float()): return torch.zeros_like(a)
         diff_bc = b.float() - c.float()
         dist_bc, dist_ab = torch.abs(diff_bc), torch.abs(b.float() - a.float())
@@ -180,6 +201,11 @@ class ExtractOp(Operation):
     def oper(self, base: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if a is None or b is None:
             return None
+        if base is not None:
+            base, a = resize_tensors(base, a)
+            base, b = resize_tensors(base, b)
+        a, b = resize_tensors(a, b)
+
         dtype = base.dtype if base is not None else a.dtype
         base_f = base.float() if base is not None else 0
         a_f, b_f = a.float() - base_f, b.float() - base_f
@@ -217,6 +243,7 @@ class InterpolateDifference(Operation):
     def oper(self, a, b):
         if a is None or b is None:
             return None
+        a, b = resize_tensors(a, b)
         alpha, delta = max(self.alpha, 0.001), torch.abs(a - b)
         max_delta = torch.max(delta)
         if max_delta == 0: return a
@@ -233,6 +260,7 @@ class ManualEnhancedInterpolateDifferenceOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
+        a, b = resize_tensors(a, b)
         delta = torch.abs(a - b)
         diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
         mean_diff = torch.mean(diff, 0, keepdim=True)
@@ -252,6 +280,7 @@ class AutoEnhancedInterpolateDifferenceOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
+        a, b = resize_tensors(a, b)
         delta = torch.abs(a - b)
         max_delta = torch.max(delta)
         diff = torch.nan_to_num((max_delta - delta) / max_delta)
@@ -274,6 +303,7 @@ class WeightSumCutoffOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
+        a, b = resize_tensors(a, b)
         delta = torch.abs(a - b)
         diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
         mean = torch.mean(diff, 0, True)
