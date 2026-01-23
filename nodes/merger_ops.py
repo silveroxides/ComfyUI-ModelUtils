@@ -18,12 +18,49 @@ class MissingTensorError(Exception):
 # ################# #
 # UTILITIES
 # ################# #
-def resize_tensors(tensor1, tensor2):
-    """Pads tensors to match shapes (supports up to 4D)."""
+def resize_by_interpolation(tensor1, tensor2):
+    """Resizes tensor2 to match tensor1's shape using interpolation."""
     if tensor1 is None or tensor2 is None:
         return tensor1, tensor2
     if tensor1.shape == tensor2.shape:
         return tensor1, tensor2
+
+    dims1 = len(tensor1.shape)
+    dims2 = len(tensor2.shape)
+
+    if dims1 != dims2 or dims1 > 4 or dims1 == 0:
+        return tensor1, tensor2
+
+    orig_dtype = tensor2.dtype
+    t2_f = tensor2.float()
+
+    # F.interpolate expects [B, C, ...]
+    # We treat the tensor as [1, 1, ...dims]
+    view_shape = [1, 1] + list(tensor2.shape)
+    t2_f = t2_f.view(view_shape)
+
+    # Select mode based on dimensions
+    if dims1 == 1:
+        mode = 'linear'
+    elif dims1 == 2:
+        mode = 'bilinear'
+    else:
+        mode = 'trilinear'
+
+    t2_res = F.interpolate(t2_f, size=list(tensor1.shape), mode=mode, align_corners=False)
+
+    return tensor1, t2_res.view(tensor1.shape).to(orig_dtype)
+
+
+def resize_tensors(tensor1, tensor2, mode='pad/crop'):
+    """Resizes tensors to match shapes using either padding or interpolation."""
+    if tensor1 is None or tensor2 is None:
+        return tensor1, tensor2
+    if tensor1.shape == tensor2.shape:
+        return tensor1, tensor2
+
+    if mode == 'interpolate':
+        return resize_by_interpolation(tensor1, tensor2)
 
     dims1 = len(tensor1.shape)
     dims2 = len(tensor2.shape)
@@ -64,6 +101,7 @@ class Operation:
         self.key = key
         self.sources = tuple(sources)
         self.merge_func = self.recurse
+        self.alignment_mode = 'pad/crop'
         self.alpha = None
         self.beta = None
         self.gamma = None
@@ -137,7 +175,7 @@ class Add(Operation):
             return b
         if b is None:
             return a
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         return a + b
 
 
@@ -145,17 +183,33 @@ class Sub(Operation):
     def oper(self, a, b) -> torch.Tensor:
         if a is None or b is None:
             return None  # Cannot compute difference with missing operand
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         return a - b
 
 class SVD(Operation):
-    def __init__(self, key, alpha, beta, gamma, *sources):
+    def __init__(self, key, alpha, beta, gamma, *sources, target_shape=None):
         super().__init__(key, *sources)
         self.alpha, self.beta, self.gamma = int(alpha), int(beta), gamma
+        self.target_shape = target_shape
+
     def oper(self, a, b) -> torch.Tensor:
         if a is None or b is None:
             return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
+
+        # For SVD extraction, we must ensure the diff matches the original Model A shape
+        # so the resulting LoRA weights are compatible with the target architecture.
+        if self.target_shape and a.shape != self.target_shape:
+            if self.alignment_mode == 'interpolate':
+                # Re-align both to match target_shape via interpolation
+                dummy = torch.empty(self.target_shape, device=a.device)
+                _, a = resize_by_interpolation(dummy, a)
+                _, b = resize_by_interpolation(dummy, b)
+            else:
+                slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(a.shape, self.target_shape))
+                a = a[slices]
+                b = b[slices]
+
         diff, weights, conv2d = a - b, {}, len(a.size()) == 4
         kernel_size = None if not conv2d else a.size()[2:4]
         conv2d_3x3 = conv2d and kernel_size != (1, 1)
@@ -185,9 +239,9 @@ class TrainDiff(Operation):
     def oper(self, a, b, c) -> torch.Tensor:
         if a is None or b is None or c is None:
             return None
-        a, b = resize_tensors(a, b)
-        a, c = resize_tensors(a, c)
-        b, c = resize_tensors(b, c)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
+        a, c = resize_tensors(a, c, mode=self.alignment_mode)
+        b, c = resize_tensors(b, c, mode=self.alignment_mode)
 
         if torch.allclose(b.float(), c.float()): return torch.zeros_like(a)
         diff_bc = b.float() - c.float()
@@ -202,9 +256,9 @@ class ExtractOp(Operation):
         if a is None or b is None:
             return None
         if base is not None:
-            base, a = resize_tensors(base, a)
-            base, b = resize_tensors(base, b)
-        a, b = resize_tensors(a, b)
+            base, a = resize_tensors(base, a, mode=self.alignment_mode)
+            base, b = resize_tensors(base, b, mode=self.alignment_mode)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
 
         dtype = base.dtype if base is not None else a.dtype
         base_f = base.float() if base is not None else 0
@@ -226,7 +280,7 @@ class PowerUpOp(Operation):
     def oper(self, a, b):
         if a is None or b is None:
             return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         delta = b - a
         keep_prob = 1 - self.alpha
         if keep_prob <= 0:
@@ -243,7 +297,7 @@ class InterpolateDifference(Operation):
     def oper(self, a, b):
         if a is None or b is None:
             return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         alpha, delta = max(self.alpha, 0.001), torch.abs(a - b)
         max_delta = torch.max(delta)
         if max_delta == 0: return a
@@ -260,7 +314,7 @@ class ManualEnhancedInterpolateDifferenceOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         delta = torch.abs(a - b)
         diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
         mean_diff = torch.mean(diff, 0, keepdim=True)
@@ -280,7 +334,7 @@ class AutoEnhancedInterpolateDifferenceOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         delta = torch.abs(a - b)
         max_delta = torch.max(delta)
         diff = torch.nan_to_num((max_delta - delta) / max_delta)
@@ -303,7 +357,7 @@ class WeightSumCutoffOp(Operation):
 
     def oper(self, a, b):
         if a is None or b is None: return None
-        a, b = resize_tensors(a, b)
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
         delta = torch.abs(a - b)
         diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
         mean = torch.mean(diff, 0, True)
@@ -354,6 +408,7 @@ class WeightSum(CalcMode):
     param_docs = {'alpha': 'Interpolation weight. 0.0 is 100% Model A, 1.0 is 100% Model B.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         # Use pre-loaded tensor_a if available
         if '_tensor_a' in kwargs:
@@ -369,7 +424,9 @@ class WeightSum(CalcMode):
         if kwargs['alpha'] <= 0: return a
         c = Multiply(key, 1 - kwargs['alpha'], a)
         d = Multiply(key, kwargs['alpha'], b)
-        return Add(key, c, d)
+        res = Add(key, c, d)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class AddDifference(CalcMode):
@@ -379,6 +436,7 @@ class AddDifference(CalcMode):
     param_docs = {'alpha': 'Multiplier for the (B - C) difference.', 'beta': 'Smoothing (0=Off, 1=On).'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -392,7 +450,9 @@ class AddDifference(CalcMode):
         diff = Sub(key, b, c)
         if kwargs['beta'] == 1: diff = Smooth(key, diff)
         diffm = Multiply(key, kwargs['alpha'], diff)
-        return Add(key, a, diffm)
+        res = Add(key, a, diffm)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class TrainDifference(CalcMode):
@@ -402,6 +462,7 @@ class TrainDifference(CalcMode):
     param_docs = {'alpha': 'Multiplier for the calculated difference.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -414,7 +475,9 @@ class TrainDifference(CalcMode):
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         diff = TrainDiff(key, a, b, c)
         diffm = Multiply(key, kwargs['alpha'], diff)
-        return Add(key, a, diffm)
+        res = Add(key, a, diffm)
+        res.alignment_mode = alignment_mode
+        return res
 class InterpDifference(CalcMode):
     name = 'Comparative-Interpolation'
     description = 'Interpolates A and B based on relative tensor value differences.'
@@ -422,6 +485,7 @@ class InterpDifference(CalcMode):
     param_docs = {'alpha': 'Curve strength.', 'beta': 'Style (0=Similarity, 1=Difference).', 'gamma': 'Mix (0=Random, 1=Linear).'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -435,7 +499,9 @@ class InterpDifference(CalcMode):
 
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        return InterpolateDifference(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
+        res = InterpolateDifference(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class Extract(CalcMode):
@@ -445,6 +511,7 @@ class Extract(CalcMode):
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Similarity vs dissimilarity.', 'gamma': 'Similarity bias.', 'delta': 'Multiplier for final features.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -457,7 +524,9 @@ class Extract(CalcMode):
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = ExtractOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'] * 15, a, b, c)
         multiplied = Multiply(key, kwargs['delta'], extracted)
-        return Add(key, a, multiplied)
+        res = Add(key, a, multiplied)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class AddDisimilarity(CalcMode):
@@ -467,6 +536,7 @@ class AddDisimilarity(CalcMode):
     param_docs = {'alpha': 'Weighting B vs C.', 'beta': 'Multiplier for final features.', 'gamma': 'Similarity bias.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -479,7 +549,9 @@ class AddDisimilarity(CalcMode):
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = Similarities(key, kwargs['alpha'], 1, kwargs['gamma'] * 15, b, c)
         multiplied = Multiply(key, kwargs['beta'], extracted)
-        return Add(key, a, multiplied)
+        res = Add(key, a, multiplied)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class PowerUp(CalcMode):
@@ -489,6 +561,7 @@ class PowerUp(CalcMode):
     param_docs = {'alpha': 'Dropout rate (proportion of weights from B to *drop*).', 'beta': 'Multiplier for the final difference.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -499,8 +572,11 @@ class PowerUp(CalcMode):
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
         deltahat = PowerUpOp(key, kwargs['alpha'], kwargs['seed'], a, b)
-        res = Multiply(key, kwargs['beta'], deltahat)
-        return Add(key, a, res)
+        deltahat.alignment_mode = alignment_mode # Important!
+        multiplied = Multiply(key, kwargs['beta'], deltahat)
+        res = Add(key, a, multiplied)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class SVDMode(CalcMode):
@@ -510,6 +586,7 @@ class SVDMode(CalcMode):
     param_docs = {'alpha': 'Rank for standard layers.', 'beta': 'Rank for 3x3 conv layers.', 'gamma': 'Clamp quantile for weights.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -519,7 +596,9 @@ class SVDMode(CalcMode):
 
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        return SVD(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
+        res = SVD(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b, target_shape=kwargs.get('_tensor_a_shape'))
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class ManEnhInterpDifference(CalcMode):
@@ -529,6 +608,7 @@ class ManEnhInterpDifference(CalcMode):
     param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Lower mean threshold.', 'gamma': 'Upper mean threshold.', 'delta': 'Smoothness factor.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -541,7 +621,9 @@ class ManEnhInterpDifference(CalcMode):
 
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        return ManualEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['delta'], kwargs['seed'], a, b)
+        res = ManualEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['delta'], kwargs['seed'], a, b)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class AutoEnhInterpDifference(CalcMode):
@@ -551,6 +633,7 @@ class AutoEnhInterpDifference(CalcMode):
     param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Threshold adjustment factor.', 'gamma': 'Smoothness factor.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -563,7 +646,9 @@ class AutoEnhInterpDifference(CalcMode):
 
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        return AutoEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
+        res = AutoEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 class WeightSumCutoffMode(CalcMode):
@@ -573,6 +658,7 @@ class WeightSumCutoffMode(CalcMode):
     param_docs = {'alpha': 'Interpolation weight.', 'beta': 'Upper threshold.', 'gamma': 'Lower threshold.'}
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
 
         if '_tensor_a' in kwargs:
             a = PreloadedTensor(key, kwargs['_tensor_a'])
@@ -582,7 +668,9 @@ class WeightSumCutoffMode(CalcMode):
 
         loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
         b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
-        return WeightSumCutoffOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
+        res = WeightSumCutoffOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
+        res.alignment_mode = alignment_mode
+        return res
 
 
 TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode()]

@@ -93,6 +93,7 @@ class MergerLogic:
         mismatch_mode_str = recipe_params.get('mismatch_mode', 'skip')
         mismatch_mode = MissingTensorBehavior(mismatch_mode_str)
         recipe_params['mismatch_mode'] = mismatch_mode
+        alignment_mode = recipe_params.get('alignment_mode', 'pad/crop')
 
         # Compile filter patterns
         exclude_patterns = _compile_patterns(recipe_params.get('exclude_patterns', ''))
@@ -168,6 +169,15 @@ class MergerLogic:
                 for r_key, r_tensor in result.items():
                     merged_state_dict[r_key] = r_tensor.to(save_torch_dtype).cpu().clone()
             else:
+                # Ensure compatibility with Model A's architecture.
+                # If alignment_mode is 'pad/crop', we crop results that were padded.
+                # If alignment_mode is 'interpolate', resizing happened during operators.
+                if alignment_mode == 'pad/crop':
+                    target_shape = recipe_params['_tensor_a_shape']
+                    if result.shape != target_shape:
+                        slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(result.shape, target_shape))
+                        result = result[slices]
+
                 merged_state_dict[key] = result.to(save_torch_dtype).cpu().clone()
 
             # Clean up tensor_a reference to allow GC
@@ -219,6 +229,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                 io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("checkpoints")),
                 io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
@@ -247,7 +258,7 @@ class CheckpointTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -273,6 +284,7 @@ class ModelTwoMerger(io.ComfyNode):
                 io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
                 io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
@@ -301,7 +313,7 @@ class ModelTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -327,6 +339,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("text_encoders")),
                 io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
@@ -355,7 +368,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -381,6 +394,7 @@ class LoRATwoMerger(io.ComfyNode):
                 io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("loras")),
                 io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
@@ -409,7 +423,7 @@ class LoRATwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -435,6 +449,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 io.Combo.Input("model_b", options=["None"] + folder_paths.get_filename_list("embeddings")),
                 io.Combo.Input("calc_mode", options=[m.name for m in TWO_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
@@ -463,7 +478,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -492,6 +507,7 @@ class CheckpointThreeMerger(io.ComfyNode):
                 io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("checkpoints")),
                 io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
@@ -520,7 +536,7 @@ class CheckpointThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -547,6 +563,7 @@ class ModelThreeMerger(io.ComfyNode):
                 io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("diffusion_models")),
                 io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
@@ -575,7 +592,7 @@ class ModelThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -602,6 +619,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("text_encoders")),
                 io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
@@ -630,7 +648,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -657,6 +675,7 @@ class LoRAThreeMerger(io.ComfyNode):
                 io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("loras")),
                 io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
@@ -685,7 +704,7 @@ class LoRAThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -712,6 +731,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
                 io.Combo.Input("model_c", options=["None"] + folder_paths.get_filename_list("embeddings")),
                 io.Combo.Input("calc_mode", options=[m.name for m in THREE_MODEL_MODES]),
                 io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
+                io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
@@ -740,7 +760,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode,
+            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
