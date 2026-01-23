@@ -40,6 +40,14 @@ def resize_by_interpolation(tensor1, tensor2):
     t2_f = t2_f.view(view_shape)
 
     # Select mode based on dimensions
+    if dims1 == 4:
+        # [Out, In, H, W] -> [1, 1, Out, In, H*W] (5D)
+        view_shape = [1, 1, tensor2.shape[0], tensor2.shape[1], tensor2.shape[2] * tensor2.shape[3]]
+        target_size = [tensor1.shape[0], tensor1.shape[1], tensor1.shape[2] * tensor1.shape[3]]
+        t2_f = t2_f.view(view_shape)
+        t2_res = F.interpolate(t2_f, size=target_size, mode='trilinear', align_corners=False)
+        return tensor1, t2_res.view(tensor1.shape).to(orig_dtype)
+
     if dims1 == 1:
         mode = 'linear'
     elif dims1 == 2:
@@ -448,6 +456,7 @@ class AddDifference(CalcMode):
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         diff = Sub(key, b, c)
+        diff.alignment_mode = alignment_mode
         if kwargs['beta'] == 1: diff = Smooth(key, diff)
         diffm = Multiply(key, kwargs['alpha'], diff)
         res = Add(key, a, diffm)
@@ -474,6 +483,7 @@ class TrainDifference(CalcMode):
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         diff = TrainDiff(key, a, b, c)
+        diff.alignment_mode = alignment_mode
         diffm = Multiply(key, kwargs['alpha'], diff)
         res = Add(key, a, diffm)
         res.alignment_mode = alignment_mode
@@ -523,6 +533,7 @@ class Extract(CalcMode):
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = ExtractOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'] * 15, a, b, c)
+        extracted.alignment_mode = alignment_mode
         multiplied = Multiply(key, kwargs['delta'], extracted)
         res = Add(key, a, multiplied)
         res.alignment_mode = alignment_mode
@@ -548,6 +559,7 @@ class AddDisimilarity(CalcMode):
         b = LoadTensor(key, kwargs['model_b'], **loader_args_bc)
         c = LoadTensor(key, kwargs['model_c'], **loader_args_bc)
         extracted = Similarities(key, kwargs['alpha'], 1, kwargs['gamma'] * 15, b, c)
+        extracted.alignment_mode = alignment_mode
         multiplied = Multiply(key, kwargs['beta'], extracted)
         res = Add(key, a, multiplied)
         res.alignment_mode = alignment_mode

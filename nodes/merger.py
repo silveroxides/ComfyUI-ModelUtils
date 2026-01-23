@@ -249,7 +249,7 @@ class CheckpointTwoMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
@@ -258,7 +258,7 @@ class CheckpointTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -304,7 +304,7 @@ class ModelTwoMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
@@ -313,7 +313,7 @@ class ModelTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -359,7 +359,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
@@ -368,7 +368,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -414,7 +414,7 @@ class LoRATwoMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
@@ -423,7 +423,7 @@ class LoRATwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -469,7 +469,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
@@ -478,7 +478,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -527,7 +527,7 @@ class CheckpointThreeMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
@@ -536,7 +536,7 @@ class CheckpointThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -583,7 +583,7 @@ class ModelThreeMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
@@ -592,7 +592,7 @@ class ModelThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -639,7 +639,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
@@ -648,7 +648,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -695,7 +695,7 @@ class LoRAThreeMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
@@ -704,7 +704,7 @@ class LoRAThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
@@ -751,7 +751,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
-                calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
+                calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
@@ -760,7 +760,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
 
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "model_c": model_c, "calc_mode": calc_mode,
-            "mismatch_mode": mismatch_mode, "alignment_mode": recipe_params.get('alignment_mode', 'pad/crop'),
+            "mismatch_mode": mismatch_mode, "alignment_mode": alignment_mode,
             "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
