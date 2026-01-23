@@ -16,6 +16,33 @@ class MissingTensorError(Exception):
     pass
 
 # ################# #
+# UTILITIES
+# ################# #
+def resize_tensors(tensor1, tensor2):
+    """Pads 1D or 2D tensors to match shapes."""
+    if len(tensor1.shape) not in [1, 2]:
+        return tensor1, tensor2
+
+    # Pad along the last dimension (width)
+    if tensor1.shape[-1] < tensor2.shape[-1]:
+        padding_size = tensor2.shape[-1] - tensor1.shape[-1]
+        tensor1 = F.pad(tensor1, (0, padding_size, 0, 0))
+    elif tensor2.shape[-1] < tensor1.shape[-1]:
+        padding_size = tensor1.shape[-1] - tensor2.shape[-1]
+        tensor2 = F.pad(tensor2, (0, padding_size, 0, 0))
+
+    # Pad along the first dimension (height)
+    if tensor1.shape[0] < tensor2.shape[0]:
+        padding_size = tensor2.shape[0] - tensor1.shape[0]
+        tensor1 = F.pad(tensor1, (0, 0, 0, padding_size))
+    elif tensor2.shape[0] < tensor1.shape[0]:
+        padding_size = tensor1.shape[0] - tensor2.shape[0]
+        tensor2 = F.pad(tensor2, (0, 0, 0, padding_size))
+
+    return tensor1, tensor2
+
+
+# ################# #
 # MERGE OPERATORS
 # ################# #
 class Operation:
@@ -153,11 +180,12 @@ class ExtractOp(Operation):
     def oper(self, base: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if a is None or b is None:
             return None
+        dtype = base.dtype if base is not None else a.dtype
         base_f = base.float() if base is not None else 0
         a_f, b_f = a.float() - base_f, b.float() - base_f
-        c = torch.cosine_similarity(a_f.flatten(), b_f.flatten(), 0).clamp(-1, 1)
+        c = torch.cosine_similarity(a_f, b_f, -1).clamp(-1, 1).unsqueeze(-1)
         d = ((c + 1) / 2)**self.gamma
-        return (torch.lerp(a_f, b_f, self.alpha) * torch.lerp(d, 1 - d, self.beta)).to(a.dtype)
+        return (torch.lerp(a_f, b_f, self.alpha) * torch.lerp(d, 1 - d, self.beta)).to(dtype)
 
 
 class Similarities(ExtractOp):
@@ -172,10 +200,14 @@ class PowerUpOp(Operation):
     def oper(self, a, b):
         if a is None or b is None:
             return None
+        a, b = resize_tensors(a, b)
         delta = b - a
+        keep_prob = 1 - self.alpha
+        if keep_prob <= 0:
+            return torch.zeros_like(delta)
         rng = torch.Generator(device=delta.device).manual_seed(self.seed)
-        m = torch.bernoulli(torch.full_like(delta, 1 - self.alpha), generator=rng)
-        return (m * delta) / (1 - self.alpha) if (1 - self.alpha) > 0 else torch.zeros_like(delta)
+        m = (torch.empty_like(delta).uniform_(0, 1, generator=rng) < keep_prob).to(delta.dtype)
+        return (m * delta) / keep_prob
 
 
 class InterpolateDifference(Operation):
@@ -193,6 +225,62 @@ class InterpolateDifference(Operation):
         rng = torch.Generator(device=diff.device).manual_seed(self.seed)
         mask = torch.lerp(torch.bernoulli(torch.clamp(diff, 0, 1), generator=rng), diff, self.gamma)
         return a * (1 - mask) + b * mask
+
+class ManualEnhancedInterpolateDifferenceOp(Operation):
+    def __init__(self, key, alpha, beta, gamma, delta, seed, *sources):
+        super().__init__(key, *sources)
+        self.alpha, self.beta, self.gamma, self.delta, self.seed = alpha, beta, gamma, delta, seed
+
+    def oper(self, a, b):
+        if a is None or b is None: return None
+        delta = torch.abs(a - b)
+        diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
+        mean_diff = torch.mean(diff, 0, keepdim=True)
+        mask = torch.logical_and(self.beta < mean_diff, mean_diff < self.gamma)
+        powered_diff = torch.nan_to_num(diff ** (1 / max(self.alpha, 0.001) - 1))
+        masked_diff = powered_diff * mask.float()
+        rng = torch.Generator(device=a.device).manual_seed(self.seed)
+        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0, 1), generator=rng)
+        interpolated_mask = torch.lerp(random_mask, masked_diff, self.delta)
+        return a * (1 - interpolated_mask) + b * interpolated_mask
+
+
+class AutoEnhancedInterpolateDifferenceOp(Operation):
+    def __init__(self, key, alpha, beta, gamma, seed, *sources):
+        super().__init__(key, *sources)
+        self.alpha, self.beta, self.gamma, self.seed = alpha, beta, gamma, seed
+
+    def oper(self, a, b):
+        if a is None or b is None: return None
+        delta = torch.abs(a - b)
+        max_delta = torch.max(delta)
+        diff = torch.nan_to_num((max_delta - delta) / max_delta)
+        mean_diff = torch.mean(diff)
+        lower_threshold = mean_diff * (1 - self.beta)
+        upper_threshold = mean_diff * (1 + self.beta)
+        mask = torch.logical_and(lower_threshold < diff, diff < upper_threshold)
+        powered_diff = torch.nan_to_num(diff ** (1 / max(self.alpha, 0.001) - 1))
+        masked_diff = powered_diff * mask.float()
+        rng = torch.Generator(device=a.device).manual_seed(self.seed)
+        random_mask = torch.bernoulli(torch.clamp(masked_diff, 0, 1), generator=rng)
+        interpolated_mask = torch.lerp(random_mask, masked_diff, self.gamma)
+        return a * (1 - interpolated_mask) + b * interpolated_mask
+
+
+class WeightSumCutoffOp(Operation):
+    def __init__(self, key, alpha, beta, gamma, *sources):
+        super().__init__(key, *sources)
+        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+
+    def oper(self, a, b):
+        if a is None or b is None: return None
+        delta = torch.abs(a - b)
+        diff = torch.nan_to_num((torch.max(delta) - delta) / torch.max(delta))
+        mean = torch.mean(diff, 0, True)
+        mask = torch.logical_and(mean < self.beta, self.gamma < mean)
+        mul = self.alpha * mask
+        return a * (1 - mul) + b * mul
+
 
 # ################# #
 # CALCULATION MODES
@@ -404,5 +492,68 @@ class SVDMode(CalcMode):
         return SVD(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
 
 
-TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVDMode()]
+class ManEnhInterpDifference(CalcMode):
+    name = 'Enhanced Man Interp'
+    description = 'Enhanced interpolation between each pair of values from A and B depending on their difference relative to other values.'
+    models_used = ['A', 'B']
+    param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Lower mean threshold.', 'gamma': 'Upper mean threshold.', 'delta': 'Smoothness factor.'}
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        if key.startswith('cond_stage_model.transformer.text_model.embeddings'):
+            return a
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+        return ManualEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['delta'], kwargs['seed'], a, b)
+
+
+class AutoEnhInterpDifference(CalcMode):
+    name = 'Enhanced Auto Interp'
+    description = 'Interpolates between each pair of values from A and B depending on their difference relative to other values.'
+    models_used = ['A', 'B']
+    param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Threshold adjustment factor.', 'gamma': 'Smoothness factor.'}
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        if key.startswith('cond_stage_model.transformer.text_model.embeddings'):
+            return a
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+        return AutoEnhancedInterpolateDifferenceOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['seed'], a, b)
+
+
+class WeightSumCutoffMode(CalcMode):
+    name = 'Weight-Sum Cutoff'
+    description = 'Weight-sum with cutoff based on value differences.'
+    models_used = ['A', 'B']
+    param_docs = {'alpha': 'Interpolation weight.', 'beta': 'Upper threshold.', 'gamma': 'Lower threshold.'}
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+        return WeightSumCutoffOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], a, b)
+
+
+TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode()]
 THREE_MODEL_MODES = [AddDifference(), TrainDifference(), Extract(), AddDisimilarity()]

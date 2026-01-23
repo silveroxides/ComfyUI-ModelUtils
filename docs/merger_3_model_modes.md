@@ -22,19 +22,19 @@
 ---
 
 ## Extract-Features
-> A powerful mode that identifies features present in both `(B - A)` and `(C - A)` and adds them to A. Allows for fine-grained control over combining aspects based on their similarity.
+> A powerful mode that identifies features present in both `(B - A)` and `(C - A)` and adds them to A. It uses per-vector cosine similarity to decide how much of each feature to keep, allowing for fine-grained control over combining aspects.
 
 **Models Used:** A, B, C
 **Parameters:**
 - **Alpha:** Weights the merge between Model B (`0.0`) and Model C (`1.0`).
 - **Beta:** Controls the focus on similarity (`0.0`) versus dissimilarity (`1.0`).
-- **Gamma:** A bias exponent for similarity. Higher values increase the bias.
+- **Gamma:** A bias exponent for similarity calculation.
 - **Delta:** A final multiplier for the extracted features before they are added to Model A.
 
 ---
 
 ## Add-Dissimilarities
-> Identifies features that are dissimilar between Model B and Model C and adds them to Model A. Useful for combining unique aspects of two different models.
+> Identifies features that are dissimilar between Model B and Model C (relative to A) and adds them to Model A. Useful for combining unique aspects of two different models.
 
 **Models Used:** A, B, C
 **Parameters:**

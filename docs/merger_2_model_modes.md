@@ -23,12 +23,47 @@
 ---
 
 ## Power-Up (DARE)
-> Adds the unique capabilities of Model B to Model A using the Drop and Rescale (DARE) technique, which often preserves the knowledge of the base model better than simple additions.
+> Adds the unique capabilities of Model B to Model A using the Drop and Rescale (DARE) technique. This implementation handles shape mismatches between models by padding and uses a randomized dropout mask.
 
 **Models Used:** A, B
 **Parameters:**
-- **Alpha:** The dropout rate. This is the proportion of unique weights from Model B that are *dropped* before merging. A higher value means less of B is merged.
+- **Alpha:** The dropout rate ($p$). This is the proportion of delta parameters from Model B that are randomly set to zero.
 - **Beta:** A final multiplier for the rescaled difference before it's added to Model A.
+- **Rescaling Logic:** Remaining weights are automatically rescaled by $1/(1-p)$ as per the DARE paper to approximate the original embeddings.
+
+---
+
+## Enhanced Man Interp
+> Sophisticated interpolation between values from A and B depending on their difference relative to other values, with manual threshold control.
+
+**Models Used:** A, B
+**Parameters:**
+- **Alpha:** Interpolation strength.
+- **Beta:** Lower mean threshold for filtering differences.
+- **Gamma:** Upper mean threshold for filtering differences.
+- **Delta:** Smoothness factor (mix between randomized mask and powered differences).
+
+---
+
+## Enhanced Auto Interp
+> Automated version of the enhanced interpolation mode that dynamically calculates thresholds based on mean differences.
+
+**Models Used:** A, B
+**Parameters:**
+- **Alpha:** Interpolation strength.
+- **Beta:** Threshold adjustment factor.
+- **Gamma:** Smoothness factor.
+
+---
+
+## Weight-Sum Cutoff
+> A linear interpolation mode that only applies the merge to weights whose differences fall within a specific threshold range.
+
+**Models Used:** A, B
+**Parameters:**
+- **Alpha:** Interpolation weight (multiplier for the difference).
+- **Beta:** Upper threshold for the difference cutoff.
+- **Gamma:** Lower threshold for the difference cutoff.
 
 ---
 

@@ -222,6 +222,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_2_checkpoint"),
                 io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
@@ -238,7 +239,7 @@ class CheckpointTwoMerger(io.ComfyNode):
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
-                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
@@ -247,7 +248,7 @@ class CheckpointTwoMerger(io.ComfyNode):
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
             "mismatch_mode": mismatch_mode,
-            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
@@ -275,6 +276,7 @@ class ModelTwoMerger(io.ComfyNode):
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_2_model"),
                 io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
@@ -291,7 +293,7 @@ class ModelTwoMerger(io.ComfyNode):
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
-                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
@@ -300,7 +302,7 @@ class ModelTwoMerger(io.ComfyNode):
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
             "mismatch_mode": mismatch_mode,
-            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
@@ -328,6 +330,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_2_textencoder"),
                 io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
@@ -344,7 +347,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
-                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
@@ -353,7 +356,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
             "mismatch_mode": mismatch_mode,
-            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
@@ -381,6 +384,7 @@ class LoRATwoMerger(io.ComfyNode):
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_2_lora"),
                 io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
@@ -397,7 +401,7 @@ class LoRATwoMerger(io.ComfyNode):
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
-                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
@@ -406,7 +410,7 @@ class LoRATwoMerger(io.ComfyNode):
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
             "mismatch_mode": mismatch_mode,
-            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
@@ -434,6 +438,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
+                io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_2_embedding"),
                 io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"]),
@@ -450,7 +455,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
     @classmethod
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alpha: float, beta: float,
-                gamma: float, seed: int, output_filename: str, save_dtype: str,
+                gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
@@ -459,7 +464,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
         recipe_params = {
             "model_a": model_a, "model_b": model_b, "calc_mode": calc_mode,
             "mismatch_mode": mismatch_mode,
-            "alpha": alpha, "beta": beta, "gamma": gamma, "seed": seed,
+            "alpha": alpha, "beta": beta, "gamma": gamma, "delta": delta, "seed": seed,
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
