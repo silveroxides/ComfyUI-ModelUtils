@@ -77,13 +77,14 @@ class MergerLogic:
             print(f"[Merger] Preparing memory for {total_size_gb:.2f}GB merge operation...")
             prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
 
+        lazy_load = recipe_params.get('lazy_load', True)
         handlers = {}
         for name in model_names.values():
             if name and name != "None":
                 path = folder_paths.get_full_path(model_type, name)
                 if not path:
                     raise FileNotFoundError(f"Model '{name}' not found.")
-                handlers[name] = MemoryEfficientSafeOpen(path)
+                handlers[name] = MemoryEfficientSafeOpen(path, low_memory=lazy_load)
 
         primary_handler = handlers[primary_model_name]
         all_keys = primary_handler.keys()
@@ -182,6 +183,13 @@ class MergerLogic:
 
             # Clean up tensor_a reference to allow GC
             del recipe_params['_tensor_a']
+            
+            if recipe_params.get('force_clear_cache', True):
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             pbar.update(1)
 
         # Log summary
@@ -240,6 +248,8 @@ class CheckpointTwoMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -251,7 +261,8 @@ class CheckpointTwoMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -263,6 +274,7 @@ class CheckpointTwoMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -295,6 +307,8 @@ class ModelTwoMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -306,7 +320,8 @@ class ModelTwoMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -318,6 +333,7 @@ class ModelTwoMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -350,6 +366,8 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -361,7 +379,8 @@ class TextEncoderTwoMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -373,6 +392,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -405,6 +425,8 @@ class LoRATwoMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -416,7 +438,8 @@ class LoRATwoMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -428,6 +451,7 @@ class LoRATwoMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -460,6 +484,8 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -471,7 +497,8 @@ class EmbeddingTwoMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -483,6 +510,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -518,6 +546,8 @@ class CheckpointThreeMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -529,7 +559,8 @@ class CheckpointThreeMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -541,6 +572,7 @@ class CheckpointThreeMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -574,6 +606,8 @@ class ModelThreeMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -585,7 +619,8 @@ class ModelThreeMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -597,6 +632,7 @@ class ModelThreeMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -622,7 +658,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 io.Combo.Input("alignment_mode", options=["pad/crop", "interpolate"], default="pad/crop"),
                 io.Float.Input("alpha", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Float.Input("beta", default=0.5, min=-2.0, max=3.0, step=0.01),
-                io.Float.Input("gamma", default=0.5, min=-2.0, max=3.0, step=0.01),
+                io.Float.Input("gamma", default=0.99, min=0.0, max=1.0, step=0.001),
                 io.Float.Input("delta", default=0.5, min=-2.0, max=3.0, step=0.01),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_3_textencoder"),
@@ -630,6 +666,8 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -641,7 +679,8 @@ class TextEncoderThreeMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -653,6 +692,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -686,6 +726,8 @@ class LoRAThreeMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -697,7 +739,8 @@ class LoRAThreeMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -709,6 +752,7 @@ class LoRAThreeMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -742,6 +786,8 @@ class EmbeddingThreeMerger(io.ComfyNode):
                 io.Combo.Input("process_device", options=["cuda", "cpu"]),
                 io.String.Input("exclude_patterns", default="", multiline=True),
                 io.String.Input("discard_patterns", default="", multiline=True),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -753,7 +799,8 @@ class EmbeddingThreeMerger(io.ComfyNode):
     def execute(cls, execution_mode: str, model_a: str, model_b: str, model_c: str,
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, seed: int, output_filename: str, save_dtype: str,
-                process_device: str, exclude_patterns: str, discard_patterns: str) -> io.NodeOutput:
+                process_device: str, exclude_patterns: str, discard_patterns: str,
+                lazy_load: bool, force_clear_cache: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -765,6 +812,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
             "output_filename": output_filename, "save_dtype": save_dtype,
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
+            "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
