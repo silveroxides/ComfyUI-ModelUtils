@@ -433,6 +433,8 @@ def extract_lora_from_files(
     mismatch_mode: str = "skip",
     chunk_large_layers: bool = True,
     svd_niter: int = 2,
+    lazy_load: bool = True,
+    force_clear_cache: bool = True,
 ) -> dict[str, torch.Tensor]:
     """
     Extract LoRA from difference between two models.
@@ -468,8 +470,8 @@ def extract_lora_from_files(
     print(f"[LoRA Extract] Preparing memory for {total_size_gb:.2f}GB operation...")
     prepare_for_large_operation(total_size_gb * 1.5, torch.device(device))  # 1.5x for SVD headroom
 
-    handler_a = MemoryEfficientSafeOpen(model_a_path)
-    handler_b = MemoryEfficientSafeOpen(model_b_path)
+    handler_a = MemoryEfficientSafeOpen(model_a_path, low_memory=lazy_load)
+    handler_b = MemoryEfficientSafeOpen(model_b_path, low_memory=lazy_load)
 
     try:
         keys_a = set(handler_a.keys())
@@ -588,6 +590,12 @@ def extract_lora_from_files(
                 stats["extracted"] += 1
 
             del weight_diff
+            if force_clear_cache:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             pbar.update(1)
 
         print(f"[LoRA Extract] Done: {stats['extracted']} extracted, {stats['chunked']} chunked, "
@@ -709,6 +717,8 @@ def _format_lora_key(key: str) -> str:
 
 def _get_common_inputs():
     return [
+        io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+        io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
         io.Boolean.Input("chunk_large_layers", default=False,
                         tooltip="Split large fused layers (QKV, MLP) into chunks"),
         io.Float.Input("clamp_quantile", default=0.99, min=0.5, max=1.0, step=0.01,
@@ -751,15 +761,16 @@ class LoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
-            device, save_dtype, linear_dim, conv_dim,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter
+            "lora_unet_", device, save_dtype, linear_dim, conv_dim,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
+            lazy_load, force_clear_cache
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -794,15 +805,16 @@ class LoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
-            device, save_dtype, linear_max_rank, conv_max_rank,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -837,15 +849,16 @@ class LoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
-            device, save_dtype, linear_max_rank, conv_max_rank,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -878,15 +891,16 @@ class LoRAExtractKnee(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
-            device, save_dtype, linear_max_rank, conv_max_rank,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -921,15 +935,16 @@ class LoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
 
         output_sd = extract_lora_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
-            device, save_dtype, linear_max_rank, conv_max_rank,
-            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers
+            "lora_unet_", device, save_dtype, linear_max_rank, conv_max_rank,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
