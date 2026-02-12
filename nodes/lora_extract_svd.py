@@ -423,7 +423,6 @@ def extract_lora_from_files(
     mode: str,
     linear_param: float,
     conv_param: float,
-    prefix: str,
     device: str,
     save_dtype: str,
     linear_max_rank: int = None,
@@ -446,7 +445,6 @@ def extract_lora_from_files(
         mode: Rank selection mode
         linear_param: Mode parameter for linear layers
         conv_param: Mode parameter for conv layers
-        prefix: LoRA key prefix (e.g. "lora_unet_")
         device: Computation device
         save_dtype: Output dtype
         linear_max_rank: Max rank for linear layers
@@ -486,8 +484,7 @@ def extract_lora_from_files(
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         for key in tqdm(weight_keys, desc="Extracting LoRA", unit="layers"):
-            lora_key = key[:-7]
-            lora_name = prefix + lora_key.replace(".", "_")
+            lora_name = _format_lora_key(key)
 
             if _matches_any_pattern(key, skip_patterns):
                 stats["skipped"] += 1
@@ -569,7 +566,7 @@ def extract_lora_from_files(
                         if lora_up is not None:
                             output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
                             output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
-                            output_sd[f"{lora_name}.alpha"] = torch.tensor([rank]).to(save_torch_dtype)
+                            output_sd[f"{lora_name}.alpha"] = torch.tensor(rank).to(save_torch_dtype)
                             stats["chunked"] += 1
                             del weight_diff
                             pbar.update(1)
@@ -589,7 +586,7 @@ def extract_lora_from_files(
                 lora_down, lora_up, _ = result
                 output_sd[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
                 output_sd[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
-                output_sd[f"{lora_name}.alpha"] = torch.tensor([lora_down.shape[0]]).to(save_torch_dtype)
+                output_sd[f"{lora_name}.alpha"] = torch.tensor(lora_down.shape[0]).to(save_torch_dtype)
                 stats["extracted"] += 1
 
             del weight_diff
@@ -638,6 +635,84 @@ def _get_model_inputs():
         io.Combo.Input("model_b", options=folder_paths.get_filename_list("diffusion_models"),
                       tooltip="Base model (A - B = LoRA)"),
     ]
+
+
+def _reconstruct_dots(key: str) -> str:
+    """Reconstruct dot structure from underscored key using heuristics."""
+    # Block indices: input_blocks_1 -> input_blocks.1
+    blocks = [
+        "input_blocks", "output_blocks", "middle_block",
+        "transformer_blocks", "single_transformer_blocks",
+        "double_blocks", "single_blocks",
+        "down_blocks", "up_blocks", "mid_block",
+        "attentions", "resnets", "upsamplers", "downsamplers"
+    ]
+    for b in blocks:
+        key = re.sub(f"{b}_(\\d+)", f"{b}.\\1", key)
+
+    # Sequential numbers: .1_1 -> .1.1
+    key = re.sub(r"(\.\d+)_(\d+)", r"\1.\2", key)
+
+    # Separators that should be preceded by dot
+    separators = [
+        "transformer_blocks", "single_transformer_blocks",
+        "attn1", "attn2", "attn",
+        "img_attn", "txt_attn",
+        "to_q", "to_k", "to_v", "to_out",
+        "q_proj", "k_proj", "v_proj", "out_proj",
+        "qkv", "proj", "ff", "net",
+        "norm1", "norm2", "norm3", "norm",
+        "time_emb_proj"
+    ]
+    for s in separators:
+        key = key.replace(f"_{s}", f".{s}")
+
+    # Special case: to_out_0 -> to_out.0
+    key = re.sub(r"to_out_(\d+)", r"to_out.\1", key)
+
+    return key
+
+
+def _format_lora_key(key: str) -> str:
+    """
+    Format the key for LoRA saving.
+    Standardizes to 'diffusion_model.' or 'transformer.' prefix.
+    """
+    if key.endswith(".weight"):
+        key = key[:-7]
+
+    # Handle ComfyUI Checkpoint wrapper
+    if key.startswith("model.diffusion_model."):
+        # Check if it's a Diffusers-format transformer inside a checkpoint
+        inner_key = key[22:]  # len("model.diffusion_model.")
+        if inner_key.startswith("transformer_blocks") or inner_key.startswith("single_transformer_blocks"):
+            return f"transformer.{inner_key}"
+        # Standard checkpoint or Original Flux
+        return f"diffusion_model.{inner_key}"
+
+    # Handle direct Diffusers keys
+    if key.startswith("transformer_blocks") or key.startswith("single_transformer_blocks"):
+        return f"transformer.{key}"
+
+    # Handle legacy lora_unet_ prefix (for resizing without base)
+    if key.startswith("lora_unet_"):
+        core = key[10:]
+        dotted = _reconstruct_dots(core)
+        # Check if reconstructed key implies transformer format
+        if dotted.startswith("transformer_blocks") or dotted.startswith("single_transformer_blocks"):
+            return f"transformer.{dotted}"
+        return f"diffusion_model.{dotted}"
+
+    # Handle already correct prefixes
+    if key.startswith("diffusion_model.") or key.startswith("transformer."):
+        return key
+    
+    # Handle known Unet blocks (Diffusers format UNet)
+    if any(key.startswith(p) for p in ["down_blocks", "up_blocks", "mid_block", "conv_in", "conv_out", "time_embedding", "class_embedding"]):
+        return f"diffusion_model.{key}"
+
+    # Default fallback to diffusion_model
+    return f"diffusion_model.{key}"
 
 
 def _get_common_inputs():
@@ -717,9 +792,9 @@ class LoRAExtractRatio(io.ComfyNode):
                               tooltip="Ratio threshold for linear layers (higher = more SVs kept)"),
                 io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
                               tooltip="Ratio threshold for conv layers (higher = more SVs kept)"),
-                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("linear_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for linear layers"),
-                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("conv_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
@@ -761,9 +836,9 @@ class LoRAExtractQuantile(io.ComfyNode):
                               tooltip="Target cumulative % for linear layers"),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target cumulative % for conv layers"),
-                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("linear_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for linear layers"),
-                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("conv_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
@@ -803,9 +878,9 @@ class LoRAExtractKnee(io.ComfyNode):
                 *_get_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"],
                               default="sv_knee", tooltip="Knee detection method"),
-                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("linear_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for linear layers"),
-                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("conv_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
@@ -847,9 +922,9 @@ class LoRAExtractFrobenius(io.ComfyNode):
                               tooltip="Target Frobenius norm fraction for linear"),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target Frobenius norm fraction for conv"),
-                io.Int.Input("linear_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("linear_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for linear layers"),
-                io.Int.Input("conv_max_rank", default=128, min=1, max=1024,
+                io.Int.Input("conv_max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
