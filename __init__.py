@@ -1,6 +1,7 @@
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
+from .nodes.lora_merger import LoRAMultiMerge, LoRAMultiMergeDARE
 from .nodes.metakeys import (
     ModelMetaKeys, TextEncoderMetaKeys, LoRAMetaKeys,
     CheckpointMetaKeys, EmbeddingMetaKeys
@@ -26,9 +27,7 @@ from .nodes.lora_extract_svd import (
 from .nodes.lora_resize import (
     LoRAResizeFixed, LoRAResizeRatio,
     LoRAResizeFrobenius, LoRAResizeCumulative,
-    LoRAResizeViaBaseFixed, LoRAResizeViaBaseRatio,
-    LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
-    LoRAMultiMerge, LoRAMergeToModel
+    LoRAMergeToModel
 )
 
 
@@ -57,11 +56,8 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Resize
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
-            # LoRA Fast Resize (via base model)
-            LoRAResizeViaBaseFixed, LoRAResizeViaBaseRatio,
-            LoRAResizeViaBaseFrobenius, LoRAResizeViaBaseCumulative,
             # LoRA Multi-Merge
-            LoRAMultiMerge,
+            LoRAMultiMerge, LoRAMultiMergeDARE,
             # LoRA Merge To Model
             LoRAMergeToModel,
         ]
