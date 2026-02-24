@@ -183,7 +183,7 @@ class MergerLogic:
 
             # Clean up tensor_a reference to allow GC
             del recipe_params['_tensor_a']
-            
+
             if recipe_params.get('force_clear_cache', True):
                 import gc
                 gc.collect()

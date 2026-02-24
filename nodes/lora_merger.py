@@ -13,8 +13,8 @@ from typing import List, Dict, Tuple, Optional
 from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 from .lora_resize import (
-    detect_lora_format, 
-    extract_lora_pairs, 
+    detect_lora_format,
+    extract_lora_pairs,
     detect_lora_rank,
     _compile_patterns,
     _matches_any_pattern,
@@ -32,7 +32,7 @@ def merge_multi_loras(
 ) -> str:
     """
     Merge multiple LoRAs into a single LoRA file.
-    
+
     Modes:
     - concatenate: Mathematically sound merge by stacking ranks.
                    New rank = sum(input ranks). Alpha set to new rank.
@@ -45,22 +45,22 @@ def merge_multi_loras(
     if verbose:
         print(f"[LoRA Multi-Merge] Preparing memory for {total_size_gb:.2f}GB operation...")
         print(f"[LoRA Multi-Merge] Mode: {merge_mode}")
-    
+
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
 
     handlers = [MemoryEfficientSafeOpen(p) for p in lora_paths]
-    
+
     try:
         # 1. Analyze all LoRAs
         layer_map = {}
         lora_infos = []
-        
+
         for i, handler in enumerate(handlers):
             keys = handler.keys()
             fmt = detect_lora_format(keys)
             pairs = extract_lora_pairs(keys, fmt)
             rank, alpha = detect_lora_rank(handler, pairs)
-            
+
             info = {
                 "name": os.path.basename(lora_paths[i]),
                 "format": fmt,
@@ -71,10 +71,10 @@ def merge_multi_loras(
                 "scale": alpha / rank if rank > 0 else 1.0
             }
             lora_infos.append(info)
-            
+
             if verbose:
                 print(f"[LoRA Multi-Merge] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}, format={fmt['format']}")
-            
+
             for block_name in pairs.keys():
                 core = _format_lora_key(block_name)
                 if core not in layer_map:
@@ -94,37 +94,37 @@ def merge_multi_loras(
                 ups = []
                 is_conv = False
                 max_rank = 0
-                
+
                 # First pass: load and determine max rank
                 for idx in indices:
                     info = lora_infos[idx]
                     handler = handlers[idx]
                     orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                     block_keys = info["pairs"][orig_block]
-                    
+
                     if "down" not in block_keys or "up" not in block_keys:
                         continue
-                        
+
                     t_down = handler.get_tensor(block_keys["down"])
                     t_up = handler.get_tensor(block_keys["up"])
-                    
+
                     if device == 'cuda':
                         t_down = transfer_to_gpu_pinned(t_down, device, torch.float32)
                         t_up = transfer_to_gpu_pinned(t_up, device, torch.float32)
                     else:
                         t_down = t_down.to(device=device, dtype=torch.float32)
                         t_up = t_up.to(device=device, dtype=torch.float32)
-                    
+
                     # Store with original info for padding/weighting
                     is_conv = len(t_down.shape) == 4
                     current_rank = t_down.shape[0]
                     max_rank = max(max_rank, current_rank)
-                    
+
                     # Apply scale immediately for concatenate mode, or keep for later
                     if merge_mode == "concatenate":
                         effective_weight = info["weight"] * info["scale"]
                         t_up = t_up * effective_weight
-                    
+
                     downs.append((t_down, info))
                     ups.append((t_up, info))
 
@@ -148,10 +148,10 @@ def merge_multi_loras(
                     target_down_shape[0] = max_rank
                     target_up_shape = list(ups[0][0].shape)
                     target_up_shape[1] = max_rank
-                    
+
                     merged_down = torch.zeros(target_down_shape, device=device, dtype=torch.float32)
                     merged_up = torch.zeros(target_up_shape, device=device, dtype=torch.float32)
-                    
+
                     for (t_d, info_d), (t_u, info_u) in zip(downs, ups):
                         r = t_d.shape[0]
                         w = info_d["weight"]
@@ -159,7 +159,7 @@ def merge_multi_loras(
                         # Kohya just uses weights. But to be safe with different alphas,
                         # we apply scale to the final delta.
                         # For direct weight merge, we'll just use weights.
-                        
+
                         if r < max_rank:
                             # Pad down: [r, in...] -> [max_rank, in...]
                             pad_d = [0] * (len(t_d.shape) * 2)
@@ -168,15 +168,15 @@ def merge_multi_loras(
                             # For [r, in], padding is (0,0, 0, max_rank-r)
                             padding_d = [0, 0] * (len(t_d.shape) - 1) + [0, max_rank - r]
                             t_d = torch.nn.functional.pad(t_d, tuple(padding_d))
-                            
+
                             # Pad up: [out, r...] -> [out, max_rank...]
                             # For [out, r], padding is (0, max_rank-r, 0, 0)
                             padding_u = [0, max_rank - r] + [0, 0] * (len(t_u.shape) - 1)
                             t_u = torch.nn.functional.pad(t_u, tuple(padding_u))
-                        
+
                         merged_down += w * t_d
                         merged_up += w * t_u
-                    
+
                     new_rank = max_rank
                     # Alpha is usually max of alphas or same as rank
                     new_alpha = float(max_rank)
@@ -185,12 +185,12 @@ def merge_multi_loras(
                 output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.alpha"] = torch.tensor(new_alpha, dtype=save_dtype)
-                
+
                 # Cleanup
                 del merged_down, merged_up
                 for d, _ in downs: del d
                 for u, _ in ups: del u
-                
+
                 pbar.update(1)
 
         # 3. Final Summary
@@ -199,7 +199,7 @@ def merge_multi_loras(
             for indices in layer_map.values():
                 for idx in indices:
                     matched_stats[idx] += 1
-            
+
             print(f"[LoRA Multi-Merge] --- Merge Summary ---")
             for i, info in enumerate(lora_infos):
                 print(f"[LoRA Multi-Merge] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
@@ -210,16 +210,16 @@ def merge_multi_loras(
             "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via concatenation",
             "ss_network_module": "networks.lora",
         }
-        
+
         # 4. Save
         output_dir = folder_paths.get_folder_paths("loras")[0]
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-        
+
         save_file(output_sd, output_path, metadata)
         if verbose:
             print(f"[LoRA Multi-Merge] Saved merged LoRA to {output_path}")
-            
+
         return output_path
 
     finally:
@@ -265,7 +265,7 @@ class LoRAMultiMerge(io.ComfyNode):
                 # LoRA 8
                 io.Combo.Input("lora_8", options=["None"] + folder_paths.get_filename_list("loras"), default="None"),
                 io.Float.Input("weight_8", default=1.0, min=-10.0, max=10.0, step=0.01),
-                
+
                 io.Combo.Input("merge_mode", options=["concatenate", "weighted_sum"], default="concatenate",
                               tooltip="concatenate: safe, increases rank. weighted_sum: fixed rank (to max input rank), mathematically lossy but standard in Kohya."),
                 io.String.Input("output_filename", default="merged_lora"),
@@ -281,25 +281,25 @@ class LoRAMultiMerge(io.ComfyNode):
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 merge_mode, output_filename, save_dtype, device) -> io.NodeOutput:
-        
+
         count = int(lora_count)
         names = [lora_1, lora_2, lora_3, lora_4, lora_5, lora_6, lora_7, lora_8]
         weights = [weight_1, weight_2, weight_3, weight_4, weight_5, weight_6, weight_7, weight_8]
-        
+
         valid_paths = []
         valid_weights = []
-        
+
         for i in range(count):
             if names[i] and names[i] != "None":
                 path = folder_paths.get_full_path_or_raise("loras", names[i])
                 valid_paths.append(path)
                 valid_weights.append(weights[i])
-                
+
         if not valid_paths:
             raise ValueError("No LoRAs selected for merging.")
-            
+
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
-        
+
         path = merge_multi_loras(
             lora_paths=valid_paths,
             lora_weights=valid_weights,
@@ -308,7 +308,7 @@ class LoRAMultiMerge(io.ComfyNode):
             save_dtype=dtype,
             output_filename=output_filename
         )
-        
+
         return io.NodeOutput(path)
 
 
@@ -359,25 +359,25 @@ class LoRAMultiMergeDARE(io.ComfyNode):
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 drop_rate, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
-        
+
         count = int(lora_count)
         names = [lora_1, lora_2, lora_3, lora_4, lora_5, lora_6, lora_7, lora_8]
         weights = [weight_1, weight_2, weight_3, weight_4, weight_5, weight_6, weight_7, weight_8]
-        
+
         valid_paths = []
         valid_weights = []
-        
+
         for i in range(count):
             if names[i] and names[i] != "None":
                 path = folder_paths.get_full_path_or_raise("loras", names[i])
                 valid_paths.append(path)
                 valid_weights.append(weights[i])
-                
+
         if not valid_paths:
             raise ValueError("No LoRAs selected for merging.")
-            
+
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
-        
+
         path = merge_multi_loras_dare(
             lora_paths=valid_paths,
             lora_weights=valid_weights,
@@ -388,7 +388,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             save_dtype=dtype,
             output_filename=output_filename
         )
-        
+
         return io.NodeOutput(path)
 
 def merge_multi_loras_dare(
@@ -413,7 +413,7 @@ def merge_multi_loras_dare(
 
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
     handlers = [MemoryEfficientSafeOpen(p) for p in lora_paths]
-    
+
     rng = torch.Generator(device=device).manual_seed(seed)
 
     try:
@@ -433,7 +433,7 @@ def merge_multi_loras_dare(
                 "weight": lora_weights[i]
             }
             lora_infos.append(info)
-            
+
             if verbose:
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
@@ -454,16 +454,16 @@ def merge_multi_loras_dare(
                 downs = []
                 ups = []
                 max_rank = 0
-                
+
                 for idx in indices:
                     info = lora_infos[idx]
                     orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                     block_keys = info["pairs"][orig_block]
                     if "down" not in block_keys or "up" not in block_keys: continue
-                    
+
                     t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
                     t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
-                    
+
                     max_rank = max(max_rank, t_d.shape[0])
                     downs.append((t_d, info["weight"]))
                     ups.append((t_u, info["weight"]))
@@ -484,13 +484,13 @@ def merge_multi_loras_dare(
                             padding[rev_dim*2 + 1] = max_rank - t.shape[dim_to_pad]
                             t = torch.nn.functional.pad(t, tuple(padding))
                         padded.append(t * w)
-                    
+
                     # DARE
                     if drop_rate > 0:
                         for i in range(len(padded)):
                             mask = (torch.rand(padded[i].shape, generator=rng, device=device) > drop_rate).float()
                             padded[i] = (padded[i] * mask) / (1 - drop_rate)
-                    
+
                     # TIES
                     # 1. Trim
                     if trim_quantile > 0:
@@ -500,17 +500,17 @@ def merge_multi_loras_dare(
                             if k > 0:
                                 threshold = torch.kthvalue(flat, k).values
                                 padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
-                    
+
                     # 2. Elect & Merge
                     stacked = torch.stack(padded) # [N, ...]
                     signs = torch.sign(stacked)
                     sum_signs = signs.sum(dim=0)
                     dominant_sign = torch.sign(sum_signs)
-                    
+
                     # Filter those matching dominant sign
                     mask = (signs == dominant_sign) & (dominant_sign != 0)
                     filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
-                    
+
                     # Average matching signs
                     count = mask.sum(dim=0)
                     result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
@@ -522,7 +522,7 @@ def merge_multi_loras_dare(
                 output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.alpha"] = torch.tensor(float(max_rank), dtype=save_dtype)
-                
+
                 pbar.update(1)
 
         # Final Summary
@@ -531,7 +531,7 @@ def merge_multi_loras_dare(
             for indices in layer_map.values():
                 for idx in indices:
                     matched_stats[idx] += 1
-            
+
             print(f"[LoRA Multi-Merge DARE] --- Merge Summary ---")
             for i, info in enumerate(lora_infos):
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")

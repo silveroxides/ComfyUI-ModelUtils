@@ -886,11 +886,11 @@ class LoRAMergeToModel(io.ComfyNode):
             node_id="LoRAMergeToModel",
             display_name="LoRA Merge To Model",
             category="ModelUtils/LoRA/Merge",
-            description="Merge 1-4 LoRAs into a base model and save the result. Saves to base model directory.",
+            description="Merge 1-8 LoRAs into a base model and save the result. Saves to base model directory.",
             inputs=[
                 io.Combo.Input("base_model", options=folder_paths.get_filename_list("diffusion_models"),
                               tooltip="Base model the LoRAs were trained on"),
-                io.Combo.Input("lora_count", options=["1", "2", "3", "4"], default="2",
+                io.Combo.Input("lora_count", options=["1", "2", "3", "4", "5", "6", "7", "8"], default="2",
                               tooltip="Number of LoRAs to merge"),
                 # LoRA 1
                 io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"),
@@ -912,6 +912,26 @@ class LoRAMergeToModel(io.ComfyNode):
                               default="None", tooltip="Fourth LoRA"),
                 io.Float.Input("weight_4", default=1.0, min=-10.0, max=10.0, step=0.01,
                               tooltip="Weight strength for LoRA 4"),
+                # LoRA 5
+                io.Combo.Input("lora_5", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Fifth LoRA"),
+                io.Float.Input("weight_5", default=1.0, min=-10.0, max=10.0, step=0.01,
+                              tooltip="Weight strength for LoRA 5"),
+                # LoRA 6
+                io.Combo.Input("lora_6", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Sixth LoRA"),
+                io.Float.Input("weight_6", default=1.0, min=-10.0, max=10.0, step=0.01,
+                              tooltip="Weight strength for LoRA 6"),
+                # LoRA 7
+                io.Combo.Input("lora_7", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Seventh LoRA"),
+                io.Float.Input("weight_7", default=1.0, min=-10.0, max=10.0, step=0.01,
+                              tooltip="Weight strength for LoRA 7"),
+                # LoRA 8
+                io.Combo.Input("lora_8", options=["None"] + folder_paths.get_filename_list("loras"),
+                              default="None", tooltip="Eighth LoRA"),
+                io.Float.Input("weight_8", default=1.0, min=-10.0, max=10.0, step=0.01,
+                              tooltip="Weight strength for LoRA 8"),
                 # Settings
                 io.String.Input("skip_patterns", default="", multiline=True,
                                tooltip="Regex patterns for layers to skip"),
@@ -926,12 +946,13 @@ class LoRAMergeToModel(io.ComfyNode):
     @classmethod
     def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
+                lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 skip_patterns, output_filename, save_dtype, device) -> io.NodeOutput:
 
         # Build LoRA list based on count
         count = int(lora_count)
-        lora_names = [lora_1, lora_2, lora_3, lora_4][:count]
-        lora_weights = [weight_1, weight_2, weight_3, weight_4][:count]
+        lora_names = [lora_1, lora_2, lora_3, lora_4, lora_5, lora_6, lora_7, lora_8][:count]
+        lora_weights = [weight_1, weight_2, weight_3, weight_4, weight_5, weight_6, weight_7, weight_8][:count]
 
         # Filter out "None" entries
         valid_loras = [(name, weight) for name, weight in zip(lora_names, lora_weights) if name != "None"]
