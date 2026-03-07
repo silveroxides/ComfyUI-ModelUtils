@@ -48,7 +48,7 @@ def merge_multi_loras(
 
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
 
-    handlers = [MemoryEfficientSafeOpen(p) for p in lora_paths]
+    handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
 
     try:
         # 1. Analyze all LoRAs
@@ -190,6 +190,12 @@ def merge_multi_loras(
                 del merged_down, merged_up
                 for d, _ in downs: del d
                 for u, _ in ups: del u
+                downs.clear()
+                ups.clear()
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 pbar.update(1)
 
@@ -412,7 +418,7 @@ def merge_multi_loras_dare(
         print(f"[LoRA Multi-Merge DARE] Drop rate: {drop_rate}, Trim quantile: {trim_quantile}")
 
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
-    handlers = [MemoryEfficientSafeOpen(p) for p in lora_paths]
+    handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
 
     rng = torch.Generator(device=device).manual_seed(seed)
 
@@ -522,6 +528,16 @@ def merge_multi_loras_dare(
                 output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
                 output_sd[f"{core}.alpha"] = torch.tensor(float(max_rank), dtype=save_dtype)
+
+                del merged_down, merged_up
+                for d, _ in downs: del d
+                for u, _ in ups: del u
+                downs.clear()
+                ups.clear()
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 pbar.update(1)
 

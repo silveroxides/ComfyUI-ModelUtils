@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from enum import Enum
 
 
+from .merger_utils import transfer_to_gpu_pinned
+
 class MissingTensorBehavior(Enum):
     """Controls behavior when a tensor key is missing from a model."""
     ERROR = "error"      # Raise exception (strict mode)
@@ -127,11 +129,20 @@ class Operation:
         raise NotImplementedError
 
     def recurse(self, operation):
-        source_tensors = [source_oper.merge() for source_oper in operation.sources]
-        return operation.oper(*source_tensors)
+        self._source_tensors = [source_oper.merge() for source_oper in operation.sources]
+        return operation.oper(*self._source_tensors)
 
     def merge(self):
         return self.merge_func(self)
+
+    def clean(self):
+        if hasattr(self, '_source_tensors'):
+            for t in self._source_tensors:
+                del t
+            del self._source_tensors
+        for source in self.sources:
+            if hasattr(source, 'clean'):
+                source.clean()
 
 class LoadTensor(Operation):
     def __init__(self, key, model_name, handlers, device, dtype,
@@ -165,7 +176,17 @@ class LoadTensor(Operation):
                 dtype = self.fallback_dtype if self.fallback_dtype else self.dtype
                 return torch.zeros(self.fallback_shape, device=self.device, dtype=dtype)
 
-        return handler.get_tensor(self.key).to(device=self.device, dtype=self.dtype)
+        cpu_tensor = handler.get_tensor(self.key)
+        if self.device == 'cuda':
+            self._tensor = transfer_to_gpu_pinned(cpu_tensor, self.device, self.dtype)
+        else:
+            self._tensor = cpu_tensor.to(device=self.device, dtype=self.dtype)
+        del cpu_tensor
+        return self._tensor
+
+    def clean(self):
+        if hasattr(self, '_tensor'):
+            del self._tensor
 
 class Multiply(Operation):
     def __init__(self, key, alpha, *sources):
@@ -408,6 +429,10 @@ class PreloadedTensor(Operation):
 
     def merge(self) -> torch.Tensor:
         return self.tensor
+
+    def clean(self):
+        if hasattr(self, 'tensor'):
+            del self.tensor
 
 class WeightSum(CalcMode):
     name = 'Weight-Sum'
