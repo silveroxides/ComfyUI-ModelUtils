@@ -77,18 +77,17 @@ class MergerLogic:
             print(f"[Merger] Preparing memory for {total_size_gb:.2f}GB merge operation...")
             prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
 
-        lazy_load = recipe_params.get('lazy_load', True)
         handlers = {}
         for name in model_names.values():
             if name and name != "None":
                 path = folder_paths.get_full_path(model_type, name)
                 if not path:
                     raise FileNotFoundError(f"Model '{name}' not found.")
-                handlers[name] = MemoryEfficientSafeOpen(path, low_memory=lazy_load)
+                handlers[name] = MemoryEfficientSafeOpen(path, low_memory=True)
 
         primary_handler = handlers[primary_model_name]
         all_keys = primary_handler.keys()
-        metadata = primary_handler.header.get("__metadata__", {})
+        metadata = primary_handler.metadata()
 
         # Convert mismatch_mode string to enum
         mismatch_mode_str = recipe_params.get('mismatch_mode', 'skip')
@@ -125,72 +124,78 @@ class MergerLogic:
         discarded_keys = 0
         error_keys = []
 
-        for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
-            # Check discard patterns first - skip entirely
-            if _matches_any_pattern(key, discard_patterns):
-                discarded_keys += 1
+        with torch.no_grad():
+            for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
+                # Check discard patterns first - skip entirely
+                if _matches_any_pattern(key, discard_patterns):
+                    discarded_keys += 1
+                    pbar.update(1)
+                    continue
+
+                # Pre-load Model A's tensor with pinned memory for CUDA
+                cpu_tensor = primary_handler.get_tensor(key)
+                if process_device == 'cuda':
+                    tensor_a = transfer_to_gpu_pinned(cpu_tensor, process_device, process_dtype)
+                else:
+                    tensor_a = cpu_tensor.to(device=process_device, dtype=process_dtype)
+                del cpu_tensor
+
+                # Check exclude patterns - use Model A only, no merge
+                if _matches_any_pattern(key, exclude_patterns):
+                    merged_state_dict[key] = tensor_a.detach().to(save_torch_dtype).cpu().clone()
+                    excluded_keys += 1
+                    pbar.update(1)
+                    continue
+
+                # Pass tensor_a metadata to recipes for zeros mode and fallback
+                recipe_params['_tensor_a'] = tensor_a
+                recipe_params['_tensor_a_shape'] = tensor_a.shape
+                recipe_params['_tensor_a_dtype'] = tensor_a.dtype
+
+                try:
+                    recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
+                    result = recipe.merge()
+                except MissingTensorError as e:
+                    if mismatch_mode == MissingTensorBehavior.ERROR:
+                        raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
+                    result = None
+                    error_keys.append(key)
+
+                # Handle None result (mismatch occurred with skip mode)
+                if result is None:
+                    result = tensor_a
+                    skipped_keys += 1
+
+                if isinstance(result, dict):
+                    for r_key, r_tensor in result.items():
+                        merged_state_dict[r_key] = r_tensor.detach().to(save_torch_dtype).cpu().clone()
+                else:
+                    # Ensure compatibility with Model A's architecture.
+                    # If alignment_mode is 'pad/crop', we crop results that were padded.
+                    # If alignment_mode is 'interpolate', resizing happened during operators.
+                    if alignment_mode == 'pad/crop':
+                        target_shape = recipe_params['_tensor_a_shape']
+                        if result.shape != target_shape:
+                            slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(result.shape, target_shape))
+                            result = result[slices]
+
+                    merged_state_dict[key] = result.detach().to(save_torch_dtype).cpu().clone()
+
+                # Clean up references to allow GC immediately.
+                # Local loop variables must be explicitly deleted to prevent PyTorch from keeping tensors in VRAM.
+                recipe.clean()
+                del recipe_params['_tensor_a']
+                del tensor_a
+                del recipe
+                del result
+
+                if recipe_params.get('force_clear_cache', True):
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                 pbar.update(1)
-                continue
-
-            # Pre-load Model A's tensor with pinned memory for CUDA
-            cpu_tensor = primary_handler.get_tensor(key)
-            if process_device == 'cuda':
-                tensor_a = transfer_to_gpu_pinned(cpu_tensor, process_device, process_dtype)
-            else:
-                tensor_a = cpu_tensor.to(device=process_device, dtype=process_dtype)
-            del cpu_tensor
-
-            # Check exclude patterns - use Model A only, no merge
-            if _matches_any_pattern(key, exclude_patterns):
-                merged_state_dict[key] = tensor_a.to(save_torch_dtype).cpu().clone()
-                excluded_keys += 1
-                pbar.update(1)
-                continue
-
-            # Pass tensor_a metadata to recipes for zeros mode and fallback
-            recipe_params['_tensor_a'] = tensor_a
-            recipe_params['_tensor_a_shape'] = tensor_a.shape
-            recipe_params['_tensor_a_dtype'] = tensor_a.dtype
-
-            try:
-                recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
-                result = recipe.merge()
-            except MissingTensorError as e:
-                if mismatch_mode == MissingTensorBehavior.ERROR:
-                    raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
-                result = None
-                error_keys.append(key)
-
-            # Handle None result (mismatch occurred with skip mode)
-            if result is None:
-                result = tensor_a
-                skipped_keys += 1
-
-            if isinstance(result, dict):
-                for r_key, r_tensor in result.items():
-                    merged_state_dict[r_key] = r_tensor.to(save_torch_dtype).cpu().clone()
-            else:
-                # Ensure compatibility with Model A's architecture.
-                # If alignment_mode is 'pad/crop', we crop results that were padded.
-                # If alignment_mode is 'interpolate', resizing happened during operators.
-                if alignment_mode == 'pad/crop':
-                    target_shape = recipe_params['_tensor_a_shape']
-                    if result.shape != target_shape:
-                        slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(result.shape, target_shape))
-                        result = result[slices]
-
-                merged_state_dict[key] = result.to(save_torch_dtype).cpu().clone()
-
-            # Clean up tensor_a reference to allow GC
-            del recipe_params['_tensor_a']
-
-            if recipe_params.get('force_clear_cache', True):
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            pbar.update(1)
 
         # Log summary
         if excluded_keys > 0:

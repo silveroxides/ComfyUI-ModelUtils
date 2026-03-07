@@ -461,6 +461,12 @@ def resize_lora_file(
                 if alpha_suffix:
                     output_sd[f"{new_block_name}{alpha_suffix}"] = torch.tensor(result["new_alpha"]).to(save_dtype)
 
+                del result
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 pbar.update(1)
 
         if verbose and fro_list:
@@ -854,6 +860,10 @@ def merge_loras_to_model(
                     del cpu_base
                     stats["copied"] += 1
 
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 pbar.update(1)
 
