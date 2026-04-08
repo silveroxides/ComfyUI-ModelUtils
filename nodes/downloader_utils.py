@@ -548,10 +548,15 @@ def scan_and_process(scan_dirs, recursive=True, db_path=None, nsfw_level="All", 
         path = Path(scan_dir)
         if recursive:
             for ext in model_exts:
-                files_to_process.extend(path.rglob(f"*{ext}"))
+                # rglob includes all directories, so we must filter out hidden ones
+                for f in path.rglob(f"*{ext}"):
+                    if not any(part.startswith('.') for part in f.parts if part != '.' and part != '..'):
+                        files_to_process.append(f)
         else:
             for ext in model_exts:
-                files_to_process.extend(path.glob(f"*{ext}"))
+                for f in path.glob(f"*{ext}"):
+                    if not any(part.startswith('.') for part in f.parts if part != '.' and part != '..'):
+                        files_to_process.append(f)
                 
     nsfw_threshold = NSFW_LEVELS.get(nsfw_level, NSFW_LEVELS["All"])
 

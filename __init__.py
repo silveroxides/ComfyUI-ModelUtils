@@ -30,7 +30,7 @@ from .nodes.lora_resize import (
     LoRAMergeToModel
 )
 from .nodes.downloader_nodes import (
-    CheckpointDownloader, LoRADownloader, EmbeddingDownloader,
+    CheckpointDownloader, DiffusionModelDownloader, LoRADownloader, EmbeddingDownloader,
     VAEDownloader, ControlNetDownloader, ManualPathDownloader
 )
 
@@ -65,7 +65,7 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Merge To Model
             LoRAMergeToModel,
             # Downloaders
-            CheckpointDownloader, LoRADownloader, EmbeddingDownloader,
+            CheckpointDownloader, DiffusionModelDownloader, LoRADownloader, EmbeddingDownloader,
             VAEDownloader, ControlNetDownloader, ManualPathDownloader,
         ]
 

@@ -1,6 +1,30 @@
+import os
 import folder_paths
 from comfy_api.latest import io
 from .downloader_utils import scan_and_process
+
+def get_subdirectories(folder_name: str) -> list[str]:
+    """Helper to get a list of subdirectories for a given model folder name."""
+    paths = folder_paths.get_folder_paths(folder_name)
+    if not paths:
+        return ["/"]
+    
+    subdirs = set()
+    for base_path in paths:
+        if not os.path.exists(base_path):
+            continue
+        for root, dirs, _ in os.walk(base_path):
+            # Ignore hidden directories directly during walk
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            rel_path = os.path.relpath(root, base_path)
+            if rel_path == ".":
+                subdirs.add("/")
+            else:
+                # Store with forward slashes for consistency
+                subdirs.add("/" + rel_path.replace("\\", "/"))
+    
+    return sorted(list(subdirs))
 
 class BaseDownloaderNode(io.ComfyNode):
     CATEGORY = "ModelUtils/Downloader"
@@ -51,28 +75,225 @@ class BaseDownloaderNode(io.ComfyNode):
 
 class CheckpointDownloader(BaseDownloaderNode):
     @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("checkpoints"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="Checkpoint Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
     def get_scan_dirs(cls, **kwargs):
-        return folder_paths.get_folder_paths("checkpoints")
+        base_paths = folder_paths.get_folder_paths("checkpoints")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
+
+class DiffusionModelDownloader(BaseDownloaderNode):
+    @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("diffusion_models"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="Diffusion Model Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
+        base_paths = folder_paths.get_folder_paths("diffusion_models")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
 
 class LoRADownloader(BaseDownloaderNode):
     @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("loras"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="LoRA Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
     def get_scan_dirs(cls, **kwargs):
-        return folder_paths.get_folder_paths("loras")
+        base_paths = folder_paths.get_folder_paths("loras")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
 
 class EmbeddingDownloader(BaseDownloaderNode):
     @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("embeddings"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="Embedding Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
     def get_scan_dirs(cls, **kwargs):
-        return folder_paths.get_folder_paths("embeddings")
+        base_paths = folder_paths.get_folder_paths("embeddings")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
 
 class VAEDownloader(BaseDownloaderNode):
     @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("vae"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="VAE Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
     def get_scan_dirs(cls, **kwargs):
-        return folder_paths.get_folder_paths("vae")
+        base_paths = folder_paths.get_folder_paths("vae")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
 
 class ControlNetDownloader(BaseDownloaderNode):
     @classmethod
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("controlnet"), default="/"))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="ControlNet Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, subdirectory, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        return super().execute(
+            recursive=recursive, nsfw_level=nsfw_level, max_examples=max_examples,
+            threads=threads, api_key=api_key, subdirectory=subdirectory, **kwargs
+        )
+
+    @classmethod
     def get_scan_dirs(cls, **kwargs):
-        return folder_paths.get_folder_paths("controlnet")
+        base_paths = folder_paths.get_folder_paths("controlnet")
+        if not base_paths:
+            return []
+        sub = kwargs.get("subdirectory", "/")
+        if sub == "/":
+            return base_paths
+        
+        target_paths = []
+        for bp in base_paths:
+            target_path = os.path.join(bp, sub.lstrip("/"))
+            if os.path.exists(target_path):
+                target_paths.append(target_path)
+        return target_paths
 
 class ManualPathDownloader(BaseDownloaderNode):
     @classmethod
