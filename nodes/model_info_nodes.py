@@ -66,7 +66,7 @@ class CheckpointInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, checkpoint, workflow_index):
         res = cls.get_info("checkpoints", checkpoint, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
 
 class LoRAInfoLoader(BaseModelInfoLoader):
     @classmethod
@@ -89,7 +89,7 @@ class LoRAInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, lora, workflow_index):
         res = cls.get_info("loras", lora, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
 
 class EmbeddingInfoLoader(BaseModelInfoLoader):
     @classmethod
@@ -112,7 +112,7 @@ class EmbeddingInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, embedding, workflow_index):
         res = cls.get_info("embeddings", embedding, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
 
 class VAEInfoLoader(BaseModelInfoLoader):
     @classmethod
@@ -135,7 +135,7 @@ class VAEInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, vae, workflow_index):
         res = cls.get_info("vae", vae, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
 
 class ControlNetInfoLoader(BaseModelInfoLoader):
     @classmethod
@@ -158,7 +158,7 @@ class ControlNetInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, controlnet, workflow_index):
         res = cls.get_info("controlnet", controlnet, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
 
 class DiffusionModelInfoLoader(BaseModelInfoLoader):
     @classmethod
@@ -181,4 +181,4 @@ class DiffusionModelInfoLoader(BaseModelInfoLoader):
     @classmethod
     def execute(cls, diffusion_model, workflow_index):
         res = cls.get_info("diffusion_models", diffusion_model, workflow_index)
-        return io.NodeOutput(preview=res[0], workflow_json=res[1], metadata_json=res[2])
+        return io.NodeOutput(res[0], res[1], res[2])
