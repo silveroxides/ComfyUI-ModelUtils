@@ -29,6 +29,10 @@ from .nodes.lora_resize import (
     LoRAResizeFrobenius, LoRAResizeCumulative,
     LoRAMergeToModel
 )
+from .nodes.downloader_nodes import (
+    CheckpointDownloader, LoRADownloader, EmbeddingDownloader,
+    VAEDownloader, ControlNetDownloader, ManualPathDownloader
+)
 
 
 class ModelUtilsExtension(ComfyExtension):
@@ -60,6 +64,9 @@ class ModelUtilsExtension(ComfyExtension):
             LoRAMultiMerge, LoRAMultiMergeDARE,
             # LoRA Merge To Model
             LoRAMergeToModel,
+            # Downloaders
+            CheckpointDownloader, LoRADownloader, EmbeddingDownloader,
+            VAEDownloader, ControlNetDownloader, ManualPathDownloader,
         ]
 
 
