@@ -26,18 +26,18 @@ def get_subdirectories(folder_name: str) -> list[str]:
 
     return sorted(list(subdirs))
 
-class BaseDownloaderNode(io.ComfyNode):
+class BaseInfoMetaDownloaderNode(io.ComfyNode):
     CATEGORY = "ModelUtils/Downloader"
     OUTPUT_NODE = True
 
     @classmethod
     def get_common_inputs(cls):
         return {
-            "recursive": io.Boolean.Input("recursive", default=True),
-            "nsfw_level": io.Combo.Input("nsfw_level", options=["None", "Soft", "Mature", "X", "XXX", "All"], default="All"),
-            "max_examples": io.Int.Input("max_examples", default=0, min=0, max=100),
-            "threads": io.Int.Input("threads", default=4, min=1, max=32),
-            "api_key": io.String.Input("api_key", default="")
+            "recursive": io.Boolean.Input("recursive", default=True, tooltip="Whether to scan subdirectories recursively."),
+            "nsfw_level": io.Combo.Input("nsfw_level", options=["None", "Soft", "Mature", "X", "XXX", "All"], default="All", tooltip="Filter models based on NSFW level in metadata."),
+            "max_examples": io.Int.Input("max_examples", default=0, min=0, max=100, tooltip="Maximum number of examples to process."),
+            "threads": io.Int.Input("threads", default=4, min=1, max=32, tooltip="Number of threads to use for processing."),
+            "api_key": io.String.Input("api_key", default="", tooltip="API key for accessing the model repository.")
         }
 
     @classmethod
@@ -49,6 +49,7 @@ class BaseDownloaderNode(io.ComfyNode):
             inputs=list(cls.get_common_inputs().values()),
             outputs=[io.String.Output(display_name="status")],
             is_output_node=True,
+            description=("Scans specified directories for models, extracts metadata, generates previews, and optionally compresses files.")
         )
 
     @classmethod
@@ -84,7 +85,7 @@ class BaseDownloaderNode(io.ComfyNode):
     def get_scan_dirs(cls, **kwargs) -> list[str]:
         return []
 
-class CheckpointDownloader(BaseDownloaderNode):
+class CheckpointInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -121,7 +122,7 @@ class CheckpointDownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class DiffusionModelDownloader(BaseDownloaderNode):
+class DiffusionModelInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -158,7 +159,7 @@ class DiffusionModelDownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class LoRADownloader(BaseDownloaderNode):
+class LoRAInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -195,7 +196,7 @@ class LoRADownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class EmbeddingDownloader(BaseDownloaderNode):
+class EmbeddingInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -232,7 +233,7 @@ class EmbeddingDownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class VAEDownloader(BaseDownloaderNode):
+class VAEInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -269,7 +270,7 @@ class VAEDownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class ControlNetDownloader(BaseDownloaderNode):
+class ControlNetInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
@@ -306,7 +307,7 @@ class ControlNetDownloader(BaseDownloaderNode):
                 target_paths.append(target_path)
         return target_paths
 
-class ManualPathDownloader(BaseDownloaderNode):
+class ManualPathInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
