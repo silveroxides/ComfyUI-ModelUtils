@@ -562,11 +562,26 @@ def scan_and_process(scan_dirs, recursive=True, db_path=None, nsfw_level="All", 
 
     print(f"Found {len(files_to_process)} models to process.")
     
+    # Import and use ComfyUI's ProgressBar
+    try:
+        import comfy.utils
+        pbar = comfy.utils.ProgressBar(len(files_to_process))
+    except ImportError:
+        pbar = None
+    
     if threads > 1:
         print(f"Starting {threads} threads...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
             futures = [executor.submit(process_file, fp, cache, api, nsfw_threshold, max_examples) for fp in files_to_process]
-            concurrent.futures.wait(futures)
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error in thread: {e}")
+                if pbar:
+                    pbar.update(1)
     else:
         for filepath in files_to_process:
             process_file(filepath, cache, api, nsfw_threshold, max_examples)
+            if pbar:
+                pbar.update(1)
