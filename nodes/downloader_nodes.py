@@ -9,25 +9,29 @@ class BaseDownloaderNode(io.ComfyNode):
     @classmethod
     def get_common_inputs(cls):
         return {
-            "recursive": io.BOOLEAN(default=True),
-            "nsfw_level": io.COMBO(["None", "Soft", "Mature", "X", "XXX", "All"], default="All"),
-            "max_examples": io.INT(default=0, min=0, max=100),
-            "threads": io.INT(default=4, min=1, max=32),
-            "api_key": io.STRING(default="")
+            "recursive": io.Boolean.Input("recursive", default=True),
+            "nsfw_level": io.Combo.Input("nsfw_level", options=["None", "Soft", "Mature", "X", "XXX", "All"], default="All"),
+            "max_examples": io.Int.Input("max_examples", default=0, min=0, max=100),
+            "threads": io.Int.Input("threads", default=4, min=1, max=32),
+            "api_key": io.String.Input("api_key", default="")
         }
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": cls.get_common_inputs()}
+    def define_schema(cls):
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name=cls.__name__.replace("Downloader", " Downloader"),
+            category=cls.CATEGORY,
+            inputs=list(cls.get_common_inputs().values()),
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("status",)
-    FUNCTION = "process"
-
-    def process(self, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
-        scan_dirs = self.get_scan_dirs(**kwargs)
+    @classmethod
+    def execute(cls, recursive, nsfw_level, max_examples, threads, api_key, **kwargs):
+        scan_dirs = cls.get_scan_dirs(**kwargs)
         if not scan_dirs:
-            return ("No directories to scan.",)
+            return io.NodeOutput("No directories to scan.")
         
         # Call the scan_and_process function
         scan_and_process(
@@ -39,45 +43,66 @@ class BaseDownloaderNode(io.ComfyNode):
             threads=threads
         )
         
-        return (f"Completed scanning and downloading for {len(scan_dirs)} directories.",)
+        return io.NodeOutput(f"Completed scanning and downloading for {len(scan_dirs)} directories.")
 
-    def get_scan_dirs(self, **kwargs) -> list[str]:
+    @classmethod
+    def get_scan_dirs(cls, **kwargs) -> list[str]:
         return []
 
-
 class CheckpointDownloader(BaseDownloaderNode):
-    def get_scan_dirs(self, **kwargs):
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
         return folder_paths.get_folder_paths("checkpoints")
 
-
 class LoRADownloader(BaseDownloaderNode):
-    def get_scan_dirs(self, **kwargs):
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
         return folder_paths.get_folder_paths("loras")
 
-
 class EmbeddingDownloader(BaseDownloaderNode):
-    def get_scan_dirs(self, **kwargs):
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
         return folder_paths.get_folder_paths("embeddings")
 
-
 class VAEDownloader(BaseDownloaderNode):
-    def get_scan_dirs(self, **kwargs):
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
         return folder_paths.get_folder_paths("vae")
 
-
 class ControlNetDownloader(BaseDownloaderNode):
-    def get_scan_dirs(self, **kwargs):
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
         return folder_paths.get_folder_paths("controlnet")
-
 
 class ManualPathDownloader(BaseDownloaderNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        inputs = cls.get_common_inputs()
-        inputs["scan_dir"] = io.STRING(default="")
-        return {"required": inputs}
+    def define_schema(cls):
+        inputs = list(cls.get_common_inputs().values())
+        inputs.append(io.String.Input("scan_dir", default=""))
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name="Manual Path Downloader",
+            category=cls.CATEGORY,
+            inputs=inputs,
+            outputs=[io.String.Output(display_name="status")],
+            is_output_node=True,
+        )
 
-    def get_scan_dirs(self, scan_dir, **kwargs):
+    @classmethod
+    def execute(cls, recursive, nsfw_level, max_examples, threads, api_key, scan_dir, **kwargs):
+        return super().execute(
+            recursive=recursive,
+            nsfw_level=nsfw_level,
+            max_examples=max_examples,
+            threads=threads,
+            api_key=api_key,
+            scan_dir=scan_dir,
+            **kwargs
+        )
+
+    @classmethod
+    def get_scan_dirs(cls, **kwargs):
+        scan_dir = kwargs.get("scan_dir", "")
         if scan_dir.strip():
             return [scan_dir.strip()]
         return []
