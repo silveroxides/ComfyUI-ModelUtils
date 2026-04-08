@@ -8,7 +8,7 @@ def get_subdirectories(folder_name: str) -> list[str]:
     paths = folder_paths.get_folder_paths(folder_name)
     if not paths:
         return ["/"]
-    
+
     subdirs = set()
     for base_path in paths:
         if not os.path.exists(base_path):
@@ -16,14 +16,14 @@ def get_subdirectories(folder_name: str) -> list[str]:
         for root, dirs, _ in os.walk(base_path):
             # Ignore hidden directories directly during walk
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
+
             rel_path = os.path.relpath(root, base_path)
             if rel_path == ".":
                 subdirs.add("/")
             else:
                 # Store with forward slashes for consistency
                 subdirs.add("/" + rel_path.replace("\\", "/"))
-    
+
     return sorted(list(subdirs))
 
 class BaseDownloaderNode(io.ComfyNode):
@@ -56,9 +56,9 @@ class BaseDownloaderNode(io.ComfyNode):
         scan_dirs = cls.get_scan_dirs(**kwargs)
         if not scan_dirs:
             return io.NodeOutput("No directories to scan.")
-        
+
         # Call the scan_and_process function
-        scan_and_process(
+        stats = scan_and_process(
             scan_dirs=scan_dirs,
             recursive=recursive,
             nsfw_level=nsfw_level,
@@ -66,8 +66,19 @@ class BaseDownloaderNode(io.ComfyNode):
             api_key=api_key if api_key else None,
             threads=threads
         )
-        
-        return io.NodeOutput(f"Completed scanning and downloading for {len(scan_dirs)} directories.")
+
+        mb_saved = stats.get("space_saved", 0) / (1024 * 1024)
+
+        output_msg = (
+            f"Scan Complete for {len(scan_dirs)} directory/directories.\n"
+            f"Total Models Processed: {stats.get('total_processed', 0)}\n"
+            f"New Models Hashed: {stats.get('new_hashes', 0)}\n"
+            f"Images Processed: {stats.get('images_processed', 0)}\n"
+            f"Workflows Extracted: {stats.get('workflows_extracted', 0)}\n"
+            f"Space Saved via Compression: {mb_saved:.2f} MB"
+        )
+
+        return io.NodeOutput(output_msg)
 
     @classmethod
     def get_scan_dirs(cls, **kwargs) -> list[str]:
@@ -102,7 +113,7 @@ class CheckpointDownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))
@@ -139,7 +150,7 @@ class DiffusionModelDownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))
@@ -176,7 +187,7 @@ class LoRADownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))
@@ -213,7 +224,7 @@ class EmbeddingDownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))
@@ -250,7 +261,7 @@ class VAEDownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))
@@ -287,7 +298,7 @@ class ControlNetDownloader(BaseDownloaderNode):
         sub = kwargs.get("subdirectory", "/")
         if sub == "/":
             return base_paths
-        
+
         target_paths = []
         for bp in base_paths:
             target_path = os.path.join(bp, sub.lstrip("/"))

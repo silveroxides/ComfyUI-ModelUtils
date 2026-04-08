@@ -2,3 +2,4 @@ requests
 Pillow
 mutagen
 unifiedefficientloader
+av

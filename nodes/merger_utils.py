@@ -65,8 +65,8 @@ def transfer_to_gpu_pinned(
 
 class MemoryEfficientSafeOpen:
     """Memory-efficient safetensors file reader with streaming and pinned memory support.
-    
-    Operates strictly in streaming mode (low memory). Tensors are read byte-by-byte from 
+
+    Operates strictly in streaming mode (low memory). Tensors are read byte-by-byte from
     their exact offsets without using safe_open or memory mapping, ensuring tensors do not
     remain persistently in OS page caches or RAM.
     """
