@@ -12,7 +12,7 @@ from .device_utils import (
 )
 
 try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
     UNIFIED_ENABLED = True
 except Exception as e:
     UNIFIED_ENABLED = False
@@ -131,6 +131,18 @@ class MergerLogic:
         discarded_keys = 0
         error_keys = []
 
+        output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
+        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
+        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = recipe_params.get("output_filename")
+        output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
+
+        writer = None
+        if UNIFIED_ENABLED:
+            writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+            writer.__enter__()
+
         with torch.no_grad():
             for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
                 # Check discard patterns first - skip entirely
@@ -149,7 +161,12 @@ class MergerLogic:
 
                 # Check exclude patterns - use Model A only, no merge
                 if _matches_any_pattern(key, exclude_patterns):
-                    merged_state_dict[key] = tensor_a.detach().to(save_torch_dtype).cpu().clone()
+                    out_t = tensor_a.detach().to(save_torch_dtype).cpu().clone()
+                    if UNIFIED_ENABLED:
+                        writer.write(key, out_t)
+                        del out_t
+                    else:
+                        merged_state_dict[key] = out_t
                     excluded_keys += 1
                     pbar.update(1)
                     continue
@@ -164,6 +181,7 @@ class MergerLogic:
                     result = recipe.merge()
                 except MissingTensorError as e:
                     if mismatch_mode == MissingTensorBehavior.ERROR:
+                        if UNIFIED_ENABLED: writer.__exit__(None, None, None)
                         raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
                     result = None
                     error_keys.append(key)
@@ -175,7 +193,12 @@ class MergerLogic:
 
                 if isinstance(result, dict):
                     for r_key, r_tensor in result.items():
-                        merged_state_dict[r_key] = r_tensor.detach().to(save_torch_dtype).cpu().clone()
+                        out_t = r_tensor.detach().to(save_torch_dtype).cpu().clone()
+                        if UNIFIED_ENABLED:
+                            writer.write(r_key, out_t)
+                            del out_t
+                        else:
+                            merged_state_dict[r_key] = out_t
                 else:
                     # Ensure compatibility with Model A's architecture.
                     # If alignment_mode is 'pad/crop', we crop results that were padded.
@@ -186,7 +209,12 @@ class MergerLogic:
                             slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(result.shape, target_shape))
                             result = result[slices]
 
-                    merged_state_dict[key] = result.detach().to(save_torch_dtype).cpu().clone()
+                    out_t = result.detach().to(save_torch_dtype).cpu().clone()
+                    if UNIFIED_ENABLED:
+                        writer.write(key, out_t)
+                        del out_t
+                    else:
+                        merged_state_dict[key] = out_t
 
                 # Clean up references to allow GC immediately.
                 # Local loop variables must be explicitly deleted to prevent PyTorch from keeping tensors in VRAM.
@@ -203,6 +231,9 @@ class MergerLogic:
                         torch.cuda.empty_cache()
 
                 pbar.update(1)
+
+        if UNIFIED_ENABLED:
+            writer.__exit__(None, None, None)
 
         # Log summary
         if excluded_keys > 0:
@@ -223,10 +254,12 @@ class MergerLogic:
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
-        save_file(merged_state_dict, output_path, metadata=metadata)
+        if not UNIFIED_ENABLED:
+            save_file(merged_state_dict, output_path, metadata=metadata)
 
         # Cleanup after heavy operation
-        del merged_state_dict
+        if not UNIFIED_ENABLED:
+            del merged_state_dict
         cleanup_after_operation()
 
         return f"{output_filename}.safetensors"
