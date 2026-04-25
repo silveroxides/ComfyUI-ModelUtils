@@ -10,7 +10,6 @@ from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from typing import List, Dict, Tuple, Optional
-from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 from .lora_resize import (
     detect_lora_format,
@@ -20,6 +19,16 @@ from .lora_resize import (
     _matches_any_pattern,
     _format_lora_key
 )
+
+try:
+    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+    UNIFIED_ENABLED = True
+except Exception as e:
+    UNIFIED_ENABLED = False
+
+if not UNIFIED_ENABLED:
+    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+
 
 def merge_multi_loras(
     lora_paths: List[str],

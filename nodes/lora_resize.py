@@ -14,8 +14,17 @@ from tqdm import tqdm
 from comfy_api.latest import io
 from safetensors.torch import save_file
 from typing import Optional, Dict, Tuple, List
-from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
+
+try:
+    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+    UNIFIED_ENABLED = True
+except Exception as e:
+    UNIFIED_ENABLED = False
+
+if not UNIFIED_ENABLED:
+    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+
 
 # Reuse rank functions from extraction module
 from .lora_extract_svd import (
