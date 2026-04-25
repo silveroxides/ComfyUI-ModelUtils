@@ -29,6 +29,14 @@ from .nodes.lora_resize import (
     LoRAResizeFrobenius, LoRAResizeCumulative,
     LoRAMergeToModel
 )
+from .nodes.downloader_nodes import (
+    CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
+    VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader
+)
+from .nodes.model_info_nodes import (
+    CheckpointInfoLoader, LoRAInfoLoader, EmbeddingInfoLoader,
+    VAEInfoLoader, ControlNetInfoLoader, DiffusionModelInfoLoader
+)
 
 
 class ModelUtilsExtension(ComfyExtension):
@@ -60,6 +68,12 @@ class ModelUtilsExtension(ComfyExtension):
             LoRAMultiMerge, LoRAMultiMergeDARE,
             # LoRA Merge To Model
             LoRAMergeToModel,
+            # Downloaders
+            CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
+            VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,
+            # Info Loaders
+            CheckpointInfoLoader, LoRAInfoLoader, EmbeddingInfoLoader,
+            VAEInfoLoader, ControlNetInfoLoader, DiffusionModelInfoLoader,
         ]
 
 

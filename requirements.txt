@@ -1,1 +1,5 @@
-# No external dependencies required
+requests
+Pillow
+mutagen
+unifiedefficientloader
+av
