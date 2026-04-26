@@ -83,6 +83,9 @@ class MergerLogic:
             process_device = recipe_params.get('device', 'cpu')
             print(f"[Merger] Preparing memory for {total_size_gb:.2f}GB merge operation...")
             prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
+            flush_threshold_bytes = int(total_size_gb * 1024**3 / 16)
+        else:
+            flush_threshold_bytes = 256 * 1024 * 1024  # 256MB fallback (min 8GB RAM assumed)
 
         handlers = {}
         for name in model_names.values():
@@ -143,12 +146,32 @@ class MergerLogic:
             writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
             writer.__enter__()
 
+        batch_buffer = {}
+        batch_bytes = 0
+        batch_key_count = 0
+
+        def _flush_batch():
+            nonlocal batch_buffer, batch_bytes, batch_key_count
+            if not batch_buffer:
+                return
+            writer.write_dict(batch_buffer)
+            pbar.update(batch_key_count)
+            batch_buffer = {}
+            batch_bytes = 0
+            batch_key_count = 0
+            if recipe_params.get('force_clear_cache', True):
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         with torch.no_grad():
             for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
                 # Check discard patterns first - skip entirely
                 if _matches_any_pattern(key, discard_patterns):
                     discarded_keys += 1
-                    pbar.update(1)
+                    if not UNIFIED_ENABLED:
+                        pbar.update(1)
                     continue
 
                 # Pre-load Model A's tensor with pinned memory for CUDA
@@ -161,14 +184,18 @@ class MergerLogic:
 
                 # Check exclude patterns - use Model A only, no merge
                 if _matches_any_pattern(key, exclude_patterns):
-                    out_t = tensor_a.detach().to(save_torch_dtype).cpu().clone()
+                    t = tensor_a.detach().to(save_torch_dtype).cpu()
                     if UNIFIED_ENABLED:
-                        writer.write(key, out_t)
-                        del out_t
+                        batch_buffer[key] = t
+                        batch_bytes += t.numel() * t.element_size()
+                        batch_key_count += 1
                     else:
-                        merged_state_dict[key] = out_t
+                        merged_state_dict[key] = t.clone()
+                        pbar.update(1)
                     excluded_keys += 1
-                    pbar.update(1)
+                    del tensor_a
+                    if UNIFIED_ENABLED and (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
+                        _flush_batch()
                     continue
 
                 # Pass tensor_a metadata to recipes for zeros mode and fallback
@@ -181,7 +208,9 @@ class MergerLogic:
                     result = recipe.merge()
                 except MissingTensorError as e:
                     if mismatch_mode == MissingTensorBehavior.ERROR:
-                        if UNIFIED_ENABLED: writer.__exit__(None, None, None)
+                        if UNIFIED_ENABLED:
+                            _flush_batch()
+                            writer.__exit__(None, None, None)
                         raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
                     result = None
                     error_keys.append(key)
@@ -193,12 +222,12 @@ class MergerLogic:
 
                 if isinstance(result, dict):
                     for r_key, r_tensor in result.items():
-                        out_t = r_tensor.detach().to(save_torch_dtype).cpu().clone()
+                        t = r_tensor.detach().to(save_torch_dtype).cpu()
                         if UNIFIED_ENABLED:
-                            writer.write(r_key, out_t)
-                            del out_t
+                            batch_buffer[r_key] = t
+                            batch_bytes += t.numel() * t.element_size()
                         else:
-                            merged_state_dict[r_key] = out_t
+                            merged_state_dict[r_key] = t.clone()
                 else:
                     # Ensure compatibility with Model A's architecture.
                     # If alignment_mode is 'pad/crop', we crop results that were padded.
@@ -209,12 +238,17 @@ class MergerLogic:
                             slices = tuple(slice(0, min(res_s, tgt_s)) for res_s, tgt_s in zip(result.shape, target_shape))
                             result = result[slices]
 
-                    out_t = result.detach().to(save_torch_dtype).cpu().clone()
+                    t = result.detach().to(save_torch_dtype).cpu()
                     if UNIFIED_ENABLED:
-                        writer.write(key, out_t)
-                        del out_t
+                        batch_buffer[key] = t
+                        batch_bytes += t.numel() * t.element_size()
                     else:
-                        merged_state_dict[key] = out_t
+                        merged_state_dict[key] = t.clone()
+
+                if UNIFIED_ENABLED:
+                    batch_key_count += 1
+                else:
+                    pbar.update(1)
 
                 # Clean up references to allow GC immediately.
                 # Local loop variables must be explicitly deleted to prevent PyTorch from keeping tensors in VRAM.
@@ -224,15 +258,11 @@ class MergerLogic:
                 del recipe
                 del result
 
-                if recipe_params.get('force_clear_cache', True):
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                pbar.update(1)
+                if UNIFIED_ENABLED and (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
+                    _flush_batch()
 
         if UNIFIED_ENABLED:
+            _flush_batch()
             writer.__exit__(None, None, None)
 
         # Log summary
