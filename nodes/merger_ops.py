@@ -319,6 +319,53 @@ class PowerUpOp(Operation):
         return (m * delta) / keep_prob
 
 
+class DARETIESOp(Operation):
+    """DARE + TIES combined operation on a single task vector (delta = b - a).
+
+    Step 1 — DARE: randomly drop `drop_rate` fraction of delta parameters,
+                   rescale survivors by 1/(1-drop_rate).
+    Step 2 — TIES trim: zero out parameters below the `trim_quantile` magnitude threshold.
+    Step 3 — TIES elect: determine dominant sign per parameter position.
+    Step 4 — TIES merge: zero out parameters that disagree with the dominant sign.
+
+    For a two-model merge the TIES elect/merge step degenerates to a no-op (single vector,
+    sign is always self-consistent) but the trim step still reduces interference from
+    near-zero noisy deltas. The dominant sign filter is included for correctness and
+    forward compatibility with n-model extensions.
+    """
+    def __init__(self, key, alpha, beta, gamma, seed, *sources):
+        super().__init__(key, *sources)
+        # alpha = drop_rate (DARE), beta = trim_quantile (TIES), gamma = lambda scale
+        self.alpha, self.beta, self.gamma, self.seed = alpha, beta, gamma, seed
+
+    def oper(self, a, b):
+        if a is None or b is None:
+            return None
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
+        delta = (b - a).float()
+
+        # --- DARE: drop and rescale ---
+        keep_prob = 1.0 - self.alpha
+        if keep_prob <= 0:
+            return torch.zeros_like(a)
+        rng = torch.Generator(device=delta.device).manual_seed(self.seed)
+        dare_mask = (torch.empty_like(delta).uniform_(0, 1, generator=rng) < keep_prob).float()
+        delta = (delta * dare_mask) / keep_prob
+
+        # --- TIES trim: zero parameters below magnitude threshold ---
+        if self.beta > 0:
+            flat_abs = delta.abs().flatten()
+            k = max(1, int(flat_abs.numel() * self.beta))
+            threshold = torch.kthvalue(flat_abs, k).values
+            delta = torch.where(delta.abs() < threshold, torch.zeros_like(delta), delta)
+
+        # --- TIES elect: dominant sign (trivially self-consistent for single vector) ---
+        dominant_sign = torch.sign(delta)
+        delta = torch.where(torch.sign(delta) == dominant_sign, delta, torch.zeros_like(delta))
+
+        return (a + self.gamma * delta).to(a.dtype)
+
+
 class InterpolateDifference(Operation):
     def __init__(self, key, alpha, beta, gamma, seed, *sources):
         super().__init__(key, *sources)
@@ -710,5 +757,41 @@ class WeightSumCutoffMode(CalcMode):
         return res
 
 
-TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode()]
+class DARETIESMode(CalcMode):
+    name = 'Power-Up (DARE+TIES)'
+    description = 'Adds capabilities of B to A using DARE (Drop and Rescale) followed by TIES (Trim, Elect Sign). Best practice for LoRA-tuned model merging.'
+    models_used = ['A', 'B']
+    param_docs = {
+        'alpha': 'DARE drop rate — fraction of delta parameters randomly zeroed. Higher = more aggressive sparsification.',
+        'beta':  'TIES trim quantile — fraction of smallest-magnitude delta parameters zeroed after DARE. Removes residual noise.',
+        'gamma': 'Lambda — scale multiplier applied to the final merged delta before adding to Model A.',
+        'seed':  'Random seed for the DARE dropout mask.',
+    }
+
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+
+        op = DARETIESOp(
+            key,
+            kwargs['alpha'],   # drop_rate
+            kwargs['beta'],    # trim_quantile
+            kwargs['gamma'],   # lambda scale
+            kwargs['seed'],
+            a, b,
+        )
+        op.alignment_mode = alignment_mode
+        return op
+
+
+TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), DARETIESMode(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode()]
 THREE_MODEL_MODES = [AddDifference(), TrainDifference(), Extract(), AddDisimilarity()]

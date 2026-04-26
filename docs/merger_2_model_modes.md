@@ -33,6 +33,30 @@
 
 ---
 
+## Power-Up (DARE+TIES)
+> Combines DARE (Drop and Rescale) with TIES (Trim, Elect Sign) — the current best-practice algorithm for merging fine-tuned models, particularly LoRA-tuned ones. DARE sparsifies the task vector via random dropout and rescaling; TIES then removes residual low-magnitude noise and enforces sign consistency. The result is a cleaner, more targeted capability transfer from B to A with less interference.
+
+**Models Used:** A, B
+**Parameters:**
+- **Alpha:** DARE drop rate. Fraction of delta parameters randomly zeroed. Higher values produce a sparser, more targeted delta. Typical range: `0.5`–`0.9`.
+- **Beta:** TIES trim quantile. Fraction of the smallest-magnitude delta parameters zeroed after DARE, removing residual noise. `0.0` disables trimming. Typical range: `0.1`–`0.3`.
+- **Gamma:** Lambda scale. Final multiplier applied to the merged delta before adding to Model A. Equivalent to the task arithmetic scaling coefficient. Typical range: `0.5`–`1.5`.
+- **Seed:** Random seed for the DARE dropout mask. Controls reproducibility.
+
+**Algorithm:**
+1. Compute task vector `δ = B − A`
+2. **DARE:** apply random binary mask with keep probability `1 − alpha`; rescale survivors by `1/(1−alpha)`
+3. **TIES trim:** zero out parameters below the `beta`-quantile magnitude threshold
+4. **TIES elect:** determine dominant sign per position; zero out disagreeing parameters
+5. Return `A + gamma × δ_filtered`
+
+**Guidance:**
+- Start with `alpha=0.9, beta=0.2, gamma=1.0` for LoRA-derived models
+- Lower `alpha` (e.g. `0.5`) for full fine-tunes where more delta mass should be retained
+- Increase `gamma` beyond `1.0` to amplify B's influence; decrease below `1.0` to soften it
+
+---
+
 ## Enhanced Man Interp
 > Sophisticated interpolation between values from A and B depending on their difference relative to other values, with manual threshold control.
 
