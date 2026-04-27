@@ -8,14 +8,8 @@ from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen
-    UNIFIED_ENABLED = True
-except Exception as e:
-    UNIFIED_ENABLED = False
+from unifiedefficientloader import MemoryEfficientSafeOpen
 
-if not UNIFIED_ENABLED:
-    from .merger_utils import MemoryEfficientSafeOpen
 
 
 def _rename_keys(model_name: str, model_type: str, old_keys_str: str,

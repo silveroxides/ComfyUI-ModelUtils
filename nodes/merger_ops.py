@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from enum import Enum
 
 
-from .merger_utils import transfer_to_gpu_pinned
+from unifiedefficientloader import transfer_to_gpu_pinned
 
 class MissingTensorBehavior(Enum):
     """Controls behavior when a tensor key is missing from a model."""

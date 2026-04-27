@@ -18,14 +18,8 @@ from .device_utils import (
     cleanup_after_operation, get_device_capabilities
 )
 
-try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
-    UNIFIED_ENABLED = True
-except Exception as e:
-    UNIFIED_ENABLED = False
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
-if not UNIFIED_ENABLED:
-    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 
 

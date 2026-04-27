@@ -16,14 +16,8 @@ from safetensors.torch import save_file
 from typing import Optional, Dict, Tuple, List
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
-    UNIFIED_ENABLED = True
-except Exception as e:
-    UNIFIED_ENABLED = False
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
-if not UNIFIED_ENABLED:
-    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 
 # Reuse rank functions from extraction module
@@ -198,7 +192,7 @@ def detect_lora_rank(handler: MemoryEfficientSafeOpen, pairs: Dict) -> Tuple[int
         # Get dim from down weight shape
         if network_dim is None:
             down_key = block_keys["down"]
-            shape = handler.header[down_key]["shape"]
+            shape = handler.get_shape(down_key)
             # Linear: [rank, in_features] or Conv: [rank, in_ch, k, k]
             network_dim = shape[0]
 

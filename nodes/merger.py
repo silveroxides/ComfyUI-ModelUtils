@@ -11,14 +11,8 @@ from .device_utils import (
     estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 )
 
-try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
-    UNIFIED_ENABLED = True
-except Exception as e:
-    UNIFIED_ENABLED = False
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
 
-if not UNIFIED_ENABLED:
-    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 def load_documentation_from_file(filename):
     """Loads documentation from a markdown file in the ../docs/ directory."""
@@ -142,9 +136,9 @@ class MergerLogic:
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
 
         writer = None
-        if UNIFIED_ENABLED:
-            writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-            writer.__enter__()
+
+        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+        writer.__enter__()
 
         batch_buffer = {}
         batch_bytes = 0
@@ -170,8 +164,6 @@ class MergerLogic:
                 # Check discard patterns first - skip entirely
                 if _matches_any_pattern(key, discard_patterns):
                     discarded_keys += 1
-                    if not UNIFIED_ENABLED:
-                        pbar.update(1)
                     continue
 
                 # Pre-load Model A's tensor with pinned memory for CUDA
@@ -185,16 +177,13 @@ class MergerLogic:
                 # Check exclude patterns - use Model A only, no merge
                 if _matches_any_pattern(key, exclude_patterns):
                     t = tensor_a.detach().to(save_torch_dtype).cpu()
-                    if UNIFIED_ENABLED:
-                        batch_buffer[key] = t
-                        batch_bytes += t.numel() * t.element_size()
-                        batch_key_count += 1
-                    else:
-                        merged_state_dict[key] = t.clone()
-                        pbar.update(1)
+            
+                    batch_buffer[key] = t
+                    batch_bytes += t.numel() * t.element_size()
+                    batch_key_count += 1
                     excluded_keys += 1
                     del tensor_a
-                    if UNIFIED_ENABLED and (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
+                    if (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
                         _flush_batch()
                     continue
 
@@ -208,9 +197,9 @@ class MergerLogic:
                     result = recipe.merge()
                 except MissingTensorError as e:
                     if mismatch_mode == MissingTensorBehavior.ERROR:
-                        if UNIFIED_ENABLED:
-                            _flush_batch()
-                            writer.__exit__(None, None, None)
+                
+                        _flush_batch()
+                        writer.__exit__(None, None, None)
                         raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
                     result = None
                     error_keys.append(key)
@@ -223,11 +212,9 @@ class MergerLogic:
                 if isinstance(result, dict):
                     for r_key, r_tensor in result.items():
                         t = r_tensor.detach().to(save_torch_dtype).cpu()
-                        if UNIFIED_ENABLED:
-                            batch_buffer[r_key] = t
-                            batch_bytes += t.numel() * t.element_size()
-                        else:
-                            merged_state_dict[r_key] = t.clone()
+                
+                        batch_buffer[r_key] = t
+                        batch_bytes += t.numel() * t.element_size()
                 else:
                     # Ensure compatibility with Model A's architecture.
                     # If alignment_mode is 'pad/crop', we crop results that were padded.
@@ -239,16 +226,12 @@ class MergerLogic:
                             result = result[slices]
 
                     t = result.detach().to(save_torch_dtype).cpu()
-                    if UNIFIED_ENABLED:
-                        batch_buffer[key] = t
-                        batch_bytes += t.numel() * t.element_size()
-                    else:
-                        merged_state_dict[key] = t.clone()
+            
+                    batch_buffer[key] = t
+                    batch_bytes += t.numel() * t.element_size()
 
-                if UNIFIED_ENABLED:
-                    batch_key_count += 1
-                else:
-                    pbar.update(1)
+        
+                batch_key_count += 1
 
                 # Clean up references to allow GC immediately.
                 # Local loop variables must be explicitly deleted to prevent PyTorch from keeping tensors in VRAM.
@@ -258,12 +241,12 @@ class MergerLogic:
                 del recipe
                 del result
 
-                if UNIFIED_ENABLED and (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
+                if (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
                     _flush_batch()
 
-        if UNIFIED_ENABLED:
-            _flush_batch()
-            writer.__exit__(None, None, None)
+
+        _flush_batch()
+        writer.__exit__(None, None, None)
 
         # Log summary
         if excluded_keys > 0:
@@ -284,12 +267,9 @@ class MergerLogic:
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
-        if not UNIFIED_ENABLED:
-            save_file(merged_state_dict, output_path, metadata=metadata)
-
+        if os.path.exists(output_path):
+            print(f"[Merger] Output saved to {output_path}")
         # Cleanup after heavy operation
-        if not UNIFIED_ENABLED:
-            del merged_state_dict
         cleanup_after_operation()
 
         return f"{output_filename}.safetensors"

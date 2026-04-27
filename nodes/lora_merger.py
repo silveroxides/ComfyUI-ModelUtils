@@ -20,14 +20,8 @@ from .lora_resize import (
     _format_lora_key
 )
 
-try:
-    from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
-    UNIFIED_ENABLED = True
-except Exception as e:
-    UNIFIED_ENABLED = False
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
-if not UNIFIED_ENABLED:
-    from .merger_utils import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 
 def merge_multi_loras(

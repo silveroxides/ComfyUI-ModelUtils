@@ -36,12 +36,7 @@ except ImportError:
 # Assuming downloader_utils.py is inside nodes/, the root is one level up
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(root_dir, 'unifiedefficientloader-reference'))
-try:
-    from unifiedefficientloader import UnifiedSafetensorsLoader
-    HAS_UNIFIED_LOADER = True
-except ImportError:
-    HAS_UNIFIED_LOADER = False
-    print("Warning: unifiedefficientloader not found. Safetensors metadata extraction disabled.")
+from unifiedefficientloader import UnifiedSafetensorsLoader
 
 # --- Database Path Logic ---
 try:
@@ -416,8 +411,6 @@ def filter_images_by_nsfw(images, threshold_level):
     return valid_images
 
 def extract_safetensors_metadata(filepath):
-    if not HAS_UNIFIED_LOADER:
-        return None
     try:
         # Use low_memory=True to only read the header and metadata without loading tensors
         loader = UnifiedSafetensorsLoader(filepath, low_memory=True)
