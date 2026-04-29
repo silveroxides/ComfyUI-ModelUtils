@@ -1,8 +1,23 @@
 [project]
 name = "ComfyUI-ModelUtils"
 description = "[WIP]Custom nodes for handling, inspecting, modifying and creating various model files."
-version = "0.3.3"
+version = "0.3.4"
 license = { file = "LICENSE" }
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "unifiedefficientloader==0.4.4"
+]
 
 [project.urls]
 Repository = "https://github.com/silveroxides/ComfyUI-ModelUtils"
