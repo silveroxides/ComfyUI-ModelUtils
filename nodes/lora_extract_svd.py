@@ -692,9 +692,13 @@ def _format_lora_key(key: str) -> str:
         key = key[:-7]
 
     # Handle ComfyUI Checkpoint wrapper
-    if key.startswith("model.diffusion_model."):
+    if key.startswith("model.diffusion_model.") or key.startswith("net."):
         # Check if it's a Diffusers-format transformer inside a checkpoint
-        inner_key = key[22:]  # len("model.diffusion_model.")
+        if key.startswith("model.diffusion_model."):
+            inner_key = key[22:]  # len("model.diffusion_model.")
+        else:
+            inner_key = key[4:]   # len("net.")
+
         if inner_key.startswith("transformer_blocks") or inner_key.startswith("single_transformer_blocks"):
             return f"transformer.{inner_key}"
         # Standard checkpoint or Original Flux
