@@ -441,6 +441,7 @@ def extract_lora_from_files(
     svd_niter: int = 2,
     lazy_load: bool = True,
     force_clear_cache: bool = True,
+    is_text_encoder: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Extract LoRA from difference between two models.
@@ -460,6 +461,7 @@ def extract_lora_from_files(
         skip_patterns_str: Patterns for layers to skip
         mismatch_mode: How to handle mismatches
         chunk_large_layers: Enable chunked extraction
+        is_text_encoder: Whether extracting from text encoder models
     """
     output_sd = {}
 
@@ -487,7 +489,7 @@ def extract_lora_from_files(
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         def _process_layer(key):
-            lora_name = _format_lora_key(key)
+            lora_name = _format_lora_key(key, is_text_encoder=is_text_encoder)
 
             if _matches_any_pattern(key, skip_patterns):
                 return "skipped", None
@@ -647,6 +649,15 @@ def _get_model_inputs():
     ]
 
 
+def _get_clip_model_inputs():
+    return [
+        io.Combo.Input("model_a", options=folder_paths.get_filename_list("text_encoders"),
+                      tooltip="Finetuned CLIP/Text Encoder (A - B = LoRA)"),
+        io.Combo.Input("model_b", options=folder_paths.get_filename_list("text_encoders"),
+                      tooltip="Base CLIP/Text Encoder (A - B = LoRA)"),
+    ]
+
+
 def _reconstruct_dots(key: str) -> str:
     """Reconstruct dot structure from underscored key using heuristics."""
     # Block indices: input_blocks_1 -> input_blocks.1
@@ -683,13 +694,17 @@ def _reconstruct_dots(key: str) -> str:
     return key
 
 
-def _format_lora_key(key: str) -> str:
+def _format_lora_key(key: str, is_text_encoder: bool = False) -> str:
     """
     Format the key for LoRA saving.
     Standardizes to 'diffusion_model.' or 'transformer.' prefix.
+    If is_text_encoder is True, use 'text_encoders.transformer.'
     """
     if key.endswith(".weight"):
         key = key[:-7]
+
+    if is_text_encoder:
+        return f"text_encoders.transformer.{key}"
 
     # Handle ComfyUI Checkpoint wrapper
     if key.startswith("model.diffusion_model.") or key.startswith("net."):
@@ -959,6 +974,46 @@ class LoRAExtractFrobenius(io.ComfyNode):
             device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache
+        )
+
+        return io.NodeOutput(_save_lora(output_sd, output_filename))
+
+
+class LoRATextEncoderExtractFixed(io.ComfyNode):
+    """Extract LoRA from Text Encoder with fixed rank."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRATextEncoderExtractFixed",
+            display_name="LoRA Extract (Text Encoder, Fixed Rank)",
+            category="ModelUtils/LoRA",
+            description="Extract LoRA from Text Encoder/CLIP models with specified fixed rank.",
+            inputs=[
+                *_get_clip_model_inputs(),
+                io.Int.Input("linear_dim", default=32, min=1, max=16384,
+                            tooltip="Rank for linear layers"),
+                io.Int.Input("svd_niter", default=2, min=0, max=10,
+                            tooltip="SVD power iterations"),
+                *_get_common_inputs(),
+            ],
+            outputs=[io.String.Output(display_name="output_path")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, model_a, model_b, linear_dim, svd_niter, chunk_large_layers,
+                clamp_quantile, min_diff, mismatch_mode, output_filename,
+                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+
+        model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
+        model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
+
+        output_sd = extract_lora_from_files(
+            model_a_path, model_b_path, "fixed", linear_dim, 0,
+            device, save_dtype, linear_dim, 0,
+            clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
+            lazy_load, force_clear_cache, is_text_encoder=True
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))

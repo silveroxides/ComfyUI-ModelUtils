@@ -22,7 +22,7 @@ from .nodes.merger import (
 )
 from .nodes.lora_extract_svd import (
     LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
-    LoRAExtractKnee, LoRAExtractFrobenius
+    LoRAExtractKnee, LoRAExtractFrobenius, LoRATextEncoderExtractFixed
 )
 from .nodes.lora_resize import (
     LoRAResizeFixed, LoRAResizeRatio,
@@ -60,7 +60,7 @@ class ModelUtilsExtension(ComfyExtension):
             CheckpointThreeMerger, EmbeddingThreeMerger,
             # LoRA Extraction
             LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
-            LoRAExtractKnee, LoRAExtractFrobenius,
+            LoRAExtractKnee, LoRAExtractFrobenius, LoRATextEncoderExtractFixed,
             # LoRA Resize
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
