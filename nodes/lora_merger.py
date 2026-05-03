@@ -11,6 +11,7 @@ from comfy_api.latest import io
 from safetensors.torch import save_file
 from typing import List, Dict, Tuple, Optional
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
+from .merger_utils import parse_custom_weights, get_custom_parameters
 from .lora_resize import (
     detect_lora_format,
     extract_lora_pairs,
@@ -31,6 +32,7 @@ def merge_multi_loras(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    custom_weights: str = "",
     verbose: bool = True,
 ) -> str:
     """
@@ -50,6 +52,8 @@ def merge_multi_loras(
         print(f"[LoRA Multi-Merge] Mode: {merge_mode}")
 
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
+
+    parsed_custom_weights = parse_custom_weights(custom_weights)
 
     handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
 
@@ -93,6 +97,9 @@ def merge_multi_loras(
         # 2. Merge each core layer
         with torch.no_grad():
             for core, indices in tqdm(layer_map.items(), desc="Merging layers", unit="layers"):
+                # Apply per-layer overrides (regex/substring matching)
+                layer_overrides = get_custom_parameters(core, parsed_custom_weights, {})
+
                 downs = []
                 ups = []
                 is_conv = False
@@ -100,7 +107,14 @@ def merge_multi_loras(
 
                 # First pass: load and determine max rank
                 for idx in indices:
-                    info = lora_infos[idx]
+                    info = lora_infos[idx].copy()
+                    # Apply overrides: w1, w2, w3... or 'weight'
+                    lora_key = f'w{idx+1}'
+                    if lora_key in layer_overrides:
+                        info["weight"] = layer_overrides[lora_key]
+                    elif "weight" in layer_overrides:
+                        info["weight"] = layer_overrides["weight"]
+
                     handler = handlers[idx]
                     orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                     block_keys = info["pairs"][orig_block]
@@ -278,6 +292,7 @@ class LoRAMultiMerge(io.ComfyNode):
                 io.Combo.Input("merge_mode", options=["concatenate", "weighted_sum"], default="concatenate",
                               tooltip="concatenate: safe, increases rank. weighted_sum: fixed rank (to max input rank), mathematically lossy but standard in Kohya."),
                 io.String.Input("output_filename", default="merged_lora"),
+                io.String.Input("custom_weights", default="", multiline=True, tooltip="Per-layer weights for each LoRA. Syntax: 'regex:w1,w2,w3...' or 'regex:w1=0.5,w2=1.0'"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
             ],
@@ -289,7 +304,7 @@ class LoRAMultiMerge(io.ComfyNode):
     def execute(cls, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
-                merge_mode, output_filename, save_dtype, device) -> io.NodeOutput:
+                merge_mode, output_filename, custom_weights, save_dtype, device) -> io.NodeOutput:
 
         count = int(lora_count)
         names = [lora_1, lora_2, lora_3, lora_4, lora_5, lora_6, lora_7, lora_8]
@@ -315,7 +330,8 @@ class LoRAMultiMerge(io.ComfyNode):
             merge_mode=merge_mode,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            custom_weights=custom_weights
         )
 
         return io.NodeOutput(path)
@@ -356,6 +372,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
                 io.Float.Input("trim_quantile", default=0.2, min=0.0, max=1.0, step=0.01, tooltip="TIES trim quantile (drops smallest values)"),
                 io.Int.Input("seed", default=42, min=0, max=0xffffffffffffffff),
                 io.String.Input("output_filename", default="merged_lora_dare"),
+                io.String.Input("custom_weights", default="", multiline=True, tooltip="Per-layer weights for each LoRA. Syntax: 'regex:w1,w2,w3...' or 'regex:w1=0.5,w2=1.0'"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
             ],
@@ -367,7 +384,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
     def execute(cls, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
-                drop_rate, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
+                drop_rate, trim_quantile, seed, output_filename, custom_weights, save_dtype, device) -> io.NodeOutput:
 
         count = int(lora_count)
         names = [lora_1, lora_2, lora_3, lora_4, lora_5, lora_6, lora_7, lora_8]
@@ -395,7 +412,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             seed=seed,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            custom_weights=custom_weights
         )
 
         return io.NodeOutput(path)
@@ -409,6 +427,7 @@ def merge_multi_loras_dare(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    custom_weights: str = "",
     verbose: bool = True,
 ) -> str:
     """
@@ -421,6 +440,9 @@ def merge_multi_loras_dare(
         print(f"[LoRA Multi-Merge DARE] Drop rate: {drop_rate}, Trim quantile: {trim_quantile}")
 
     prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
+
+    parsed_custom_weights = parse_custom_weights(custom_weights)
+
     handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
 
     rng = torch.Generator(device=device).manual_seed(seed)
@@ -460,12 +482,22 @@ def merge_multi_loras_dare(
         # 2. Merge
         with torch.no_grad():
             for core, indices in tqdm(layer_map.items(), desc="Merging layers (DARE)", unit="layers"):
+                # Apply per-layer overrides (regex/substring matching)
+                layer_overrides = get_custom_parameters(core, parsed_custom_weights, {})
+
                 downs = []
                 ups = []
                 max_rank = 0
 
                 for idx in indices:
-                    info = lora_infos[idx]
+                    info = lora_infos[idx].copy()
+                    # Apply overrides: w1, w2, w3... or 'weight'
+                    lora_key = f'w{idx+1}'
+                    if lora_key in layer_overrides:
+                        info["weight"] = layer_overrides[lora_key]
+                    elif "weight" in layer_overrides:
+                        info["weight"] = layer_overrides["weight"]
+
                     orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                     block_keys = info["pairs"][orig_block]
                     if "down" not in block_keys or "up" not in block_keys: continue
@@ -494,18 +526,22 @@ def merge_multi_loras_dare(
                             t = torch.nn.functional.pad(t, tuple(padding))
                         padded.append(t * w)
 
+                    # Apply per-layer overrides for DARE/TIES parameters
+                    current_drop_rate = layer_overrides.get('alpha', layer_overrides.get('drop_rate', drop_rate))
+                    current_trim_quantile = layer_overrides.get('beta', layer_overrides.get('trim_quantile', trim_quantile))
+
                     # DARE
-                    if drop_rate > 0:
+                    if current_drop_rate > 0:
                         for i in range(len(padded)):
-                            mask = (torch.rand(padded[i].shape, generator=rng, device=device) > drop_rate).float()
-                            padded[i] = (padded[i] * mask) / (1 - drop_rate)
+                            mask = (torch.rand(padded[i].shape, generator=rng, device=device) > current_drop_rate).float()
+                            padded[i] = (padded[i] * mask) / (1 - current_drop_rate)
 
                     # TIES
                     # 1. Trim
-                    if trim_quantile > 0:
+                    if current_trim_quantile > 0:
                         for i in range(len(padded)):
                             flat = padded[i].abs().flatten()
-                            k = int(len(flat) * trim_quantile)
+                            k = int(len(flat) * current_trim_quantile)
                             if k > 0:
                                 threshold = torch.kthvalue(flat, k).values
                                 padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
