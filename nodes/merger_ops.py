@@ -793,5 +793,143 @@ class DARETIESMode(CalcMode):
         return op
 
 
-TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), DARETIESMode(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode()]
+class EnhancedPowerUpOp(Operation):
+    def __init__(self, key, alpha, beta, gamma, delta, seed, *sources):
+        super().__init__(key, *sources)
+        self.mask_power = alpha       # Mask power
+        self.min_keep_prob = beta     # Min keep prob
+        self.mask_smooth = gamma      # Smoothness (0 or 1)
+        self.delta = delta            # Final multiplier
+        self.seed = seed
+
+    def oper(self, a, b):
+        if a is None or b is None: return None
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
+        delta_val = (b - a).float()
+        abs_delta = torch.abs(delta_val)
+        max_delta = torch.max(abs_delta)
+        if max_delta == 0: return torch.zeros_like(delta_val)
+
+        prob = torch.clamp((abs_delta / max_delta) ** max(self.mask_power, 0.001), min=self.min_keep_prob, max=1.0)
+
+        rng = torch.Generator(device=a.device).manual_seed(self.seed)
+        random_mask = torch.bernoulli(prob, generator=rng)
+        interpolated_mask = torch.lerp(random_mask, prob, self.mask_smooth)
+
+        rescaled_delta = (delta_val * interpolated_mask) / prob
+        return rescaled_delta
+
+
+class EnhancedDARETIESOp(Operation):
+    def __init__(self, key, alpha, beta, gamma, delta, epsilon, zeta, seed, *sources):
+        super().__init__(key, *sources)
+        self.alpha = alpha       # Unused directly for drop scale
+        self.beta = beta         # TIES trim quantile
+        self.gamma = gamma       # TIES lambda scale
+        self.mask_power = delta
+        self.min_keep_prob = epsilon
+        self.mask_smooth = zeta
+        self.seed = seed
+
+    def oper(self, a, b):
+        if a is None or b is None: return None
+        a, b = resize_tensors(a, b, mode=self.alignment_mode)
+        delta_val = (b - a).float()
+        abs_delta = torch.abs(delta_val)
+        max_delta = torch.max(abs_delta)
+
+        if max_delta > 0:
+            prob = torch.clamp((abs_delta / max_delta) ** max(self.mask_power, 0.001), min=self.min_keep_prob, max=1.0)
+
+            rng = torch.Generator(device=a.device).manual_seed(self.seed)
+            random_mask = torch.bernoulli(prob, generator=rng)
+            interpolated_mask = torch.lerp(random_mask, prob, self.mask_smooth)
+
+            delta_val = (delta_val * interpolated_mask) / prob
+
+        if self.beta > 0:
+            flat_abs = delta_val.abs().flatten()
+            k = max(1, int(flat_abs.numel() * self.beta))
+            threshold = torch.kthvalue(flat_abs, k).values
+            delta_val = torch.where(delta_val.abs() < threshold, torch.zeros_like(delta_val), delta_val)
+
+        dominant_sign = torch.sign(delta_val)
+        delta_val = torch.where(torch.sign(delta_val) == dominant_sign, delta_val, torch.zeros_like(delta_val))
+
+        return (a + self.gamma * delta_val).to(a.dtype)
+
+
+class EnhancedPowerUp(CalcMode):
+    name = 'Power-Up Enhanced (DARE)'
+    description = 'Adds capabilities of B to A using Enhanced Drop and Rescale based on relative tensor differences.'
+    models_used = ['A', 'B']
+    param_docs = {
+        'alpha': 'Mask power (Curve. 2.0 = quadratic).',
+        'beta': 'Minimum keep probability (Floor to prevent explosion).',
+        'gamma': 'Mask smoothness factor (0.0 = pure dropout, 1.0 = soft scale).',
+        'delta': 'Multiplier for the final difference.',
+    }
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+
+        deltahat = EnhancedPowerUpOp(key, kwargs['alpha'], kwargs['beta'], kwargs['gamma'], kwargs['delta'], kwargs['seed'], a, b)
+        deltahat.alignment_mode = alignment_mode
+        multiplied = Multiply(key, kwargs['delta'], deltahat)
+        res = Add(key, a, multiplied)
+        res.alignment_mode = alignment_mode
+        return res
+
+
+class EnhancedDARETIESMode(CalcMode):
+    name = 'Power-Up Enhanced (DARE+TIES)'
+    description = 'Adds capabilities of B to A using Enhanced DARE mask followed by TIES.'
+    models_used = ['A', 'B']
+    param_docs = {
+        'alpha': 'Unused (Drop scale handled via mask interpolation).',
+        'beta': 'TIES trim quantile (fraction of smallest-magnitude delta zeroed).',
+        'gamma': 'TIES Lambda scale.',
+        'delta': 'Mask power (Curve. 2.0 = quadratic).',
+        'epsilon': 'Minimum keep probability (Floor to prevent explosion).',
+        'zeta': 'Mask smoothness factor (0.0 = pure dropout, 1.0 = soft scale).',
+    }
+
+    def create_recipe(self, key, **kwargs):
+        mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
+        alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
+
+        if '_tensor_a' in kwargs:
+            a = PreloadedTensor(key, kwargs['_tensor_a'])
+        else:
+            loader_args_a = {"handlers": kwargs['handlers'], "device": kwargs['device'], "dtype": kwargs['dtype']}
+            a = LoadTensor(key, kwargs['model_a'], **loader_args_a)
+
+        loader_args_b = self._get_secondary_loader_args(kwargs, mismatch_mode)
+        b = LoadTensor(key, kwargs['model_b'], **loader_args_b)
+
+        op = EnhancedDARETIESOp(
+            key,
+            kwargs.get('alpha', 0.5),
+            kwargs.get('beta', 0.2),
+            kwargs.get('gamma', 1.0),
+            kwargs.get('delta', 0.5),
+            kwargs.get('epsilon', 0.5),
+            kwargs.get('zeta', 0.5),
+            kwargs['seed'],
+            a, b,
+        )
+        op.alignment_mode = alignment_mode
+        return op
+
+
+TWO_MODEL_MODES = [WeightSum(), InterpDifference(), PowerUp(), DARETIESMode(), SVDMode(), ManEnhInterpDifference(), AutoEnhInterpDifference(), WeightSumCutoffMode(), EnhancedPowerUp(), EnhancedDARETIESMode()]
 THREE_MODEL_MODES = [AddDifference(), TrainDifference(), Extract(), AddDisimilarity()]
