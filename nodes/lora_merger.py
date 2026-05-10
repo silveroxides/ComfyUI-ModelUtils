@@ -735,18 +735,11 @@ def merge_multi_loras_dare_enhanced(
                     continue
 
                 def process_ties_dare_enhanced(tensors, weights, dim_to_pad):
-                    padded = []
+                    processed = []
                     for t, w in tensors:
-                        if t.shape[dim_to_pad] < max_rank:
-                            padding = [0] * (len(t.shape) * 2)
-                            rev_dim = len(t.shape) - 1 - dim_to_pad
-                            padding[rev_dim*2 + 1] = max_rank - t.shape[dim_to_pad]
-                            t = torch.nn.functional.pad(t, tuple(padding))
-                        padded.append(t * w)
+                        t_val = t * w
 
-                    # Enhanced DARE
-                    for i in range(len(padded)):
-                        t_val = padded[i]
+                        # Enhanced DARE
                         abs_t = torch.abs(t_val)
                         max_val = torch.max(abs_t)
                         if max_val > 0:
@@ -756,18 +749,26 @@ def merge_multi_loras_dare_enhanced(
                             random_mask = torch.bernoulli(prob, generator=rng)
                             interpolated_mask = torch.lerp(random_mask, prob, mask_smooth)
 
-                            padded[i] = (t_val * interpolated_mask) / prob
+                            t_val = t_val * interpolated_mask
 
-                    # TIES
-                    if trim_quantile > 0:
-                        for i in range(len(padded)):
-                            flat = padded[i].abs().flatten()
+                        # TIES
+                        if trim_quantile > 0:
+                            flat = t_val.abs().flatten()
                             k = max(1, int(len(flat) * trim_quantile))
                             if k > 0:
                                 threshold = torch.kthvalue(flat, k).values
-                                padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
+                                t_val = torch.where(t_val.abs() < threshold, torch.zeros_like(t_val), t_val)
 
-                    stacked = torch.stack(padded)
+                        # Pad
+                        if t_val.shape[dim_to_pad] < max_rank:
+                            padding = [0] * (len(t_val.shape) * 2)
+                            rev_dim = len(t_val.shape) - 1 - dim_to_pad
+                            padding[rev_dim*2 + 1] = max_rank - t_val.shape[dim_to_pad]
+                            t_val = torch.nn.functional.pad(t_val, tuple(padding))
+
+                        processed.append(t_val)
+
+                    stacked = torch.stack(processed)
                     signs = torch.sign(stacked)
                     sum_signs = signs.sum(dim=0)
                     dominant_sign = torch.sign(sum_signs)

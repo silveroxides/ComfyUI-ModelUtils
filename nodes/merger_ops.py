@@ -816,7 +816,7 @@ class EnhancedPowerUpOp(Operation):
         random_mask = torch.bernoulli(prob, generator=rng)
         interpolated_mask = torch.lerp(random_mask, prob, self.mask_smooth)
 
-        rescaled_delta = (delta_val * interpolated_mask) / prob
+        rescaled_delta = delta_val * interpolated_mask
         return rescaled_delta
 
 
@@ -845,7 +845,7 @@ class EnhancedDARETIESOp(Operation):
             random_mask = torch.bernoulli(prob, generator=rng)
             interpolated_mask = torch.lerp(random_mask, prob, self.mask_smooth)
 
-            delta_val = (delta_val * interpolated_mask) / prob
+            delta_val = delta_val * interpolated_mask
 
         if self.beta > 0:
             flat_abs = delta_val.abs().flatten()

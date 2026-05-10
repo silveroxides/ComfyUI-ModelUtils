@@ -4,6 +4,7 @@ LoRA Extraction via SVD decomposition.
 Native implementation of Low-Rank Adapter extraction with multiple rank selection modes.
 No external dependencies required.
 """
+import fnmatch
 import os
 import re
 import torch
@@ -399,14 +400,22 @@ def _extract_chunked_layer(
 # Pattern Matching
 # =============================================================================
 
-def _compile_patterns(pattern_string: str) -> list:
-    """Compile regex patterns from whitespace-separated string."""
+def _compile_patterns(pattern_string: str, glob_mode: bool = False) -> list:
+    """Compile patterns from whitespace-separated string.
+
+    In regex mode (default) returns compiled re.Pattern objects.
+    In glob mode returns plain strings; fnmatch handles matching.
+    """
     if not pattern_string or not pattern_string.strip():
         return []
     patterns = []
     for p in pattern_string.split():
         p = p.strip()
-        if p:
+        if not p:
+            continue
+        if glob_mode:
+            patterns.append(p)
+        else:
             try:
                 patterns.append(re.compile(p))
             except re.error:
@@ -414,8 +423,15 @@ def _compile_patterns(pattern_string: str) -> list:
     return patterns
 
 
-def _matches_any_pattern(key: str, patterns: list) -> bool:
-    """Check if key matches any pattern."""
+def _matches_any_pattern(key: str, patterns: list, glob_mode: bool = False) -> bool:
+    """Check if key matches any pattern.
+
+    Glob mode: each pattern is matched as a substring glob using fnmatch
+    (dots are literal, * matches any sequence of characters).
+    Regex mode: each pattern is a compiled re.Pattern, matched via search().
+    """
+    if glob_mode:
+        return any(fnmatch.fnmatch(key, f"*{p}*") for p in patterns)
     return any(p.search(key) for p in patterns)
 
 
@@ -441,6 +457,7 @@ def extract_lora_from_files(
     svd_niter: int = 2,
     lazy_load: bool = True,
     force_clear_cache: bool = True,
+    glob_skip_patterns: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Extract LoRA from difference between two models.
@@ -460,6 +477,8 @@ def extract_lora_from_files(
         skip_patterns_str: Patterns for layers to skip
         mismatch_mode: How to handle mismatches
         chunk_large_layers: Enable chunked extraction
+        glob_skip_patterns: When True, treat skip_patterns as glob (* wildcard).
+                            When False (default), treat as Python regex.
     """
     output_sd = {}
 
@@ -469,7 +488,7 @@ def extract_lora_from_files(
         "bf16": torch.bfloat16,
     }.get(save_dtype, torch.float16)
 
-    skip_patterns = _compile_patterns(skip_patterns_str)
+    skip_patterns = _compile_patterns(skip_patterns_str, glob_mode=glob_skip_patterns)
 
     # Prepare memory before heavy operation
     total_size_gb = estimate_model_size(model_a_path) + estimate_model_size(model_b_path)
@@ -489,7 +508,7 @@ def extract_lora_from_files(
         def _process_layer(key):
             lora_name = _format_lora_key(key)
 
-            if _matches_any_pattern(key, skip_patterns):
+            if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
                 return "skipped", None
 
             # Load tensors with pinned memory for CUDA
@@ -570,9 +589,8 @@ def extract_lora_from_files(
                             weight_diff, num_chunks, mode, linear_param, device, linear_max_rank
                         )
                         if lora_up is not None:
-                            layer_results[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
-                            layer_results[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
-                            layer_results[f"{lora_name}.alpha"] = torch.tensor(rank).to(save_torch_dtype)
+                            layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
+                            layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
                             del weight_diff
                             return "chunked", layer_results
 
@@ -586,9 +604,8 @@ def extract_lora_from_files(
                 status = "full"
             else:
                 lora_down, lora_up, _ = result
-                layer_results[f"{lora_name}.lora_down.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
-                layer_results[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
-                layer_results[f"{lora_name}.alpha"] = torch.tensor(lora_down.shape[0]).to(save_torch_dtype)
+                layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
+                layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
                 status = "extracted"
 
             del weight_diff
@@ -686,46 +703,48 @@ def _reconstruct_dots(key: str) -> str:
 def _format_lora_key(key: str) -> str:
     """
     Format the key for LoRA saving.
-    Standardizes to 'diffusion_model.' or 'transformer.' prefix.
+    Always standardizes to 'diffusion_model.' prefix for maximum compatibility.
+
+    ComfyUI maps 'diffusion_model.<layer>' generically for all model types, making
+    it universally compatible. The 'transformer.' prefix only works for a subset of
+    model types via model-specific mapping code and is intentionally not used here.
     """
     if key.endswith(".weight"):
         key = key[:-7]
 
-    # Handle ComfyUI Checkpoint wrapper
-    if key.startswith("model.diffusion_model.") or key.startswith("net."):
-        # Check if it's a Diffusers-format transformer inside a checkpoint
-        if key.startswith("model.diffusion_model."):
-            inner_key = key[22:]  # len("model.diffusion_model.")
-        else:
-            inner_key = key[4:]   # len("net.")
-
-        if inner_key.startswith("transformer_blocks") or inner_key.startswith("single_transformer_blocks"):
-            return f"transformer.{inner_key}"
-        # Standard checkpoint or Original Flux
+    # Handle ComfyUI Checkpoint wrapper (ldm/sgm format: model.diffusion_model.*)
+    if key.startswith("model.diffusion_model."):
+        inner_key = key[22:]  # strip len("model.diffusion_model.")
         return f"diffusion_model.{inner_key}"
 
-    # Handle direct Diffusers keys
+    # Handle net.* wrapper
+    if key.startswith("net."):
+        inner_key = key[4:]  # strip len("net.")
+        return f"diffusion_model.{inner_key}"
+
+    # Handle direct Diffusers keys (transformer_blocks.* / single_transformer_blocks.* without prefix)
     if key.startswith("transformer_blocks") or key.startswith("single_transformer_blocks"):
-        return f"transformer.{key}"
+        return f"diffusion_model.{key}"
 
     # Handle legacy lora_unet_ prefix (for resizing without base)
     if key.startswith("lora_unet_"):
         core = key[10:]
         dotted = _reconstruct_dots(core)
-        # Check if reconstructed key implies transformer format
-        if dotted.startswith("transformer_blocks") or dotted.startswith("single_transformer_blocks"):
-            return f"transformer.{dotted}"
         return f"diffusion_model.{dotted}"
 
-    # Handle already correct prefixes
-    if key.startswith("diffusion_model.") or key.startswith("transformer."):
+    # Handle already-prefixed keys
+    if key.startswith("diffusion_model."):
         return key
 
-    # Handle known Unet blocks (Diffusers format UNet)
+    # Absorb now-invalid transformer. prefix into diffusion_model. for compatibility
+    if key.startswith("transformer."):
+        return f"diffusion_model.{key[12:]}"
+
+    # Handle known Diffusers UNet blocks
     if any(key.startswith(p) for p in ["down_blocks", "up_blocks", "mid_block", "conv_in", "conv_out", "time_embedding", "class_embedding"]):
         return f"diffusion_model.{key}"
 
-    # Default fallback to diffusion_model
+    # Default fallback
     return f"diffusion_model.{key}"
 
 
@@ -744,7 +763,10 @@ def _get_common_inputs():
         io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
         io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
         io.String.Input("skip_patterns", default="", multiline=True,
-                       tooltip="Regex patterns for layers to skip"),
+                       tooltip="Patterns for layers to skip (regex or glob depending on glob_skip_patterns)"),
+        io.Boolean.Input("glob_skip_patterns", default=False,
+                        tooltip="When True, skip_patterns use glob syntax (* = any sequence, ? = any char, dots are literal). "
+                                "When False (default), patterns are Python regex matched as substrings."),
     ]
 
 
@@ -775,7 +797,7 @@ class LoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -784,7 +806,7 @@ class LoRAExtractFixed(io.ComfyNode):
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             device, save_dtype, linear_dim, conv_dim,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
-            lazy_load, force_clear_cache
+            lazy_load, force_clear_cache, glob_skip_patterns
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -819,7 +841,7 @@ class LoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -828,7 +850,8 @@ class LoRAExtractRatio(io.ComfyNode):
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
             device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -863,7 +886,7 @@ class LoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -872,7 +895,8 @@ class LoRAExtractQuantile(io.ComfyNode):
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
             device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -905,7 +929,7 @@ class LoRAExtractKnee(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -914,7 +938,8 @@ class LoRAExtractKnee(io.ComfyNode):
             model_a_path, model_b_path, knee_method, 0, 0,
             device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
@@ -949,7 +974,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -958,7 +983,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
             device, save_dtype, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns
         )
 
         return io.NodeOutput(_save_lora(output_sd, output_filename))
