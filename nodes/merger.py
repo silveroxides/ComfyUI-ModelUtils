@@ -6,7 +6,6 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
 from .merger_ops import TWO_MODEL_MODES, THREE_MODEL_MODES, MissingTensorBehavior, MissingTensorError
 from .device_utils import (
     estimate_model_size, prepare_for_large_operation, cleanup_after_operation

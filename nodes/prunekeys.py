@@ -4,12 +4,11 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
 from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen
+from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
 
 
 def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
@@ -40,32 +39,33 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     if not patterns:
         raise ValueError("No keys/patterns provided to prune.")
 
-    # Stream tensors and filter on the fly
-    pruned_tensors = {}
-    with MemoryEfficientSafeOpen(model_path_to_load) as handler:
-        all_keys = handler.keys()
-        pbar = comfy.utils.ProgressBar(len(all_keys))
-        for key in tqdm(all_keys, desc="Pruning keys", unit="keys"):
-            is_match = False
-            if use_regex:
-                if any(re.search(pattern, key) for pattern in patterns):
-                    is_match = True
-            else:
-                if any(pattern in key for pattern in patterns):
-                    is_match = True
-
-            if not is_match:
-                pruned_tensors[key] = handler.get_tensor(key)
-            pbar.update(1)
-
     # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
     model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
-    save_file(pruned_tensors, output_path, metadata)
+    # Stream tensors, filter on the fly, write immediately
+    writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+    writer.__enter__()
+    try:
+        with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+            all_keys = handler.keys()
+            pbar = comfy.utils.ProgressBar(len(all_keys))
+            for key in tqdm(all_keys, desc="Pruning keys", unit="keys"):
+                is_match = False
+                if use_regex:
+                    if any(re.search(pattern, key) for pattern in patterns):
+                        is_match = True
+                else:
+                    if any(pattern in key for pattern in patterns):
+                        is_match = True
+
+                if not is_match:
+                    writer.write(key, handler.get_tensor(key).contiguous())
+                pbar.update(1)
+    finally:
+        writer.__exit__(None, None, None)
 
     # Cleanup after operation
-    del pruned_tensors
     cleanup_after_operation()
 
     return output_path

@@ -12,11 +12,10 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
-from typing import Optional, Dict, Tuple, List
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from typing import Optional, Dict, Tuple, List
 
 
 
@@ -419,66 +418,7 @@ def resize_lora_file(
             print(f"[LoRA Resize] Original dim={network_dim}, alpha={network_alpha:.1f}, scale={scale:.3f}")
             print(f"[LoRA Resize] Resizing with method={method_str}, max_rank={new_rank}")
 
-        output_sd = {}
-        fro_list = []
-        pbar = comfy.utils.ProgressBar(len(pairs))
-
-        with torch.no_grad():
-            for block_name, block_keys in tqdm(pairs.items(), desc="Resizing layers", unit="layers"):
-                if "down" not in block_keys or "up" not in block_keys:
-                    pbar.update(1)
-                    continue
-
-                lora_down = handler.get_tensor(block_keys["down"])
-                lora_up = handler.get_tensor(block_keys["up"])
-
-                is_conv = len(lora_down.shape) == 4
-
-                # Transfer to GPU with pinned memory if available
-                if device == 'cuda':
-                    lora_down = transfer_to_gpu_pinned(lora_down, device, torch.float32)
-                    lora_up = transfer_to_gpu_pinned(lora_up, device, torch.float32)
-
-                # Merge and re-extract
-                if is_conv:
-                    weight = _merge_conv(lora_down, lora_up, device)
-                    result = _extract_conv(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
-                else:
-                    weight = _merge_linear(lora_down, lora_up, device)
-                    result = _extract_linear(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
-
-                del weight, lora_down, lora_up
-
-                fro_list.append(result['fro_retained'])
-
-                # Store using same format suffixes as input
-                down_suffix = format_info["down_suffix"]
-                up_suffix = format_info["up_suffix"]
-                alpha_suffix = format_info["alpha_suffix"]
-
-                # Standardize prefix using heuristics if possible
-                new_block_name = _format_lora_key(block_name)
-
-                output_sd[f"{new_block_name}{down_suffix}"] = result["lora_down"].to(save_dtype)
-                output_sd[f"{new_block_name}{up_suffix}"] = result["lora_up"].to(save_dtype)
-                if alpha_suffix:
-                    output_sd[f"{new_block_name}{alpha_suffix}"] = torch.tensor(result["new_alpha"]).to(save_dtype)
-
-                del result
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                pbar.update(1)
-
-        if verbose and fro_list:
-            import numpy as np
-            avg_fro = np.mean(fro_list)
-            std_fro = np.std(fro_list)
-            print(f"[LoRA Resize] Average Frobenius retention: {avg_fro:.1%} ± {std_fro:.3f}")
-
-        # Update metadata
+        # Build metadata and output path before loop (all values known at this point)
         if dynamic_method:
             metadata["ss_training_comment"] = f"Dynamic resize with {dynamic_method}: {dynamic_param} from dim {network_dim}"
             metadata["ss_network_dim"] = "Dynamic"
@@ -488,14 +428,78 @@ def resize_lora_file(
             metadata["ss_network_dim"] = str(new_rank)
             metadata["ss_network_alpha"] = str(scale * new_rank)
 
-        # Save
         output_dir = folder_paths.get_folder_paths("loras")[0]
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
-        save_file(output_sd, output_path, metadata)
-        print(f"[LoRA Resize] Saved to {output_path}")
+        fro_list = []
+        pbar = comfy.utils.ProgressBar(len(pairs))
 
+        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+        writer.__enter__()
+        try:
+            with torch.no_grad():
+                for block_name, block_keys in tqdm(pairs.items(), desc="Resizing layers", unit="layers"):
+                    if "down" not in block_keys or "up" not in block_keys:
+                        pbar.update(1)
+                        continue
+
+                    lora_down = handler.get_tensor(block_keys["down"])
+                    lora_up = handler.get_tensor(block_keys["up"])
+
+                    is_conv = len(lora_down.shape) == 4
+
+                    # Transfer to GPU with pinned memory if available
+                    if device == 'cuda':
+                        lora_down = transfer_to_gpu_pinned(lora_down, device, torch.float32)
+                        lora_up = transfer_to_gpu_pinned(lora_up, device, torch.float32)
+
+                    # Merge and re-extract
+                    if is_conv:
+                        weight = _merge_conv(lora_down, lora_up, device)
+                        result = _extract_conv(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
+                    else:
+                        weight = _merge_linear(lora_down, lora_up, device)
+                        result = _extract_linear(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
+
+                    del weight, lora_down, lora_up
+
+                    fro_list.append(result['fro_retained'])
+
+                    # Store using same format suffixes as input
+                    down_suffix = format_info["down_suffix"]
+                    up_suffix = format_info["up_suffix"]
+                    alpha_suffix = format_info["alpha_suffix"]
+
+                    # Standardize prefix using heuristics if possible
+                    new_block_name = _format_lora_key(block_name)
+
+                    block_sd = {
+                        f"{new_block_name}{down_suffix}": result["lora_down"].to(save_dtype),
+                        f"{new_block_name}{up_suffix}": result["lora_up"].to(save_dtype),
+                    }
+                    if alpha_suffix:
+                        block_sd[f"{new_block_name}{alpha_suffix}"] = torch.tensor(result["new_alpha"]).to(save_dtype)
+
+                    writer.write_dict(block_sd)
+
+                    del result
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
+
+        if verbose and fro_list:
+            import numpy as np
+            avg_fro = np.mean(fro_list)
+            std_fro = np.std(fro_list)
+            print(f"[LoRA Resize] Average Frobenius retention: {avg_fro:.1%} ± {std_fro:.3f}")
+
+        print(f"[LoRA Resize] Saved to {output_path}")
         return output_path
 
     finally:
@@ -715,7 +719,7 @@ def merge_loras_to_model(
                 print(f"[LoRA Merge To Model] LoRA {i+1}: {format_info['format']}, {len(pairs)} layers, dim={network_dim}")
 
         # Common prefixes
-        BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model."]
+        BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
         LORA_PREFIXES = [
             "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
             "lycoris_", "diffusion_model.", "transformer.", "unet."
@@ -761,7 +765,11 @@ def merge_loras_to_model(
         base_metadata = base_handler.metadata().copy() if base_handler.metadata() else {}
         base_metadata["merge_comment"] = f"Merged {len(lora_paths)} LoRAs with weights: {lora_weights}"
 
-        output_sd = {}
+        # Build output path before loop
+        base_dir = os.path.dirname(base_model_path)
+        os.makedirs(base_dir, exist_ok=True)
+        output_path = os.path.join(base_dir, f"{output_filename.strip()}.safetensors")
+
         stats = {"merged": 0, "copied": 0, "skipped": 0}
         base_keys = list(base_handler.keys())
         pbar = comfy.utils.ProgressBar(len(base_keys))
@@ -769,118 +777,116 @@ def merge_loras_to_model(
         if verbose:
             print(f"[LoRA Merge To Model] Processing {len(base_keys)} base model keys...")
 
-        with torch.no_grad():
-            for base_key in tqdm(base_keys, desc="Merging to model", unit="keys"):
-                # Check skip patterns
-                if _matches_any_pattern(base_key, skip_patterns):
-                    stats["skipped"] += 1
-                    pbar.update(1)
-                    continue
+        writer = IncrementalSafetensorsWriter(output_path, metadata=base_metadata)
+        writer.__enter__()
+        try:
+            with torch.no_grad():
+                for base_key in tqdm(base_keys, desc="Merging to model", unit="keys"):
+                    # Check skip patterns
+                    if _matches_any_pattern(base_key, skip_patterns):
+                        stats["skipped"] += 1
+                        pbar.update(1)
+                        continue
 
-                # Load base weight
-                cpu_base = base_handler.get_tensor(base_key)
+                    # Load base weight
+                    cpu_base = base_handler.get_tensor(base_key)
 
-                # Only process weight tensors for LoRA merging
-                if base_key.endswith(".weight"):
-                    core = extract_core_layer_base(base_key)
-                    core_underscored = core.replace(".", "_")
+                    # Only process weight tensors for LoRA merging
+                    if base_key.endswith(".weight"):
+                        core = extract_core_layer_base(base_key)
+                        core_underscored = core.replace(".", "_")
 
-                    # Check if any LoRA contributes to this layer
-                    if core_underscored in lora_lookup:
-                        # Transfer to GPU for computation
-                        if device == 'cuda':
-                            base_weight = transfer_to_gpu_pinned(cpu_base, device, torch.float32)
-                        else:
-                            base_weight = cpu_base.to(device=device, dtype=torch.float32)
-                        del cpu_base
-
-                        # Accumulate deltas from all contributing LoRAs
-                        for info, block_keys in lora_lookup[core_underscored]:
-                            is_full_diff = info["format_info"].get("is_full_diff", False)
-
-                            if is_full_diff:
-                                # Full diff format
-                                if "diff" not in block_keys:
-                                    continue
-                                cpu_diff = info["handler"].get_tensor(block_keys["diff"])
-                                if device == 'cuda':
-                                    delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
-                                else:
-                                    delta = cpu_diff.to(device=device, dtype=torch.float32)
-                                del cpu_diff
-                                effective_scale = info["weight"]
+                        # Check if any LoRA contributes to this layer
+                        if core_underscored in lora_lookup:
+                            # Transfer to GPU for computation
+                            if device == 'cuda':
+                                base_weight = transfer_to_gpu_pinned(cpu_base, device, torch.float32)
                             else:
-                                # Standard LoRA format
-                                if "down" not in block_keys or "up" not in block_keys:
-                                    continue
+                                base_weight = cpu_base.to(device=device, dtype=torch.float32)
+                            del cpu_base
 
-                                cpu_down = info["handler"].get_tensor(block_keys["down"])
-                                cpu_up = info["handler"].get_tensor(block_keys["up"])
-                                if device == 'cuda':
-                                    lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
-                                    lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                            # Accumulate deltas from all contributing LoRAs
+                            for info, block_keys in lora_lookup[core_underscored]:
+                                is_full_diff = info["format_info"].get("is_full_diff", False)
+
+                                if is_full_diff:
+                                    # Full diff format
+                                    if "diff" not in block_keys:
+                                        continue
+                                    cpu_diff = info["handler"].get_tensor(block_keys["diff"])
+                                    if device == 'cuda':
+                                        delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
+                                    else:
+                                        delta = cpu_diff.to(device=device, dtype=torch.float32)
+                                    del cpu_diff
+                                    effective_scale = info["weight"]
                                 else:
-                                    lora_down = cpu_down.to(device=device, dtype=torch.float32)
-                                    lora_up = cpu_up.to(device=device, dtype=torch.float32)
-                                del cpu_down, cpu_up
+                                    # Standard LoRA format
+                                    if "down" not in block_keys or "up" not in block_keys:
+                                        continue
 
-                                # Get alpha
-                                if "alpha" in block_keys:
-                                    alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
-                                    layer_alpha = float(alpha_tensor.item())
-                                else:
-                                    layer_alpha = float(info["network_dim"])
-                                layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
-                                effective_scale = layer_scale * info["weight"]
+                                    cpu_down = info["handler"].get_tensor(block_keys["down"])
+                                    cpu_up = info["handler"].get_tensor(block_keys["up"])
+                                    if device == 'cuda':
+                                        lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
+                                        lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                                    else:
+                                        lora_down = cpu_down.to(device=device, dtype=torch.float32)
+                                        lora_up = cpu_up.to(device=device, dtype=torch.float32)
+                                    del cpu_down, cpu_up
 
-                                # Compute delta
-                                is_conv = len(lora_down.shape) == 4
-                                if is_conv:
-                                    in_rank, in_size, kernel_size, k_ = lora_down.shape
-                                    out_size, out_rank, _, _ = lora_up.shape
-                                    delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
-                                    delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
-                                else:
-                                    delta = lora_up @ lora_down
-                                del lora_down, lora_up
+                                    # Get alpha
+                                    if "alpha" in block_keys:
+                                        alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
+                                        layer_alpha = float(alpha_tensor.item())
+                                    else:
+                                        layer_alpha = float(info["network_dim"])
+                                    layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
+                                    effective_scale = layer_scale * info["weight"]
 
-                            # Apply delta to base weight
-                            base_weight = base_weight + effective_scale * delta
-                            del delta
+                                    # Compute delta
+                                    is_conv = len(lora_down.shape) == 4
+                                    if is_conv:
+                                        in_rank, in_size, kernel_size, k_ = lora_down.shape
+                                        out_size, out_rank, _, _ = lora_up.shape
+                                        delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
+                                        delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
+                                    else:
+                                        delta = lora_up @ lora_down
+                                    del lora_down, lora_up
 
-                        # Store merged weight
-                        output_sd[base_key] = base_weight.to(save_dtype).cpu().contiguous()
-                        del base_weight
-                        stats["merged"] += 1
+                                # Apply delta to base weight
+                                base_weight = base_weight + effective_scale * delta
+                                del delta
+
+                            # Write merged weight
+                            writer.write(base_key, base_weight.to(save_dtype).cpu().contiguous())
+                            del base_weight
+                            stats["merged"] += 1
+                        else:
+                            # No LoRA contribution, write as-is
+                            writer.write(base_key, cpu_base.to(save_dtype).contiguous())
+                            del cpu_base
+                            stats["copied"] += 1
                     else:
-                        # No LoRA contribution, copy as-is
-                        output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
+                        # Non-weight tensor (bias, norm, etc.), write as-is
+                        writer.write(base_key, cpu_base.to(save_dtype).contiguous())
                         del cpu_base
                         stats["copied"] += 1
-                else:
-                    # Non-weight tensor (bias, norm, etc.), copy as-is
-                    output_sd[base_key] = cpu_base.to(save_dtype).contiguous()
-                    del cpu_base
-                    stats["copied"] += 1
 
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                pbar.update(1)
+                    pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
 
         if verbose:
             print(f"[LoRA Merge To Model] Done: {stats['merged']} merged, {stats['copied']} copied, {stats['skipped']} skipped")
 
-        # Save to base model directory
-        base_dir = os.path.dirname(base_model_path)
-        os.makedirs(base_dir, exist_ok=True)
-        output_path = os.path.join(base_dir, f"{output_filename.strip()}.safetensors")
-
-        save_file(output_sd, output_path, base_metadata)
         print(f"[LoRA Merge To Model] Saved to {output_path}")
-
         return output_path
 
     finally:
