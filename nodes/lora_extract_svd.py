@@ -13,13 +13,12 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
 from .device_utils import (
     estimate_model_size, prepare_for_large_operation,
     cleanup_after_operation, get_device_capabilities
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
 
 
 
@@ -447,6 +446,7 @@ def extract_lora_from_files(
     conv_param: float,
     device: str,
     save_dtype: str,
+    output_path: str,
     linear_max_rank: int = None,
     conv_max_rank: int = None,
     clamp_quantile: float = 0.99,
@@ -458,9 +458,9 @@ def extract_lora_from_files(
     lazy_load: bool = True,
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
-) -> dict[str, torch.Tensor]:
+) -> None:
     """
-    Extract LoRA from difference between two models.
+    Extract LoRA from difference between two models, writing incrementally to disk.
 
     Args:
         model_a_path: Finetuned model path
@@ -470,6 +470,7 @@ def extract_lora_from_files(
         conv_param: Mode parameter for conv layers
         device: Computation device
         save_dtype: Output dtype
+        output_path: Full path to output safetensors file
         linear_max_rank: Max rank for linear layers
         conv_max_rank: Max rank for conv layers
         clamp_quantile: Quantile for weight clamping
@@ -480,8 +481,6 @@ def extract_lora_from_files(
         glob_skip_patterns: When True, treat skip_patterns as glob (* wildcard).
                             When False (default), treat as Python regex.
     """
-    output_sd = {}
-
     save_torch_dtype = {
         "fp32": torch.float32,
         "fp16": torch.float16,
@@ -611,19 +610,24 @@ def extract_lora_from_files(
             del weight_diff
             return status, layer_results
 
-        for key in tqdm(weight_keys, desc="Extracting LoRA", unit="layers"):
-            status, layer_sd = _process_layer(key)
-            stats[status] += 1
-            if layer_sd:
-                output_sd.update(layer_sd)
+        writer = IncrementalSafetensorsWriter(output_path)
+        writer.__enter__()
+        try:
+            for key in tqdm(weight_keys, desc="Extracting LoRA", unit="layers"):
+                status, layer_sd = _process_layer(key)
+                stats[status] += 1
+                if layer_sd:
+                    writer.write_dict(layer_sd)
 
-            if force_clear_cache:
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if force_clear_cache:
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-            pbar.update(1)
+                pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
 
         print(f"[LoRA Extract] Done: {stats['extracted']} extracted, {stats['chunked']} chunked, "
               f"{stats['full']} full, {stats['skipped']} skipped")
@@ -633,22 +637,12 @@ def extract_lora_from_files(
         handler_b.__exit__(None, None, None)
         cleanup_after_operation()
 
-    return output_sd
 
-
-def _save_lora(output_sd: dict, output_filename: str) -> str:
-    """Save LoRA to file."""
-    if not output_sd:
-        raise ValueError("No LoRA weights extracted")
-
+def _build_lora_output_path(output_filename: str) -> str:
+    """Build output path for LoRA file."""
     output_dir = folder_paths.get_folder_paths("loras")[0]
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-
-    save_file(output_sd, output_path)
-    print(f"[LoRA Extract] Saved to {output_path}")
-
-    return output_path
+    return os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
 
 # =============================================================================
@@ -662,42 +656,6 @@ def _get_model_inputs():
         io.Combo.Input("model_b", options=folder_paths.get_filename_list("diffusion_models"),
                       tooltip="Base model (A - B = LoRA)"),
     ]
-
-
-def _reconstruct_dots(key: str) -> str:
-    """Reconstruct dot structure from underscored key using heuristics."""
-    # Block indices: input_blocks_1 -> input_blocks.1
-    blocks = [
-        "input_blocks", "output_blocks", "middle_block",
-        "transformer_blocks", "single_transformer_blocks",
-        "double_blocks", "single_blocks",
-        "down_blocks", "up_blocks", "mid_block",
-        "attentions", "resnets", "upsamplers", "downsamplers"
-    ]
-    for b in blocks:
-        key = re.sub(f"{b}_(\\d+)", f"{b}.\\1", key)
-
-    # Sequential numbers: .1_1 -> .1.1
-    key = re.sub(r"(\.\d+)_(\d+)", r"\1.\2", key)
-
-    # Separators that should be preceded by dot
-    separators = [
-        "transformer_blocks", "single_transformer_blocks",
-        "attn1", "attn2", "attn",
-        "img_attn", "txt_attn",
-        "to_q", "to_k", "to_v", "to_out",
-        "q_proj", "k_proj", "v_proj", "out_proj",
-        "qkv", "proj", "ff", "net",
-        "norm1", "norm2", "norm3", "norm",
-        "time_emb_proj"
-    ]
-    for s in separators:
-        key = key.replace(f"_{s}", f".{s}")
-
-    # Special case: to_out_0 -> to_out.0
-    key = re.sub(r"to_out_(\d+)", r"to_out.\1", key)
-
-    return key
 
 
 def _format_lora_key(key: str) -> str:
@@ -728,9 +686,7 @@ def _format_lora_key(key: str) -> str:
 
     # Handle legacy lora_unet_ prefix (for resizing without base)
     if key.startswith("lora_unet_"):
-        core = key[10:]
-        dotted = _reconstruct_dots(core)
-        return f"diffusion_model.{dotted}"
+        return key
 
     # Handle already-prefixed keys
     if key.startswith("diffusion_model."):
@@ -801,15 +757,16 @@ class LoRAExtractFixed(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
+        output_path = _build_lora_output_path(output_filename)
 
-        output_sd = extract_lora_from_files(
+        extract_lora_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
-            device, save_dtype, linear_dim, conv_dim,
+            device, save_dtype, output_path, linear_dim, conv_dim,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
             lazy_load, force_clear_cache, glob_skip_patterns
         )
 
-        return io.NodeOutput(_save_lora(output_sd, output_filename))
+        return io.NodeOutput(output_path)
 
 
 class LoRAExtractRatio(io.ComfyNode):
@@ -845,16 +802,17 @@ class LoRAExtractRatio(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
+        output_path = _build_lora_output_path(output_filename)
 
-        output_sd = extract_lora_from_files(
+        extract_lora_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
-            device, save_dtype, linear_max_rank, conv_max_rank,
+            device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns
         )
 
-        return io.NodeOutput(_save_lora(output_sd, output_filename))
+        return io.NodeOutput(output_path)
 
 
 class LoRAExtractQuantile(io.ComfyNode):
@@ -890,16 +848,17 @@ class LoRAExtractQuantile(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
+        output_path = _build_lora_output_path(output_filename)
 
-        output_sd = extract_lora_from_files(
+        extract_lora_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
-            device, save_dtype, linear_max_rank, conv_max_rank,
+            device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns
         )
 
-        return io.NodeOutput(_save_lora(output_sd, output_filename))
+        return io.NodeOutput(output_path)
 
 
 class LoRAExtractKnee(io.ComfyNode):
@@ -933,16 +892,17 @@ class LoRAExtractKnee(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
+        output_path = _build_lora_output_path(output_filename)
 
-        output_sd = extract_lora_from_files(
+        extract_lora_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
-            device, save_dtype, linear_max_rank, conv_max_rank,
+            device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns
         )
 
-        return io.NodeOutput(_save_lora(output_sd, output_filename))
+        return io.NodeOutput(output_path)
 
 
 class LoRAExtractFrobenius(io.ComfyNode):
@@ -978,13 +938,14 @@ class LoRAExtractFrobenius(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
+        output_path = _build_lora_output_path(output_filename)
 
-        output_sd = extract_lora_from_files(
+        extract_lora_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
-            device, save_dtype, linear_max_rank, conv_max_rank,
+            device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns
         )
 
-        return io.NodeOutput(_save_lora(output_sd, output_filename))
+        return io.NodeOutput(output_path)

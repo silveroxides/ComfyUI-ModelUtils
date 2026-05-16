@@ -3,12 +3,11 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
 from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen
+from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
 
 
 
@@ -43,24 +42,25 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
 
     key_map = dict(zip(old_keys, new_keys))
 
-    # Stream tensors and rename on the fly
-    renamed_tensors = {}
-    with MemoryEfficientSafeOpen(model_path_to_load) as handler:
-        original_keys = handler.keys()
-        pbar = comfy.utils.ProgressBar(len(original_keys))
-        for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
-            new_key = key_map.get(key, key)
-            renamed_tensors[new_key] = handler.get_tensor(key)
-            pbar.update(1)
-
     # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
     model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
-    save_file(renamed_tensors, output_path, metadata)
+    # Stream tensors, rename on the fly, write immediately
+    writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+    writer.__enter__()
+    try:
+        with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+            original_keys = handler.keys()
+            pbar = comfy.utils.ProgressBar(len(original_keys))
+            for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
+                new_key = key_map.get(key, key)
+                writer.write(new_key, handler.get_tensor(key).contiguous())
+                pbar.update(1)
+    finally:
+        writer.__exit__(None, None, None)
 
     # Cleanup after operation
-    del renamed_tensors
     cleanup_after_operation()
 
     return output_path

@@ -8,7 +8,6 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors.torch import save_file
 from typing import List, Dict, Tuple, Optional
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 from .lora_resize import (
@@ -20,7 +19,7 @@ from .lora_resize import (
     _format_lora_key
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
 
 
 
@@ -31,6 +30,7 @@ def merge_multi_loras(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -78,129 +78,193 @@ def merge_multi_loras(
             if verbose:
                 print(f"[LoRA Multi-Merge] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}, format={fmt['format']}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map:
-                    layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name # Keep block_name as-is without reference
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge] Total unique layers after resolving naming: {len(layer_map)}")
 
-        output_sd = {}
+        # Build metadata and output path before loop
+        metadata = {
+            "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via concatenation",
+            "ss_network_module": "networks.lora",
+        }
+        output_dir = folder_paths.get_folder_paths("loras")[0]
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+
         pbar = comfy.utils.ProgressBar(len(layer_map))
+        tensor_count = 0
 
-        # 2. Merge each core layer
-        with torch.no_grad():
-            for core, indices in tqdm(layer_map.items(), desc="Merging layers", unit="layers"):
-                downs = []
-                ups = []
-                is_conv = False
-                max_rank = 0
+        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+        writer.__enter__()
+        try:
+            # 2. Merge each core layer
+            with torch.no_grad():
+                for core, indices in tqdm(layer_map.items(), desc="Merging layers", unit="layers"):
+                    downs = []
+                    ups = []
+                    is_conv = False
+                    max_rank = 0
 
-                # First pass: load and determine max rank
-                for idx in indices:
-                    info = lora_infos[idx]
-                    handler = handlers[idx]
-                    orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
-                    block_keys = info["pairs"][orig_block]
+                    # First pass: load and determine max rank
+                    for idx, orig_block in indices:
+                        info = lora_infos[idx]
+                        handler = handlers[idx]
+                        block_keys = info["pairs"][orig_block]
 
-                    if "down" not in block_keys or "up" not in block_keys:
+                        if "down" not in block_keys or "up" not in block_keys:
+                            continue
+
+                        t_down = handler.get_tensor(block_keys["down"])
+                        t_up = handler.get_tensor(block_keys["up"])
+
+                        if device == 'cuda':
+                            t_down = transfer_to_gpu_pinned(t_down, device, torch.float32)
+                            t_up = transfer_to_gpu_pinned(t_up, device, torch.float32)
+                        else:
+                            t_down = t_down.to(device=device, dtype=torch.float32)
+                            t_up = t_up.to(device=device, dtype=torch.float32)
+
+                        # Store with original info for padding/weighting
+                        is_conv = len(t_down.shape) == 4
+                        current_rank = t_down.shape[0]
+                        max_rank = max(max_rank, current_rank)
+
+                        # Apply scale immediately for concatenate mode, or keep for later
+                        if merge_mode == "concatenate":
+                            effective_weight = info["weight"] * info["scale"]
+                            t_up = t_up * effective_weight
+
+                        downs.append((t_down, info))
+                        ups.append((t_up, info))
+
+                    if not downs:
+                        pbar.update(1)
                         continue
 
-                    t_down = handler.get_tensor(block_keys["down"])
-                    t_up = handler.get_tensor(block_keys["up"])
-
-                    if device == 'cuda':
-                        t_down = transfer_to_gpu_pinned(t_down, device, torch.float32)
-                        t_up = transfer_to_gpu_pinned(t_up, device, torch.float32)
-                    else:
-                        t_down = t_down.to(device=device, dtype=torch.float32)
-                        t_up = t_up.to(device=device, dtype=torch.float32)
-
-                    # Store with original info for padding/weighting
-                    is_conv = len(t_down.shape) == 4
-                    current_rank = t_down.shape[0]
-                    max_rank = max(max_rank, current_rank)
-
-                    # Apply scale immediately for concatenate mode, or keep for later
                     if merge_mode == "concatenate":
-                        effective_weight = info["weight"] * info["scale"]
-                        t_up = t_up * effective_weight
+                        # Stack ranks
+                        merged_down = torch.cat([d[0] for d in downs], dim=0)
+                        merged_up = torch.cat([u[0] for u in ups], dim=1)
+                        new_rank = merged_down.shape[0]
+                        new_alpha = float(new_rank)
+                    else:
+                        # weighted_sum (Kohya style)
+                        # Result = sum( weight_i * Padded(B_i) ), sum( weight_i * Padded(A_i) )
+                        # Note: We apply scale to weights here to normalize different alphas
+                        merged_down = torch.zeros_like(downs[0][0])
+                        # Need to handle different ranks via padding
+                        target_down_shape = list(downs[0][0].shape)
+                        target_down_shape[0] = max_rank
+                        target_up_shape = list(ups[0][0].shape)
+                        target_up_shape[1] = max_rank
 
-                    downs.append((t_down, info))
-                    ups.append((t_up, info))
+                        merged_down = torch.zeros(target_down_shape, device=device, dtype=torch.float32)
+                        merged_up = torch.zeros(target_up_shape, device=device, dtype=torch.float32)
 
-                if not downs:
+                        for (t_d, info_d), (t_u, info_u) in zip(downs, ups):
+                            r = t_d.shape[0]
+                            w = info_d["weight"]
+                            # We also apply sqrt(scale) to both to distribute the scale factor?
+                            # Kohya just uses weights. But to be safe with different alphas,
+                            # we apply scale to the final delta.
+                            # For direct weight merge, we'll just use weights.
+
+                            if r < max_rank:
+                                # Pad down: [r, in...] -> [max_rank, in...]
+                                pad_d = [0] * (len(t_d.shape) * 2)
+                                pad_d[-1] = max_rank - r # last dim in pad is first dim in tensor (reversed)
+                                # Wait, F.pad uses reverse order of dims.
+                                # For [r, in], padding is (0,0, 0, max_rank-r)
+                                padding_d = [0, 0] * (len(t_d.shape) - 1) + [0, max_rank - r]
+                                t_d = torch.nn.functional.pad(t_d, tuple(padding_d))
+
+                                # Pad up: [out, r...] -> [out, max_rank...]
+                                # For [out, r], padding is (0, max_rank-r, 0, 0)
+                                padding_u = [0, max_rank - r] + [0, 0] * (len(t_u.shape) - 1)
+                                t_u = torch.nn.functional.pad(t_u, tuple(padding_u))
+
+                            merged_down += w * t_d
+                            merged_up += w * t_u
+
+                        new_rank = max_rank
+                        # Alpha is usually max of alphas or same as rank
+                        new_alpha = float(max_rank)
+
+                    # Write layer immediately
+                    writer.write_dict({
+                        f"{core}.lora_down.weight": merged_down.to(save_dtype).cpu().contiguous(),
+                        f"{core}.lora_up.weight": merged_up.to(save_dtype).cpu().contiguous(),
+                        f"{core}.alpha": torch.tensor(new_alpha, dtype=save_dtype),
+                    })
+                    tensor_count += 3
+
+                    # Cleanup
+                    del merged_down, merged_up
+                    for d, _ in downs: del d
+                    for u, _ in ups: del u
+                    downs.clear()
+                    ups.clear()
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     pbar.update(1)
-                    continue
-
-                if merge_mode == "concatenate":
-                    # Stack ranks
-                    merged_down = torch.cat([d[0] for d in downs], dim=0)
-                    merged_up = torch.cat([u[0] for u in ups], dim=1)
-                    new_rank = merged_down.shape[0]
-                    new_alpha = float(new_rank)
-                else:
-                    # weighted_sum (Kohya style)
-                    # Result = sum( weight_i * Padded(B_i) ), sum( weight_i * Padded(A_i) )
-                    # Note: We apply scale to weights here to normalize different alphas
-                    merged_down = torch.zeros_like(downs[0][0])
-                    # Need to handle different ranks via padding
-                    target_down_shape = list(downs[0][0].shape)
-                    target_down_shape[0] = max_rank
-                    target_up_shape = list(ups[0][0].shape)
-                    target_up_shape[1] = max_rank
-
-                    merged_down = torch.zeros(target_down_shape, device=device, dtype=torch.float32)
-                    merged_up = torch.zeros(target_up_shape, device=device, dtype=torch.float32)
-
-                    for (t_d, info_d), (t_u, info_u) in zip(downs, ups):
-                        r = t_d.shape[0]
-                        w = info_d["weight"]
-                        # We also apply sqrt(scale) to both to distribute the scale factor?
-                        # Kohya just uses weights. But to be safe with different alphas,
-                        # we apply scale to the final delta.
-                        # For direct weight merge, we'll just use weights.
-
-                        if r < max_rank:
-                            # Pad down: [r, in...] -> [max_rank, in...]
-                            pad_d = [0] * (len(t_d.shape) * 2)
-                            pad_d[-1] = max_rank - r # last dim in pad is first dim in tensor (reversed)
-                            # Wait, F.pad uses reverse order of dims.
-                            # For [r, in], padding is (0,0, 0, max_rank-r)
-                            padding_d = [0, 0] * (len(t_d.shape) - 1) + [0, max_rank - r]
-                            t_d = torch.nn.functional.pad(t_d, tuple(padding_d))
-
-                            # Pad up: [out, r...] -> [out, max_rank...]
-                            # For [out, r], padding is (0, max_rank-r, 0, 0)
-                            padding_u = [0, max_rank - r] + [0, 0] * (len(t_u.shape) - 1)
-                            t_u = torch.nn.functional.pad(t_u, tuple(padding_u))
-
-                        merged_down += w * t_d
-                        merged_up += w * t_u
-
-                    new_rank = max_rank
-                    # Alpha is usually max of alphas or same as rank
-                    new_alpha = float(max_rank)
-
-                # Store
-                output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.alpha"] = torch.tensor(new_alpha, dtype=save_dtype)
-
-                # Cleanup
-                del merged_down, merged_up
-                for d, _ in downs: del d
-                for u, _ in ups: del u
-                downs.clear()
-                ups.clear()
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
 
         # 3. Final Summary
         if verbose:
@@ -212,21 +276,7 @@ def merge_multi_loras(
             print(f"[LoRA Multi-Merge] --- Merge Summary ---")
             for i, info in enumerate(lora_infos):
                 print(f"[LoRA Multi-Merge] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge] Output state dict has {len(output_sd)} tensors")
-
-        # 4. Metadata
-        metadata = {
-            "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via concatenation",
-            "ss_network_module": "networks.lora",
-        }
-
-        # 4. Save
-        output_dir = folder_paths.get_folder_paths("loras")[0]
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-
-        save_file(output_sd, output_path, metadata)
-        if verbose:
+            print(f"[LoRA Multi-Merge] Output state dict has {tensor_count} tensors")
             print(f"[LoRA Multi-Merge] Saved merged LoRA to {output_path}")
 
         return output_path
@@ -248,6 +298,8 @@ class LoRAMultiMerge(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file. This resolves different ranks and naming conventions.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2",
                               tooltip="Number of LoRAs to merge"),
                 # LoRA 1
@@ -286,7 +338,7 @@ class LoRAMultiMerge(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 merge_mode, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -308,6 +360,9 @@ class LoRAMultiMerge(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras(
             lora_paths=valid_paths,
@@ -315,7 +370,8 @@ class LoRAMultiMerge(io.ComfyNode):
             merge_mode=merge_mode,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -332,6 +388,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file using DARE-Ties. Drops small values and resolves sign conflicts.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2"),
                 # LoRA 1
                 io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"), tooltip="First LoRA"),
@@ -364,7 +422,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 drop_rate, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -386,6 +444,9 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras_dare(
             lora_paths=valid_paths,
@@ -395,7 +456,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             seed=seed,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -409,6 +471,7 @@ def merge_multi_loras_dare(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -446,103 +509,164 @@ def merge_multi_loras_dare(
             if verbose:
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map: layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge DARE] Total unique layers after resolving naming: {len(layer_map)}")
 
-        output_sd = {}
+        # Build output path before loop
+        output_dir = folder_paths.get_folder_paths("loras")[0]
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+
         pbar = comfy.utils.ProgressBar(len(layer_map))
+        tensor_count = 0
 
-        # 2. Merge
-        with torch.no_grad():
-            for core, indices in tqdm(layer_map.items(), desc="Merging layers (DARE)", unit="layers"):
-                downs = []
-                ups = []
-                max_rank = 0
+        writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via DARE-Ties"})
+        writer.__enter__()
+        try:
+            # 2. Merge
+            with torch.no_grad():
+                for core, indices in tqdm(layer_map.items(), desc="Merging layers (DARE)", unit="layers"):
+                    downs = []
+                    ups = []
+                    max_rank = 0
 
-                for idx in indices:
-                    info = lora_infos[idx]
-                    orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
-                    block_keys = info["pairs"][orig_block]
-                    if "down" not in block_keys or "up" not in block_keys: continue
+                    for idx, orig_block in indices:
+                        info = lora_infos[idx]
+                        block_keys = info["pairs"][orig_block]
+                        if "down" not in block_keys or "up" not in block_keys: continue
 
-                    t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
-                    t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
+                        t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
+                        t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
 
-                    max_rank = max(max_rank, t_d.shape[0])
-                    downs.append((t_d, info["weight"]))
-                    ups.append((t_u, info["weight"]))
+                        max_rank = max(max_rank, t_d.shape[0])
+                        downs.append((t_d, info["weight"]))
+                        ups.append((t_u, info["weight"]))
 
-                if not downs:
+                    if not downs:
+                        pbar.update(1)
+                        continue
+
+                    def process_ties_dare(tensors, weights, dim_to_pad):
+                        # Pad all to max_rank
+                        padded = []
+                        for t, w in tensors:
+                            if t.shape[dim_to_pad] < max_rank:
+                                padding = [0] * (len(t.shape) * 2)
+                                # dim_to_pad 0 (down) -> last pair in pad
+                                # dim_to_pad 1 (up) -> second to last pair in pad
+                                rev_dim = len(t.shape) - 1 - dim_to_pad
+                                padding[rev_dim*2 + 1] = max_rank - t.shape[dim_to_pad]
+                                t = torch.nn.functional.pad(t, tuple(padding))
+                            padded.append(t * w)
+
+                        # DARE
+                        if drop_rate > 0:
+                            for i in range(len(padded)):
+                                mask = (torch.rand(padded[i].shape, generator=rng, device=device) > drop_rate).float()
+                                padded[i] = (padded[i] * mask) / (1 - drop_rate)
+
+                        # TIES
+                        # 1. Trim
+                        if trim_quantile > 0:
+                            for i in range(len(padded)):
+                                flat = padded[i].abs().flatten()
+                                k = int(len(flat) * trim_quantile)
+                                if k > 0:
+                                    threshold = torch.kthvalue(flat, k).values
+                                    padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
+
+                        # 2. Elect & Merge
+                        stacked = torch.stack(padded) # [N, ...]
+                        signs = torch.sign(stacked)
+                        sum_signs = signs.sum(dim=0)
+                        dominant_sign = torch.sign(sum_signs)
+
+                        # Filter those matching dominant sign
+                        mask = (signs == dominant_sign) & (dominant_sign != 0)
+                        filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
+
+                        # Average matching signs
+                        count = mask.sum(dim=0)
+                        result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
+                        return result
+
+                    merged_down = process_ties_dare(downs, [1.0]*len(downs), 0)
+                    merged_up = process_ties_dare(ups, [1.0]*len(ups), 1)
+
+                    writer.write_dict({
+                        f"{core}.lora_down.weight": merged_down.to(save_dtype).cpu().contiguous(),
+                        f"{core}.lora_up.weight": merged_up.to(save_dtype).cpu().contiguous(),
+                        f"{core}.alpha": torch.tensor(float(max_rank), dtype=save_dtype),
+                    })
+                    tensor_count += 3
+
+                    del merged_down, merged_up
+                    for d, _ in downs: del d
+                    for u, _ in ups: del u
+                    downs.clear()
+                    ups.clear()
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     pbar.update(1)
-                    continue
-
-                def process_ties_dare(tensors, weights, dim_to_pad):
-                    # Pad all to max_rank
-                    padded = []
-                    for t, w in tensors:
-                        if t.shape[dim_to_pad] < max_rank:
-                            padding = [0] * (len(t.shape) * 2)
-                            # dim_to_pad 0 (down) -> last pair in pad
-                            # dim_to_pad 1 (up) -> second to last pair in pad
-                            rev_dim = len(t.shape) - 1 - dim_to_pad
-                            padding[rev_dim*2 + 1] = max_rank - t.shape[dim_to_pad]
-                            t = torch.nn.functional.pad(t, tuple(padding))
-                        padded.append(t * w)
-
-                    # DARE
-                    if drop_rate > 0:
-                        for i in range(len(padded)):
-                            mask = (torch.rand(padded[i].shape, generator=rng, device=device) > drop_rate).float()
-                            padded[i] = (padded[i] * mask) / (1 - drop_rate)
-
-                    # TIES
-                    # 1. Trim
-                    if trim_quantile > 0:
-                        for i in range(len(padded)):
-                            flat = padded[i].abs().flatten()
-                            k = int(len(flat) * trim_quantile)
-                            if k > 0:
-                                threshold = torch.kthvalue(flat, k).values
-                                padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
-
-                    # 2. Elect & Merge
-                    stacked = torch.stack(padded) # [N, ...]
-                    signs = torch.sign(stacked)
-                    sum_signs = signs.sum(dim=0)
-                    dominant_sign = torch.sign(sum_signs)
-
-                    # Filter those matching dominant sign
-                    mask = (signs == dominant_sign) & (dominant_sign != 0)
-                    filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
-
-                    # Average matching signs
-                    count = mask.sum(dim=0)
-                    result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
-                    return result
-
-                merged_down = process_ties_dare(downs, [1.0]*len(downs), 0)
-                merged_up = process_ties_dare(ups, [1.0]*len(ups), 1)
-
-                output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.alpha"] = torch.tensor(float(max_rank), dtype=save_dtype)
-
-                del merged_down, merged_up
-                for d, _ in downs: del d
-                for u, _ in ups: del u
-                downs.clear()
-                ups.clear()
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
 
         # Final Summary
         if verbose:
@@ -554,13 +678,8 @@ def merge_multi_loras_dare(
             print(f"[LoRA Multi-Merge DARE] --- Merge Summary ---")
             for i, info in enumerate(lora_infos):
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge DARE] Output state dict has {len(output_sd)} tensors")
+            print(f"[LoRA Multi-Merge DARE] Output state dict has {tensor_count} tensors")
 
-        # Save
-        output_dir = folder_paths.get_folder_paths("loras")[0]
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-        save_file(output_sd, output_path, {"ss_training_comment": "Merged via DARE-Ties"})
         return output_path
 
     finally:
@@ -579,6 +698,8 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file using Enhanced DARE-Ties. Uses dynamic probability masking based on value magnitudes.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2"),
                 # LoRA 1
                 io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"), tooltip="First LoRA"),
@@ -613,7 +734,7 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 mask_power, min_keep_prob, mask_smooth, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -635,6 +756,9 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras_dare_enhanced(
             lora_paths=valid_paths,
@@ -646,7 +770,8 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             seed=seed,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -663,6 +788,7 @@ def merge_multi_loras_dare_enhanced(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -699,105 +825,166 @@ def merge_multi_loras_dare_enhanced(
             if verbose:
                 print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map: layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge Enhanced DARE] Total unique layers after resolving naming: {len(layer_map)}")
 
-        output_sd = {}
+        # Build output path before loop
+        output_dir = folder_paths.get_folder_paths("loras")[0]
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+
         pbar = comfy.utils.ProgressBar(len(layer_map))
+        tensor_count = 0
 
-        # 2. Merge
-        with torch.no_grad():
-            for core, indices in tqdm(layer_map.items(), desc="Merging layers (Enhanced DARE)", unit="layers"):
-                downs = []
-                ups = []
-                max_rank = 0
+        writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via Enhanced DARE-Ties"})
+        writer.__enter__()
+        try:
+            # 2. Merge
+            with torch.no_grad():
+                for core, indices in tqdm(layer_map.items(), desc="Merging layers (Enhanced DARE)", unit="layers"):
+                    downs = []
+                    ups = []
+                    max_rank = 0
 
-                for idx in indices:
-                    info = lora_infos[idx]
-                    orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
-                    block_keys = info["pairs"][orig_block]
-                    if "down" not in block_keys or "up" not in block_keys: continue
+                    for idx, orig_block in indices:
+                        info = lora_infos[idx]
+                        block_keys = info["pairs"][orig_block]
+                        if "down" not in block_keys or "up" not in block_keys: continue
 
-                    t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
-                    t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
+                        t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
+                        t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
 
-                    max_rank = max(max_rank, t_d.shape[0])
-                    downs.append((t_d, info["weight"]))
-                    ups.append((t_u, info["weight"]))
+                        max_rank = max(max_rank, t_d.shape[0])
+                        downs.append((t_d, info["weight"]))
+                        ups.append((t_u, info["weight"]))
 
-                if not downs:
+                    if not downs:
+                        pbar.update(1)
+                        continue
+
+                    def process_ties_dare_enhanced(tensors, weights, dim_to_pad):
+                        processed = []
+                        for t, w in tensors:
+                            t_val = t * w
+
+                            # Enhanced DARE
+                            abs_t = torch.abs(t_val)
+                            max_val = torch.max(abs_t)
+                            if max_val > 0:
+                                prob = torch.clamp((abs_t / max_val) ** max(mask_power, 0.001), min=min_keep_prob, max=1.0)
+                                prob = torch.nan_to_num(prob)
+
+                                random_mask = torch.bernoulli(prob, generator=rng)
+                                interpolated_mask = torch.lerp(random_mask, prob, mask_smooth)
+
+                                t_val = t_val * interpolated_mask
+
+                            # TIES
+                            if trim_quantile > 0:
+                                flat = t_val.abs().flatten()
+                                k = max(1, int(len(flat) * trim_quantile))
+                                if k > 0:
+                                    threshold = torch.kthvalue(flat, k).values
+                                    t_val = torch.where(t_val.abs() < threshold, torch.zeros_like(t_val), t_val)
+
+                            # Pad
+                            if t_val.shape[dim_to_pad] < max_rank:
+                                padding = [0] * (len(t_val.shape) * 2)
+                                rev_dim = len(t_val.shape) - 1 - dim_to_pad
+                                padding[rev_dim*2 + 1] = max_rank - t_val.shape[dim_to_pad]
+                                t_val = torch.nn.functional.pad(t_val, tuple(padding))
+
+                            processed.append(t_val)
+
+                        stacked = torch.stack(processed)
+                        signs = torch.sign(stacked)
+                        sum_signs = signs.sum(dim=0)
+                        dominant_sign = torch.sign(sum_signs)
+
+                        mask = (signs == dominant_sign) & (dominant_sign != 0)
+                        filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
+
+                        count = mask.sum(dim=0)
+                        result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
+                        return result
+
+                    merged_down = process_ties_dare_enhanced(downs, [1.0]*len(downs), 0)
+                    merged_up = process_ties_dare_enhanced(ups, [1.0]*len(ups), 1)
+
+                    writer.write_dict({
+                        f"{core}.lora_down.weight": merged_down.to(save_dtype).cpu().contiguous(),
+                        f"{core}.lora_up.weight": merged_up.to(save_dtype).cpu().contiguous(),
+                        f"{core}.alpha": torch.tensor(float(max_rank), dtype=save_dtype),
+                    })
+                    tensor_count += 3
+
+                    del merged_down, merged_up
+                    for d, _ in downs: del d
+                    for u, _ in ups: del u
+                    downs.clear()
+                    ups.clear()
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     pbar.update(1)
-                    continue
-
-                def process_ties_dare_enhanced(tensors, weights, dim_to_pad):
-                    processed = []
-                    for t, w in tensors:
-                        t_val = t * w
-
-                        # Enhanced DARE
-                        abs_t = torch.abs(t_val)
-                        max_val = torch.max(abs_t)
-                        if max_val > 0:
-                            prob = torch.clamp((abs_t / max_val) ** max(mask_power, 0.001), min=min_keep_prob, max=1.0)
-                            prob = torch.nan_to_num(prob)
-
-                            random_mask = torch.bernoulli(prob, generator=rng)
-                            interpolated_mask = torch.lerp(random_mask, prob, mask_smooth)
-
-                            t_val = t_val * interpolated_mask
-
-                        # TIES
-                        if trim_quantile > 0:
-                            flat = t_val.abs().flatten()
-                            k = max(1, int(len(flat) * trim_quantile))
-                            if k > 0:
-                                threshold = torch.kthvalue(flat, k).values
-                                t_val = torch.where(t_val.abs() < threshold, torch.zeros_like(t_val), t_val)
-
-                        # Pad
-                        if t_val.shape[dim_to_pad] < max_rank:
-                            padding = [0] * (len(t_val.shape) * 2)
-                            rev_dim = len(t_val.shape) - 1 - dim_to_pad
-                            padding[rev_dim*2 + 1] = max_rank - t_val.shape[dim_to_pad]
-                            t_val = torch.nn.functional.pad(t_val, tuple(padding))
-
-                        processed.append(t_val)
-
-                    stacked = torch.stack(processed)
-                    signs = torch.sign(stacked)
-                    sum_signs = signs.sum(dim=0)
-                    dominant_sign = torch.sign(sum_signs)
-
-                    mask = (signs == dominant_sign) & (dominant_sign != 0)
-                    filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
-
-                    count = mask.sum(dim=0)
-                    result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
-                    return result
-
-                merged_down = process_ties_dare_enhanced(downs, [1.0]*len(downs), 0)
-                merged_up = process_ties_dare_enhanced(ups, [1.0]*len(ups), 1)
-
-                output_sd[f"{core}.lora_down.weight"] = merged_down.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.lora_up.weight"] = merged_up.to(save_dtype).cpu().contiguous()
-                output_sd[f"{core}.alpha"] = torch.tensor(float(max_rank), dtype=save_dtype)
-
-                del merged_down, merged_up
-                for d, _ in downs: del d
-                for u, _ in ups: del u
-                downs.clear()
-                ups.clear()
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                pbar.update(1)
+        finally:
+            writer.__exit__(None, None, None)
 
         # Final Summary
         if verbose:
@@ -809,13 +996,8 @@ def merge_multi_loras_dare_enhanced(
             print(f"[LoRA Multi-Merge Enhanced DARE] --- Merge Summary ---")
             for i, info in enumerate(lora_infos):
                 print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge Enhanced DARE] Output state dict has {len(output_sd)} tensors")
+            print(f"[LoRA Multi-Merge Enhanced DARE] Output state dict has {tensor_count} tensors")
 
-        # Save
-        output_dir = folder_paths.get_folder_paths("loras")[0]
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-        save_file(output_sd, output_path, {"ss_training_comment": "Merged via Enhanced DARE-Ties"})
         return output_path
 
     finally:
