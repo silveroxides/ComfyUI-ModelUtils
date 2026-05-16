@@ -658,42 +658,6 @@ def _get_model_inputs():
     ]
 
 
-def _reconstruct_dots(key: str) -> str:
-    """Reconstruct dot structure from underscored key using heuristics."""
-    # Block indices: input_blocks_1 -> input_blocks.1
-    blocks = [
-        "input_blocks", "output_blocks", "middle_block",
-        "transformer_blocks", "single_transformer_blocks",
-        "double_blocks", "single_blocks",
-        "down_blocks", "up_blocks", "mid_block",
-        "attentions", "resnets", "upsamplers", "downsamplers"
-    ]
-    for b in blocks:
-        key = re.sub(f"{b}_(\\d+)", f"{b}.\\1", key)
-
-    # Sequential numbers: .1_1 -> .1.1
-    key = re.sub(r"(\.\d+)_(\d+)", r"\1.\2", key)
-
-    # Separators that should be preceded by dot
-    separators = [
-        "transformer_blocks", "single_transformer_blocks",
-        "attn1", "attn2", "attn",
-        "img_attn", "txt_attn",
-        "to_q", "to_k", "to_v", "to_out",
-        "q_proj", "k_proj", "v_proj", "out_proj",
-        "qkv", "proj", "ff", "net",
-        "norm1", "norm2", "norm3", "norm",
-        "time_emb_proj"
-    ]
-    for s in separators:
-        key = key.replace(f"_{s}", f".{s}")
-
-    # Special case: to_out_0 -> to_out.0
-    key = re.sub(r"to_out_(\d+)", r"to_out.\1", key)
-
-    return key
-
-
 def _format_lora_key(key: str) -> str:
     """
     Format the key for LoRA saving.
@@ -722,9 +686,7 @@ def _format_lora_key(key: str) -> str:
 
     # Handle legacy lora_unet_ prefix (for resizing without base)
     if key.startswith("lora_unet_"):
-        core = key[10:]
-        dotted = _reconstruct_dots(core)
-        return f"diffusion_model.{dotted}"
+        return key
 
     # Handle already-prefixed keys
     if key.startswith("diffusion_model."):

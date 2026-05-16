@@ -30,6 +30,7 @@ def merge_multi_loras(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -77,11 +78,59 @@ def merge_multi_loras(
             if verbose:
                 print(f"[LoRA Multi-Merge] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}, format={fmt['format']}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map:
-                    layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name # Keep block_name as-is without reference
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge] Total unique layers after resolving naming: {len(layer_map)}")
@@ -110,10 +159,9 @@ def merge_multi_loras(
                     max_rank = 0
 
                     # First pass: load and determine max rank
-                    for idx in indices:
+                    for idx, orig_block in indices:
                         info = lora_infos[idx]
                         handler = handlers[idx]
-                        orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                         block_keys = info["pairs"][orig_block]
 
                         if "down" not in block_keys or "up" not in block_keys:
@@ -250,6 +298,8 @@ class LoRAMultiMerge(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file. This resolves different ranks and naming conventions.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2",
                               tooltip="Number of LoRAs to merge"),
                 # LoRA 1
@@ -288,7 +338,7 @@ class LoRAMultiMerge(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 merge_mode, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -310,6 +360,9 @@ class LoRAMultiMerge(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras(
             lora_paths=valid_paths,
@@ -317,7 +370,8 @@ class LoRAMultiMerge(io.ComfyNode):
             merge_mode=merge_mode,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -334,6 +388,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file using DARE-Ties. Drops small values and resolves sign conflicts.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2"),
                 # LoRA 1
                 io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"), tooltip="First LoRA"),
@@ -366,7 +422,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 drop_rate, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -388,6 +444,9 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras_dare(
             lora_paths=valid_paths,
@@ -397,7 +456,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             seed=seed,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -411,6 +471,7 @@ def merge_multi_loras_dare(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -448,10 +509,59 @@ def merge_multi_loras_dare(
             if verbose:
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map: layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge DARE] Total unique layers after resolving naming: {len(layer_map)}")
@@ -474,9 +584,8 @@ def merge_multi_loras_dare(
                     ups = []
                     max_rank = 0
 
-                    for idx in indices:
+                    for idx, orig_block in indices:
                         info = lora_infos[idx]
-                        orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                         block_keys = info["pairs"][orig_block]
                         if "down" not in block_keys or "up" not in block_keys: continue
 
@@ -589,6 +698,8 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             category="ModelUtils/LoRA/Merge",
             description="Merge 1-8 LoRAs into a single LoRA file using Enhanced DARE-Ties. Uses dynamic probability masking based on value magnitudes.",
             inputs=[
+                io.Combo.Input("base_model", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None",
+                              tooltip="Optional reference model to resolve key naming issues across formats. If None, input keys are preserved verbatim."),
                 io.Combo.Input("lora_count", options=[str(i) for i in range(1, 9)], default="2"),
                 # LoRA 1
                 io.Combo.Input("lora_1", options=folder_paths.get_filename_list("loras"), tooltip="First LoRA"),
@@ -623,7 +734,7 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_count,
+    def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 mask_power, min_keep_prob, mask_smooth, trim_quantile, seed, output_filename, save_dtype, device) -> io.NodeOutput:
@@ -645,6 +756,9 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             raise ValueError("No LoRAs selected for merging.")
 
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
+        base_path = None
+        if base_model and base_model != "None":
+            base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_model)
 
         path = merge_multi_loras_dare_enhanced(
             lora_paths=valid_paths,
@@ -656,7 +770,8 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             seed=seed,
             device=device,
             save_dtype=dtype,
-            output_filename=output_filename
+            output_filename=output_filename,
+            base_model_path=base_path
         )
 
         return io.NodeOutput(path)
@@ -673,6 +788,7 @@ def merge_multi_loras_dare_enhanced(
     device: str,
     save_dtype: torch.dtype,
     output_filename: str,
+    base_model_path: Optional[str] = None,
     verbose: bool = True,
 ) -> str:
     """
@@ -709,10 +825,59 @@ def merge_multi_loras_dare_enhanced(
             if verbose:
                 print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
-            for block_name in pairs.keys():
-                core = _format_lora_key(block_name)
-                if core not in layer_map: layer_map[core] = []
-                layer_map[core].append(i)
+        if base_model_path:
+            BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
+            LORA_PREFIXES = [
+                "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+                "lycoris_", "diffusion_model.", "transformer.", "unet."
+            ]
+
+            def extract_core_layer_base(key: str) -> str:
+                result = key
+                if result.endswith(".weight"):
+                    result = result[:-7]
+                elif result.endswith(".bias"):
+                    result = result[:-5]
+                for prefix in BASE_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                return result
+
+            def extract_core_layer_lora(block_name: str) -> str:
+                result = block_name
+                for prefix in LORA_PREFIXES:
+                    if result.startswith(prefix):
+                        result = result[len(prefix):]
+                        break
+                if result.endswith(".lora"):
+                    result = result[:-5]
+                return result.replace(".", "_")
+
+            with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+                base_keys = list(base_handler.keys())
+
+            lora_lookup = {}
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core_lora = extract_core_layer_lora(block_name)
+                    if core_lora not in lora_lookup:
+                        lora_lookup[core_lora] = []
+                    lora_lookup[core_lora].append((i, block_name))
+
+            for base_key in base_keys:
+                if base_key.endswith(".weight"):
+                    core_base = extract_core_layer_base(base_key)
+                    core_underscored = core_base.replace(".", "_")
+                    if core_underscored in lora_lookup:
+                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+        else:
+            for i, info in enumerate(lora_infos):
+                for block_name in info["pairs"].keys():
+                    core = block_name
+                    if core not in layer_map:
+                        layer_map[core] = []
+                    layer_map[core].append((i, block_name))
 
         if verbose:
             print(f"[LoRA Multi-Merge Enhanced DARE] Total unique layers after resolving naming: {len(layer_map)}")
@@ -735,9 +900,8 @@ def merge_multi_loras_dare_enhanced(
                     ups = []
                     max_rank = 0
 
-                    for idx in indices:
+                    for idx, orig_block in indices:
                         info = lora_infos[idx]
-                        orig_block = next(b for b in info["pairs"].keys() if _format_lora_key(b) == core)
                         block_keys = info["pairs"][orig_block]
                         if "down" not in block_keys or "up" not in block_keys: continue
 

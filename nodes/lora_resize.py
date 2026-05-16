@@ -471,8 +471,8 @@ def resize_lora_file(
                     up_suffix = format_info["up_suffix"]
                     alpha_suffix = format_info["alpha_suffix"]
 
-                    # Standardize prefix using heuristics if possible
-                    new_block_name = _format_lora_key(block_name)
+                    # Preserve original key format from input LoRA verbatim
+                    new_block_name = block_name
 
                     block_sd = {
                         f"{new_block_name}{down_suffix}": result["lora_down"].to(save_dtype),
