@@ -123,7 +123,9 @@ def merge_multi_loras(
                     core_base = extract_core_layer_base(base_key)
                     core_underscored = core_base.replace(".", "_")
                     if core_underscored in lora_lookup:
-                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+                        # Always use standard format with diffusion_model. prefix when reference model is provided
+                        output_key = core_base if core_base.startswith("diffusion_model.") else "diffusion_model." + core_base
+                        layer_map[output_key] = lora_lookup[core_underscored] # List of (idx, block_name)
         else:
             for i, info in enumerate(lora_infos):
                 for block_name in info["pairs"].keys():
@@ -270,7 +272,7 @@ def merge_multi_loras(
         if verbose:
             matched_stats = {i: 0 for i in range(len(lora_paths))}
             for indices in layer_map.values():
-                for idx in indices:
+                for idx, block_name in indices:
                     matched_stats[idx] += 1
 
             print(f"[LoRA Multi-Merge] --- Merge Summary ---")
@@ -554,7 +556,9 @@ def merge_multi_loras_dare(
                     core_base = extract_core_layer_base(base_key)
                     core_underscored = core_base.replace(".", "_")
                     if core_underscored in lora_lookup:
-                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+                        # Always use standard format with diffusion_model. prefix when reference model is provided
+                        output_key = core_base if core_base.startswith("diffusion_model.") else "diffusion_model." + core_base
+                        layer_map[output_key] = lora_lookup[core_underscored] # List of (idx, block_name)
         else:
             for i, info in enumerate(lora_infos):
                 for block_name in info["pairs"].keys():
@@ -672,7 +676,7 @@ def merge_multi_loras_dare(
         if verbose:
             matched_stats = {i: 0 for i in range(len(lora_paths))}
             for indices in layer_map.values():
-                for idx in indices:
+                for idx, block_name in indices:
                     matched_stats[idx] += 1
 
             print(f"[LoRA Multi-Merge DARE] --- Merge Summary ---")
@@ -870,7 +874,9 @@ def merge_multi_loras_dare_enhanced(
                     core_base = extract_core_layer_base(base_key)
                     core_underscored = core_base.replace(".", "_")
                     if core_underscored in lora_lookup:
-                        layer_map[core_base] = lora_lookup[core_underscored] # List of (idx, block_name)
+                        # Always use standard format with diffusion_model. prefix when reference model is provided
+                        output_key = core_base if core_base.startswith("diffusion_model.") else "diffusion_model." + core_base
+                        layer_map[output_key] = lora_lookup[core_underscored] # List of (idx, block_name)
         else:
             for i, info in enumerate(lora_infos):
                 for block_name in info["pairs"].keys():
@@ -990,7 +996,7 @@ def merge_multi_loras_dare_enhanced(
         if verbose:
             matched_stats = {i: 0 for i in range(len(lora_paths))}
             for indices in layer_map.values():
-                for idx in indices:
+                for idx, block_name in indices:
                     matched_stats[idx] += 1
 
             print(f"[LoRA Multi-Merge Enhanced DARE] --- Merge Summary ---")
