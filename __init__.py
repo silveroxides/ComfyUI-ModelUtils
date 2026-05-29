@@ -28,6 +28,10 @@ from .nodes.dora_extract_wd import (
     DoRAExtractFixed, DoRAExtractRatio, DoRAExtractQuantile,
     DoRAExtractKnee, DoRAExtractFrobenius
 )
+from .nodes.dora_learned_wd import (
+    DoRALearnedExtractFixed, DoRALearnedExtractRatio, DoRALearnedExtractQuantile,
+    DoRALearnedExtractKnee, DoRALearnedExtractFrobenius
+)
 from .nodes.lora_resize import (
     LoRAResizeFixed, LoRAResizeRatio,
     LoRAResizeFrobenius, LoRAResizeCumulative,
@@ -68,6 +72,9 @@ class ModelUtilsExtension(ComfyExtension):
             # DoRA Extraction
             DoRAExtractFixed, DoRAExtractRatio, DoRAExtractQuantile,
             DoRAExtractKnee, DoRAExtractFrobenius,
+            # Learned DoRA Extraction
+            DoRALearnedExtractFixed, DoRALearnedExtractRatio, DoRALearnedExtractQuantile,
+            DoRALearnedExtractKnee, DoRALearnedExtractFrobenius,
             # LoRA Resize
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
