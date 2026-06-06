@@ -1,5 +1,5 @@
 requests
 Pillow
 mutagen
-unifiedefficientloader>=0.5.1
+unifiedefficientloader>=0.5.2
 av
