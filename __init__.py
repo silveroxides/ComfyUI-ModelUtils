@@ -47,6 +47,8 @@ from .nodes.model_info_nodes import (
 )
 
 
+from .nodes.lora_rename import AnimaLoraRename
+
 class ModelUtilsExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -82,6 +84,8 @@ class ModelUtilsExtension(ComfyExtension):
             LoRAMultiMerge, LoRAMultiMergeDARE, LoRAMultiMergeDAREEnhanced,
             # LoRA Merge To Model
             LoRAMergeToModel,
+            # LoRA Utilities
+            AnimaLoraRename,
             # Downloaders
             CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
             VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,
