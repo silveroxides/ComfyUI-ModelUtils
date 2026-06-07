@@ -551,6 +551,14 @@ def extract_dora_from_files(
                     dora_scale = None
                     del tensor_b
                 else:
+                    # 1-D weights (e.g. x_pad_token, norm .weight) have no
+                    # weight-decomposition direction and are skipped below
+                    # anyway; bail out before the norm, which would index
+                    # dim=1 and raise on a 1-D tensor.
+                    if tensor_a.ndim < 2:
+                        del tensor_a, tensor_b
+                        return "skipped", None
+
                     # Weight Decomposition calculation
                     is_conv_dim = tensor_a.ndim == 4
                     
