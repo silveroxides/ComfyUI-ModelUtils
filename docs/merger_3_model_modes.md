@@ -67,6 +67,15 @@ When merging models with different layer structures, the `mismatch_mode` paramet
 
 ---
 
+## Dtype Preservation & Override
+
+By default, the merger preserves the highest precision `dtype` for each key found across all active source models (Model A, B, and C) and the requested `save_dtype`.
+
+- **Preserve Higher Precision**: If a key is `float32` in any of the active source models, but you requested `save_dtype="bf16"` or `"fp16"`, that key will be saved as `float32` anyway. This prevents degrading critical high-precision layers (such as normalization layers or layers with restored outliers).
+- **Explicit Override**: If you prefer to force the entire model to be saved strictly as the selected `save_dtype` (e.g. for complete downcasting to `bf16`), toggle `override_dtype` to `True`.
+
+---
+
 ## Layer Filtering (Regex Patterns)
 
 Use regex patterns to control which layers are merged:
