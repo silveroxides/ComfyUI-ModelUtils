@@ -377,6 +377,8 @@ def resize_lora_file(
     output_filename: str,
     verbose: bool = True,
     svd_niter: int = 2,
+    lazy_load: bool = True,
+    force_clear_cache: bool = False,
 ) -> str:
     """
     Resize a LoRA file to a new rank.
@@ -391,6 +393,8 @@ def resize_lora_file(
         output_filename: Output filename (without extension)
         verbose: Print progress info
         svd_niter: Power iterations for SVD accuracy
+        lazy_load: Low memory mode: load tensors from disk on demand
+        force_clear_cache: Clear CUDA cache after each layer
 
     Returns:
         Path to saved resized LoRA
@@ -399,7 +403,7 @@ def resize_lora_file(
     lora_size_gb = estimate_model_size(lora_path)
     prepare_for_large_operation(lora_size_gb * 2, torch.device(device))
 
-    handler = MemoryEfficientSafeOpen(lora_path)
+    handler = MemoryEfficientSafeOpen(lora_path, low_memory=lazy_load)
 
     try:
         metadata = handler.metadata().copy()
@@ -484,10 +488,11 @@ def resize_lora_file(
                     writer.write_dict(block_sd)
 
                     del result
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    if force_clear_cache:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                     pbar.update(1)
         finally:
@@ -531,17 +536,22 @@ class LoRAResizeFixed(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, new_rank, svd_niter, output_filename, save_dtype, device) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, svd_niter, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(lora_path, new_rank, None, None, device, dtype, output_filename, svd_niter=svd_niter)
+        path = resize_lora_file(
+            lora_path, new_rank, None, None, device, dtype, output_filename,
+            svd_niter=svd_niter, lazy_load=lazy_load, force_clear_cache=force_clear_cache
+        )
         return io.NodeOutput(path)
 
 
@@ -565,17 +575,22 @@ class LoRAResizeRatio(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora_ratio"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(lora_path, max_rank, "sv_ratio", ratio, device, dtype, output_filename)
+        path = resize_lora_file(
+            lora_path, max_rank, "sv_ratio", ratio, device, dtype, output_filename,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+        )
         return io.NodeOutput(path)
 
 
@@ -599,17 +614,22 @@ class LoRAResizeFrobenius(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora_fro"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(lora_path, max_rank, "sv_fro", target, device, dtype, output_filename)
+        path = resize_lora_file(
+            lora_path, max_rank, "sv_fro", target, device, dtype, output_filename,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+        )
         return io.NodeOutput(path)
 
 
@@ -633,17 +653,22 @@ class LoRAResizeCumulative(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora_cumulative"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(lora_path, max_rank, "sv_cumulative", target, device, dtype, output_filename)
+        path = resize_lora_file(
+            lora_path, max_rank, "sv_cumulative", target, device, dtype, output_filename,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+        )
         return io.NodeOutput(path)
 
 
@@ -662,6 +687,8 @@ def merge_loras_to_model(
     output_filename: str,
     skip_patterns_str: str = "",
     verbose: bool = True,
+    lazy_load: bool = True,
+    force_clear_cache: bool = False,
 ) -> str:
     """
     Merge multiple LoRAs into a base model and save the result directly.
@@ -679,6 +706,8 @@ def merge_loras_to_model(
         output_filename: Output filename (without extension)
         skip_patterns_str: Regex patterns for layers to skip
         verbose: Print progress info
+        lazy_load: Low memory mode: load tensors from disk on demand
+        force_clear_cache: Clear CUDA cache after each layer
 
     Returns:
         Path to saved merged model
@@ -694,8 +723,8 @@ def merge_loras_to_model(
     prepare_for_large_operation(total_size_gb * 1.5, torch.device(device))
 
     # Open all files - use low_memory for base model to avoid OS page caching
-    base_handler = MemoryEfficientSafeOpen(base_model_path, low_memory=True)
-    lora_handlers = [MemoryEfficientSafeOpen(lp) for lp in lora_paths]
+    base_handler = MemoryEfficientSafeOpen(base_model_path, low_memory=lazy_load)
+    lora_handlers = [MemoryEfficientSafeOpen(lp, low_memory=lazy_load) for lp in lora_paths]
 
 
     try:
@@ -874,10 +903,11 @@ def merge_loras_to_model(
                         del cpu_base
                         stats["copied"] += 1
 
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    if force_clear_cache:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                     pbar.update(1)
         finally:
@@ -957,6 +987,8 @@ class LoRAMergeToModel(io.ComfyNode):
                 io.String.Input("output_filename", default="merged_model"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
@@ -966,7 +998,7 @@ class LoRAMergeToModel(io.ComfyNode):
     def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
-                skip_patterns, output_filename, save_dtype, device) -> io.NodeOutput:
+                skip_patterns, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
 
         # Build LoRA list based on count
         count = int(lora_count)
@@ -991,5 +1023,7 @@ class LoRAMergeToModel(io.ComfyNode):
             save_dtype=dtype,
             output_filename=output_filename,
             skip_patterns_str=skip_patterns,
+            lazy_load=lazy_load,
+            force_clear_cache=force_clear_cache,
         )
         return io.NodeOutput(path)
