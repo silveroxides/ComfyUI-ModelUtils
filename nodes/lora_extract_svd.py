@@ -470,7 +470,7 @@ def extract_lora_from_files(
         linear_param: Mode parameter for linear layers
         conv_param: Mode parameter for conv layers
         device: Computation device
-        save_dtype: Output dtype
+        save_dtype: Output dtype for layers whose sources are not FP32
         output_path: Full path to output safetensors file
         linear_max_rank: Max rank for linear layers
         conv_max_rank: Max rank for conv layers
@@ -481,8 +481,8 @@ def extract_lora_from_files(
         chunk_large_layers: Enable chunked extraction
         glob_skip_patterns: When True, treat skip_patterns as glob (* wildcard).
                             When False (default), treat as Python regex.
-        include_1d_diffs: Save 1D tensors and keys ending in .scale or .lin
-                          as full .diff patches instead of skipping them.
+        include_1d_diffs: Save 1D tensors in FP32 and keys ending in .scale or
+                          .lin as full .diff patches instead of skipping them.
     """
     save_torch_dtype = {
         "fp32": torch.float32,
@@ -520,6 +520,13 @@ def extract_lora_from_files(
 
             if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
                 return "skipped", None
+
+            source_dtypes = [handler_a.get_dtype(key)]
+            if key in keys_b:
+                source_dtypes.append(handler_b.get_dtype(key))
+            layer_save_dtype = (
+                torch.float32 if torch.float32 in source_dtypes else save_torch_dtype
+            )
 
             # Load tensors with pinned memory for CUDA
             use_pinned = device == 'cuda'
@@ -576,8 +583,9 @@ def extract_lora_from_files(
             # and scale/lin parameters as exact runtime-applicable diff patches.
             is_direct_diff = weight_diff.ndim == 1 or key.endswith(direct_diff_suffixes)
             if include_1d_diffs and is_direct_diff:
+                direct_diff_dtype = torch.float32 if weight_diff.ndim == 1 else layer_save_dtype
                 layer_results = {
-                    f"{lora_name}.diff": weight_diff.to(save_torch_dtype).cpu().contiguous()
+                    f"{lora_name}.diff": weight_diff.to(direct_diff_dtype).cpu().contiguous()
                 }
                 del weight_diff
                 return "full", layer_results
@@ -608,8 +616,8 @@ def extract_lora_from_files(
                             weight_diff, num_chunks, mode, linear_param, device, linear_max_rank
                         )
                         if lora_up is not None:
-                            layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
-                            layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
+                            layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(layer_save_dtype).cpu().contiguous()
+                            layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(layer_save_dtype).cpu().contiguous()
                             del weight_diff
                             return "chunked", layer_results
 
@@ -619,12 +627,12 @@ def extract_lora_from_files(
 
             # Store result
             if mode_str == "full":
-                layer_results[f"{lora_name}.diff"] = weight_diff.to(save_torch_dtype).cpu().contiguous()
+                layer_results[f"{lora_name}.diff"] = weight_diff.to(layer_save_dtype).cpu().contiguous()
                 status = "full"
             else:
                 lora_down, lora_up, _ = result
-                layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(save_torch_dtype).cpu().contiguous()
-                layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
+                layer_results[f"{lora_name}.lora_A.weight"] = lora_down.to(layer_save_dtype).cpu().contiguous()
+                layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(layer_save_dtype).cpu().contiguous()
                 status = "extracted"
 
             del weight_diff
@@ -736,7 +744,8 @@ def _get_common_inputs():
                       tooltip="Skip layers with max difference below this"),
         io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip"),
         io.String.Input("output_filename", default="extracted_lora"),
-        io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
+        io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16",
+                       tooltip="Output dtype; layers stored as FP32 in either source remain FP32"),
         io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
         io.String.Input("skip_patterns", default="", multiline=True,
                        tooltip="Patterns for layers to skip (regex or glob depending on glob_skip_patterns)"),
@@ -744,7 +753,7 @@ def _get_common_inputs():
                         tooltip="When True, skip_patterns use glob syntax (* = any sequence, ? = any char, dots are literal). "
                                 "When False (default), patterns are Python regex matched as substrings."),
         io.Boolean.Input("include_1d_diffs", default=False,
-                        tooltip="Include 1D tensors and keys ending in .scale or .lin as full .diff patches"),
+                        tooltip="Include 1D tensors as FP32 and keys ending in .scale or .lin as full .diff patches"),
     ]
 
 
