@@ -458,6 +458,7 @@ def extract_lora_from_files(
     lazy_load: bool = True,
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
+    include_1d_diffs: bool = False,
 ) -> None:
     """
     Extract LoRA from difference between two models, writing incrementally to disk.
@@ -480,6 +481,8 @@ def extract_lora_from_files(
         chunk_large_layers: Enable chunked extraction
         glob_skip_patterns: When True, treat skip_patterns as glob (* wildcard).
                             When False (default), treat as Python regex.
+        include_1d_diffs: Save 1D tensors and keys ending in .scale or .lin
+                          as full .diff patches instead of skipping them.
     """
     save_torch_dtype = {
         "fp32": torch.float32,
@@ -500,8 +503,16 @@ def extract_lora_from_files(
     try:
         keys_a = set(handler_a.keys())
         keys_b = set(handler_b.keys())
-        weight_keys = [k for k in keys_a if k.endswith(".weight")]
-        pbar = comfy.utils.ProgressBar(len(weight_keys))
+        direct_diff_suffixes = (".scale", ".lin")
+        extraction_keys = [
+            k for k in keys_a
+            if k.endswith(".weight")
+            or (
+                include_1d_diffs
+                and (len(handler_a.get_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
+            )
+        ]
+        pbar = comfy.utils.ProgressBar(len(extraction_keys))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         def _process_layer(key):
@@ -561,7 +572,16 @@ def extract_lora_from_files(
                 del weight_diff
                 return "skipped", None
 
-            # Skip 1D tensors
+            # SVD requires matrix-shaped tensors. Optionally preserve 1D weights
+            # and scale/lin parameters as exact runtime-applicable diff patches.
+            is_direct_diff = weight_diff.ndim == 1 or key.endswith(direct_diff_suffixes)
+            if include_1d_diffs and is_direct_diff:
+                layer_results = {
+                    f"{lora_name}.diff": weight_diff.to(save_torch_dtype).cpu().contiguous()
+                }
+                del weight_diff
+                return "full", layer_results
+
             if weight_diff.ndim < 2:
                 del weight_diff
                 return "skipped", None
@@ -613,7 +633,7 @@ def extract_lora_from_files(
         writer = IncrementalSafetensorsWriter(output_path)
         writer.__enter__()
         try:
-            for key in tqdm(weight_keys, desc="Extracting LoRA", unit="layers"):
+            for key in tqdm(extraction_keys, desc="Extracting LoRA", unit="layers"):
                 status, layer_sd = _process_layer(key)
                 stats[status] += 1
                 if layer_sd:
@@ -723,6 +743,8 @@ def _get_common_inputs():
         io.Boolean.Input("glob_skip_patterns", default=False,
                         tooltip="When True, skip_patterns use glob syntax (* = any sequence, ? = any char, dots are literal). "
                                 "When False (default), patterns are Python regex matched as substrings."),
+        io.Boolean.Input("include_1d_diffs", default=False,
+                        tooltip="Include 1D tensors and keys ending in .scale or .lin as full .diff patches"),
     ]
 
 
@@ -753,7 +775,8 @@ class LoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
+                include_1d_diffs=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -763,7 +786,7 @@ class LoRAExtractFixed(io.ComfyNode):
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             device, save_dtype, output_path, linear_dim, conv_dim,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
-            lazy_load, force_clear_cache, glob_skip_patterns
+            lazy_load, force_clear_cache, glob_skip_patterns, include_1d_diffs
         )
 
         return io.NodeOutput(output_path)
@@ -798,7 +821,8 @@ class LoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
+                include_1d_diffs=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -809,7 +833,7 @@ class LoRAExtractRatio(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
         )
 
         return io.NodeOutput(output_path)
@@ -844,7 +868,8 @@ class LoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
+                include_1d_diffs=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -855,7 +880,7 @@ class LoRAExtractQuantile(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
         )
 
         return io.NodeOutput(output_path)
@@ -888,7 +913,8 @@ class LoRAExtractKnee(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
+                include_1d_diffs=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -899,7 +925,7 @@ class LoRAExtractKnee(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
         )
 
         return io.NodeOutput(output_path)
@@ -934,7 +960,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
+                include_1d_diffs=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -945,7 +972,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
         )
 
         return io.NodeOutput(output_path)
