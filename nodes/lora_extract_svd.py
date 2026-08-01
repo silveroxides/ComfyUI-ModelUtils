@@ -19,6 +19,7 @@ from .device_utils import (
 )
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from .quantization_guard import inspect_low_bit_input
 
 
 
@@ -501,16 +502,20 @@ def extract_lora_from_files(
     handler_b = MemoryEfficientSafeOpen(model_b_path, low_memory=lazy_load)
 
     try:
+        low_bit_a = inspect_low_bit_input(handler_a, f"Model A ({model_a_path})", "LoRA Extract")
+        low_bit_b = inspect_low_bit_input(handler_b, f"Model B ({model_b_path})", "LoRA Extract")
         keys_a = set(handler_a.keys())
         keys_b = set(handler_b.keys())
         direct_diff_suffixes = (".scale", ".lin")
         extraction_keys = [
             k for k in keys_a
-            if k.endswith(".weight")
+            if k not in low_bit_a
+            and k not in low_bit_b
+            and (k.endswith(".weight")
             or (
                 include_1d_diffs
                 and (len(handler_a.get_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
-            )
+            ))
         ]
         pbar = comfy.utils.ProgressBar(len(extraction_keys))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}

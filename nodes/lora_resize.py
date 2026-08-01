@@ -15,6 +15,7 @@ from comfy_api.latest import io
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
 
 
@@ -33,6 +34,34 @@ from .lora_extract_svd import (
 
 
 MIN_SV = 1e-6
+
+LORA_PAIR_SUFFIXES = (
+    (".lora_A.default.weight", ".lora_B.default.weight", ".alpha", "peft"),
+    (".lora_down.weight", ".lora_up.weight", ".alpha", "comfy"),
+    (".lora_A.weight", ".lora_B.weight", ".alpha", "diffusers"),
+    (".lora.down.weight", ".lora.up.weight", ".alpha", "huggingface"),
+)
+
+
+def is_direct_diff_key(key: str) -> bool:
+    return key.endswith(".diff") or key.endswith(".diff_b")
+
+
+def select_output_dtype(
+    source_dtypes: List[torch.dtype],
+    requested_dtype: torch.dtype,
+    force: bool = False,
+    is_1d_diff: bool = False,
+) -> torch.dtype:
+    """Select an output dtype without losing precision-sensitive LoRA deltas."""
+    if is_1d_diff:
+        return torch.float32
+    if not force and torch.float32 in source_dtypes:
+        return torch.float32
+    floating_dtypes = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+    if source_dtypes and not any(dtype in floating_dtypes for dtype in source_dtypes):
+        return source_dtypes[0]
+    return requested_dtype
 
 
 # =============================================================================
@@ -69,59 +98,99 @@ def detect_lora_format(keys: List[str]) -> Dict:
     alpha_keys = [k for k in keys if '.alpha' in k or k.endswith('alpha')]
     format_info["has_alpha"] = len(alpha_keys) > 0
 
-    # Detect format by key patterns
-    sample_keys = keys[:50]  # Check more keys for full_diff detection
+    detected = []
+    for down_suffix, up_suffix, alpha_suffix, name in LORA_PAIR_SUFFIXES:
+        if any(k.endswith(down_suffix) or k.endswith(up_suffix) for k in keys):
+            detected.append((down_suffix, up_suffix, alpha_suffix, name))
+    has_full_diff = any(is_direct_diff_key(k) for k in keys)
+    if has_full_diff:
+        detected.append((None, None, None, "full_diff"))
 
-    # Full diff format: *.diff (NOT .lora_down, just straight weight diff)
-    if any(k.endswith('.diff') for k in sample_keys):
-        format_info["format"] = "full_diff"
-        format_info["down_suffix"] = ".diff"  # Used for pairing, but no up
-        format_info["up_suffix"] = None  # No up weight in full diff
-        format_info["alpha_suffix"] = None
-        format_info["is_full_diff"] = True
-
-    # Kohya/A1111 format: lora_unet_down_blocks_0_*.lora_down.weight
-    elif any('lora_unet_' in k or 'lora_te' in k for k in sample_keys):
-        format_info["format"] = "kohya"
-        format_info["down_suffix"] = ".lora_down.weight"
-        format_info["up_suffix"] = ".lora_up.weight"
-
-    # Diffusers format: transformer.*.lora_A.weight
-    elif any('.lora_A.weight' in k for k in sample_keys):
-        format_info["format"] = "diffusers"
-        format_info["down_suffix"] = ".lora_A.weight"
-        format_info["up_suffix"] = ".lora_B.weight"
-        format_info["alpha_suffix"] = ".alpha"
-
-    # PEFT format: base_model.model.*.lora_A.default.weight
-    elif any('base_model.model.' in k and 'lora_' in k for k in sample_keys):
-        format_info["format"] = "peft"
-        # Handle nested structure
-        format_info["down_suffix"] = ".lora_A.default.weight"
-        format_info["up_suffix"] = ".lora_B.default.weight"
-
-    # HuggingFace format: transformer.*.lora.down.weight (dots instead of underscores)
-    elif any('.lora.down.weight' in k for k in sample_keys):
-        format_info["format"] = "huggingface"
-        format_info["down_suffix"] = ".lora.down.weight"
-        format_info["up_suffix"] = ".lora.up.weight"
-        format_info["alpha_suffix"] = ".alpha"
-
-    # ComfyUI native / standard
-    elif any('.lora_down.weight' in k for k in sample_keys):
-        format_info["format"] = "comfy"
-        format_info["down_suffix"] = ".lora_down.weight"
-        format_info["up_suffix"] = ".lora_up.weight"
-
-    # Count LoRA layers
-    down_keys = [k for k in keys if format_info["down_suffix"] in k]
-    format_info["key_count"] = len(down_keys)
+    if len(detected) > 1:
+        format_info["format"] = "mixed"
+    elif detected:
+        down_suffix, up_suffix, alpha_suffix, name = detected[0]
+        format_info.update({
+            "format": name,
+            "down_suffix": down_suffix,
+            "up_suffix": up_suffix,
+            "alpha_suffix": alpha_suffix,
+        })
+    format_info["is_full_diff"] = has_full_diff and not any(item[0] for item in detected)
+    pairs, _ = parse_lora_layers(keys)
+    format_info["key_count"] = len(pairs)
 
     return format_info
 
 
 
-def extract_lora_pairs(keys: List[str], format_info: Dict) -> Dict[str, Dict[str, str]]:
+def parse_lora_layers(keys: List[str]) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    """Parse low-rank, direct-diff, and pass-through tensors in one full scan."""
+    layers: Dict[str, Dict[str, str]] = {}
+    consumed = set()
+
+    for key in keys:
+        if key.endswith(".diff_b"):
+            block_name = key[:-7]
+            layers.setdefault(block_name, {})["diff_b"] = key
+            consumed.add(key)
+            continue
+        if key.endswith(".diff"):
+            block_name = key[:-5]
+            layers.setdefault(block_name, {})["diff"] = key
+            consumed.add(key)
+            continue
+        for down_suffix, up_suffix, alpha_suffix, format_name in LORA_PAIR_SUFFIXES:
+            if key.endswith(down_suffix):
+                block_name = key[:-len(down_suffix)]
+                layer = layers.setdefault(block_name, {})
+                layer.update({
+                    "down": key,
+                    "down_suffix": down_suffix,
+                    "up_suffix": up_suffix,
+                    "alpha_suffix": alpha_suffix,
+                    "format": format_name,
+                })
+                consumed.add(key)
+                break
+            if key.endswith(up_suffix):
+                block_name = key[:-len(up_suffix)]
+                layer = layers.setdefault(block_name, {})
+                layer.update({
+                    "up": key,
+                    "down_suffix": down_suffix,
+                    "up_suffix": up_suffix,
+                    "alpha_suffix": alpha_suffix,
+                    "format": format_name,
+                })
+                consumed.add(key)
+                break
+
+    for key in keys:
+        if not key.endswith(".alpha"):
+            continue
+        block_name = key[:-6]
+        if block_name in layers and ("down" in layers[block_name] or "up" in layers[block_name]):
+            layers[block_name]["alpha"] = key
+            consumed.add(key)
+
+    # Incomplete low-rank groups cannot be resized, but their tensors must survive.
+    for block_name, layer in list(layers.items()):
+        if ("down" in layer) == ("up" in layer):
+            continue
+        for name in ("down", "up", "alpha"):
+            key = layer.pop(name, None)
+            if key is not None:
+                consumed.discard(key)
+        for name in ("down_suffix", "up_suffix", "alpha_suffix", "format"):
+            layer.pop(name, None)
+        if not layer:
+            del layers[block_name]
+
+    return layers, [key for key in keys if key not in consumed]
+
+
+def extract_lora_pairs(keys: List[str], format_info: Optional[Dict] = None) -> Dict[str, Dict[str, str]]:
     """
     Group LoRA keys into down/up/alpha pairs.
 
@@ -131,50 +200,15 @@ def extract_lora_pairs(keys: List[str], format_info: Dict) -> Dict[str, Dict[str
         Dict[block_name, {"down": key, "up": key, "alpha": key}]
         For full_diff: {"diff": key, "diff_b": key}
     """
-    down_suffix = format_info["down_suffix"]
-    up_suffix = format_info["up_suffix"]
-    alpha_suffix = format_info["alpha_suffix"]
-    is_full_diff = format_info.get("is_full_diff", False)
-
-    pairs = {}
-
-    if is_full_diff:
-        # Full diff format: group .diff and .diff_b
-        for key in keys:
-            if key.endswith('.diff'):
-                block_name = key[:-5]  # Remove .diff
-                if block_name not in pairs:
-                    pairs[block_name] = {}
-                pairs[block_name]["diff"] = key
-            elif key.endswith('.diff_b'):
-                block_name = key[:-7]  # Remove .diff_b
-                if block_name not in pairs:
-                    pairs[block_name] = {}
-                pairs[block_name]["diff_b"] = key
-    else:
-        # Standard LoRA format
-        for key in keys:
-            if down_suffix and down_suffix in key:
-                block_name = key.replace(down_suffix, "")
-                if block_name not in pairs:
-                    pairs[block_name] = {}
-                pairs[block_name]["down"] = key
-            elif up_suffix and up_suffix in key:
-                block_name = key.replace(up_suffix, "")
-                if block_name not in pairs:
-                    pairs[block_name] = {}
-                pairs[block_name]["up"] = key
-            elif alpha_suffix and (alpha_suffix in key or key.endswith('.alpha')):
-                # Handle various alpha key formats
-                block_name = key.replace(alpha_suffix, "").replace(".alpha", "")
-                if block_name not in pairs:
-                    pairs[block_name] = {}
-                pairs[block_name]["alpha"] = key
-
+    pairs, _ = parse_lora_layers(keys)
     return pairs
 
 
-def detect_lora_rank(handler: MemoryEfficientSafeOpen, pairs: Dict) -> Tuple[int, float]:
+def detect_lora_rank(
+    handler: MemoryEfficientSafeOpen,
+    pairs: Dict,
+    low_bit_keys: Optional[set[str]] = None,
+) -> Tuple[int, float]:
     """
     Detect the rank and alpha of an existing LoRA.
 
@@ -196,7 +230,11 @@ def detect_lora_rank(handler: MemoryEfficientSafeOpen, pairs: Dict) -> Tuple[int
             network_dim = shape[0]
 
         # Get alpha if present
-        if network_alpha is None and "alpha" in block_keys:
+        if (
+            network_alpha is None
+            and "alpha" in block_keys
+            and block_keys["alpha"] not in (low_bit_keys or set())
+        ):
             alpha_tensor = handler.get_tensor(block_keys["alpha"])
             network_alpha = float(alpha_tensor.item())
 
@@ -406,13 +444,14 @@ def resize_lora_file(
     handler = MemoryEfficientSafeOpen(lora_path, low_memory=lazy_load)
 
     try:
-        metadata = handler.metadata().copy()
+        low_bit_keys = inspect_low_bit_input(handler, f"LoRA ({lora_path})", "LoRA Resize")
+        metadata = (handler.metadata() or {}).copy()
         all_keys = handler.keys()
 
         # Detect format and extract pairs
         format_info = detect_lora_format(all_keys)
-        pairs = extract_lora_pairs(all_keys, format_info)
-        network_dim, network_alpha = detect_lora_rank(handler, pairs)
+        pairs, passthrough_keys = parse_lora_layers(all_keys)
+        network_dim, network_alpha = detect_lora_rank(handler, pairs, low_bit_keys)
 
         scale = network_alpha / network_dim if network_dim > 0 else 1.0
 
@@ -437,13 +476,49 @@ def resize_lora_file(
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
         fro_list = []
-        pbar = comfy.utils.ProgressBar(len(pairs))
+        pbar = comfy.utils.ProgressBar(len(pairs) + len(passthrough_keys))
 
         writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
         writer.__enter__()
         try:
+            preserved_keys = set()
             with torch.no_grad():
                 for block_name, block_keys in tqdm(pairs.items(), desc="Resizing layers", unit="layers"):
+                    if layer_has_low_bit(block_keys, low_bit_keys):
+                        layer_keys = [
+                            block_keys[name]
+                            for name in ("down", "up", "alpha", "diff", "diff_b")
+                            if name in block_keys
+                        ]
+                        layer_keys.extend(
+                            key for key in passthrough_keys if key.startswith(f"{block_name}.")
+                        )
+                        for key in layer_keys:
+                            if key not in preserved_keys:
+                                write_preserved_tensor(writer, key, handler)
+                                preserved_keys.add(key)
+                        pbar.update(1)
+                        continue
+                    direct_keys = [block_keys[name] for name in ("diff", "diff_b") if name in block_keys]
+                    layer_source_keys = [
+                        block_keys[name]
+                        for name in ("down", "up", "alpha", "diff", "diff_b")
+                        if name in block_keys
+                    ]
+                    layer_source_dtypes = [handler.get_dtype(key) for key in layer_source_keys]
+                    if direct_keys:
+                        for key in direct_keys:
+                            tensor = handler.get_tensor(key)
+                            target_dtype = select_output_dtype(
+                                layer_source_dtypes,
+                                save_dtype,
+                                is_1d_diff=tensor.ndim == 1,
+                            )
+                            writer.write(key, tensor.to(target_dtype).cpu().contiguous())
+                        if "down" not in block_keys or "up" not in block_keys:
+                            pbar.update(1)
+                            continue
+
                     if "down" not in block_keys or "up" not in block_keys:
                         pbar.update(1)
                         continue
@@ -470,20 +545,17 @@ def resize_lora_file(
 
                     fro_list.append(result['fro_retained'])
 
-                    # Store using same format suffixes as input
-                    down_suffix = format_info["down_suffix"]
-                    up_suffix = format_info["up_suffix"]
-                    alpha_suffix = format_info["alpha_suffix"]
-
-                    # Preserve original key format from input LoRA verbatim
-                    new_block_name = block_name
+                    layer_dtype = select_output_dtype(
+                        layer_source_dtypes,
+                        save_dtype,
+                    )
 
                     block_sd = {
-                        f"{new_block_name}{down_suffix}": result["lora_down"].to(save_dtype),
-                        f"{new_block_name}{up_suffix}": result["lora_up"].to(save_dtype),
+                        block_keys["down"]: result["lora_down"].to(layer_dtype),
+                        block_keys["up"]: result["lora_up"].to(layer_dtype),
                     }
-                    if alpha_suffix:
-                        block_sd[f"{new_block_name}{alpha_suffix}"] = torch.tensor(result["new_alpha"]).to(save_dtype)
+                    alpha_key = block_keys.get("alpha", f"{block_name}{block_keys['alpha_suffix']}")
+                    block_sd[alpha_key] = torch.tensor(result["new_alpha"], dtype=layer_dtype)
 
                     writer.write_dict(block_sd)
 
@@ -494,6 +566,17 @@ def resize_lora_file(
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
+                    pbar.update(1)
+
+                for key in tqdm(passthrough_keys, desc="Copying auxiliary tensors", unit="layers"):
+                    if key in preserved_keys:
+                        pass
+                    elif key in low_bit_keys:
+                        write_preserved_tensor(writer, key, handler)
+                    else:
+                        tensor = handler.get_tensor(key)
+                        target_dtype = select_output_dtype([handler.get_dtype(key)], save_dtype)
+                        writer.write(key, tensor.to(target_dtype).cpu().contiguous())
                     pbar.update(1)
         finally:
             writer.__exit__(None, None, None)
@@ -689,6 +772,7 @@ def merge_loras_to_model(
     verbose: bool = True,
     lazy_load: bool = True,
     force_clear_cache: bool = False,
+    include_1d_diffs: bool = False,
 ) -> str:
     """
     Merge multiple LoRAs into a base model and save the result directly.
@@ -728,14 +812,25 @@ def merge_loras_to_model(
 
 
     try:
+        base_low_bit_keys = inspect_low_bit_input(
+            base_handler, f"Base model ({base_model_path})", "LoRA Merge To Model"
+        )
+        lora_low_bit_keys = [
+            inspect_low_bit_input(
+                handler, f"LoRA {i + 1} ({lora_paths[i]})", "LoRA Merge To Model"
+            )
+            for i, handler in enumerate(lora_handlers)
+        ]
         # Detect format and extract pairs for each LoRA
         lora_infos = []
 
         for i, handler in enumerate(lora_handlers):
             keys = handler.keys()
             format_info = detect_lora_format(keys)
-            pairs = extract_lora_pairs(keys, format_info)
-            network_dim, network_alpha = detect_lora_rank(handler, pairs)
+            pairs, _ = parse_lora_layers(keys)
+            network_dim, network_alpha = detect_lora_rank(
+                handler, pairs, lora_low_bit_keys[i]
+            )
             lora_infos.append({
                 "handler": handler,
                 "format_info": format_info,
@@ -743,6 +838,7 @@ def merge_loras_to_model(
                 "network_dim": network_dim,
                 "network_alpha": network_alpha,
                 "weight": lora_weights[i],
+                "low_bit_keys": lora_low_bit_keys[i],
             })
             if verbose:
                 print(f"[LoRA Merge To Model] LoRA {i+1}: {format_info['format']}, {len(pairs)} layers, dim={network_dim}")
@@ -778,14 +874,47 @@ def merge_loras_to_model(
             return result.replace(".", "_")
 
 
-        # Build LoRA lookup: core layer name (underscored) -> list of (info, block_keys)
+        base_keys = list(base_handler.keys())
+        base_aliases = set()
+        for key in base_keys:
+            normalized = key
+            for prefix in BASE_PREFIXES:
+                if normalized.startswith(prefix):
+                    normalized = normalized[len(prefix):]
+                    break
+            base_aliases.add(normalized)
+            base_aliases.add(normalized.replace(".", "_"))
+
+        # Build lookups for low-rank layers and exact direct patches.
         lora_lookup = {}
+        direct_lookup = {}
         for info in lora_infos:
             for block_name, block_keys in info["pairs"].items():
-                core = extract_core_layer_lora(block_name)
-                if core not in lora_lookup:
-                    lora_lookup[core] = []
-                lora_lookup[core].append((info, block_keys))
+                if "down" in block_keys or "up" in block_keys:
+                    core = extract_core_layer_lora(block_name)
+                    lora_lookup.setdefault(core, []).append((info, block_keys))
+
+                for direct_name in ("diff", "diff_b"):
+                    if direct_name not in block_keys:
+                        continue
+                    direct_key = block_keys[direct_name]
+                    core = block_name
+                    for prefix in LORA_PREFIXES:
+                        if core.startswith(prefix):
+                            core = core[len(prefix):]
+                            break
+                    if direct_name == "diff_b":
+                        targets = [f"{core}.bias"]
+                    else:
+                        # Exact non-weight state keys win; module diffs fall back to .weight.
+                        exact_aliases = {core, core.replace(".", "_")}
+                        targets = [core] if exact_aliases & base_aliases else [f"{core}.weight"]
+                    contribution = (info, direct_key, block_keys)
+                    for target in targets:
+                        direct_lookup.setdefault(target, []).append(contribution)
+                        underscored_target = target.replace(".", "_")
+                        if underscored_target != target:
+                            direct_lookup.setdefault(underscored_target, []).append(contribution)
 
         # Compile skip patterns
         skip_patterns = _compile_patterns(skip_patterns_str)
@@ -800,7 +929,6 @@ def merge_loras_to_model(
         output_path = os.path.join(base_dir, f"{output_filename.strip()}.safetensors")
 
         stats = {"merged": 0, "copied": 0, "skipped": 0}
-        base_keys = list(base_handler.keys())
         pbar = comfy.utils.ProgressBar(len(base_keys))
 
         if verbose:
@@ -811,6 +939,11 @@ def merge_loras_to_model(
         try:
             with torch.no_grad():
                 for base_key in tqdm(base_keys, desc="Merging to model", unit="keys"):
+                    if base_key in base_low_bit_keys:
+                        write_preserved_tensor(writer, base_key, base_handler)
+                        stats["copied"] += 1
+                        pbar.update(1)
+                        continue
                     # Check skip patterns
                     if _matches_any_pattern(base_key, skip_patterns):
                         stats["skipped"] += 1
@@ -820,13 +953,21 @@ def merge_loras_to_model(
                     # Load base weight
                     cpu_base = base_handler.get_tensor(base_key)
 
-                    # Only process weight tensors for LoRA merging
+                    core_with_suffix = base_key
+                    for prefix in BASE_PREFIXES:
+                        if core_with_suffix.startswith(prefix):
+                            core_with_suffix = core_with_suffix[len(prefix):]
+                            break
+                    direct_contributions = direct_lookup.get(core_with_suffix, [])
+                    if not direct_contributions:
+                        direct_contributions = direct_lookup.get(core_with_suffix.replace(".", "_"), [])
+
+                    low_rank_contributions = []
                     if base_key.endswith(".weight"):
                         core = extract_core_layer_base(base_key)
-                        core_underscored = core.replace(".", "_")
+                        low_rank_contributions = lora_lookup.get(core.replace(".", "_"), [])
 
-                        # Check if any LoRA contributes to this layer
-                        if core_underscored in lora_lookup:
+                    if direct_contributions or low_rank_contributions:
                             # Transfer to GPU for computation
                             if device == 'cuda':
                                 base_weight = transfer_to_gpu_pinned(cpu_base, device, torch.float32)
@@ -834,72 +975,88 @@ def merge_loras_to_model(
                                 base_weight = cpu_base.to(device=device, dtype=torch.float32)
                             del cpu_base
 
-                            # Accumulate deltas from all contributing LoRAs
-                            for info, block_keys in lora_lookup[core_underscored]:
-                                is_full_diff = info["format_info"].get("is_full_diff", False)
+                            source_dtypes = [base_handler.get_dtype(base_key)]
+                            applied_1d_diff = False
 
-                                if is_full_diff:
-                                    # Full diff format
-                                    if "diff" not in block_keys:
-                                        continue
-                                    cpu_diff = info["handler"].get_tensor(block_keys["diff"])
-                                    if device == 'cuda':
-                                        delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
-                                    else:
-                                        delta = cpu_diff.to(device=device, dtype=torch.float32)
+                            for info, direct_key, block_keys in direct_contributions:
+                                if layer_has_low_bit(block_keys, info["low_bit_keys"]):
+                                    continue
+                                cpu_diff = info["handler"].get_tensor(direct_key)
+                                if cpu_diff.ndim == 1 and not include_1d_diffs:
                                     del cpu_diff
-                                    effective_scale = info["weight"]
+                                    continue
+                                if tuple(cpu_diff.shape) != tuple(base_weight.shape):
+                                    print(
+                                        f"[LoRA Merge To Model] Shape mismatch for {direct_key}: "
+                                        f"{tuple(cpu_diff.shape)} != {tuple(base_weight.shape)}; skipped"
+                                    )
+                                    del cpu_diff
+                                    continue
+                                source_dtypes.append(info["handler"].get_dtype(direct_key))
+                                applied_1d_diff = applied_1d_diff or cpu_diff.ndim == 1
+                                if device == 'cuda':
+                                    delta = transfer_to_gpu_pinned(cpu_diff, device, torch.float32)
                                 else:
-                                    # Standard LoRA format
-                                    if "down" not in block_keys or "up" not in block_keys:
-                                        continue
+                                    delta = cpu_diff.to(device=device, dtype=torch.float32)
+                                del cpu_diff
+                                base_weight = base_weight + info["weight"] * delta
+                                del delta
 
-                                    cpu_down = info["handler"].get_tensor(block_keys["down"])
-                                    cpu_up = info["handler"].get_tensor(block_keys["up"])
-                                    if device == 'cuda':
-                                        lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
-                                        lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
-                                    else:
-                                        lora_down = cpu_down.to(device=device, dtype=torch.float32)
-                                        lora_up = cpu_up.to(device=device, dtype=torch.float32)
-                                    del cpu_down, cpu_up
+                            # Accumulate low-rank deltas from all contributing LoRAs.
+                            for info, block_keys in low_rank_contributions:
+                                if "down" not in block_keys or "up" not in block_keys:
+                                    continue
+                                if layer_has_low_bit(block_keys, info["low_bit_keys"]):
+                                    continue
+                                source_keys = [block_keys["down"], block_keys["up"]]
+                                if "alpha" in block_keys:
+                                    source_keys.append(block_keys["alpha"])
+                                source_dtypes.extend(info["handler"].get_dtype(key) for key in source_keys)
 
-                                    # Get alpha
-                                    if "alpha" in block_keys:
-                                        alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
-                                        layer_alpha = float(alpha_tensor.item())
-                                    else:
-                                        layer_alpha = float(info["network_dim"])
-                                    layer_scale = layer_alpha / info["network_dim"] if info["network_dim"] > 0 else 1.0
-                                    effective_scale = layer_scale * info["weight"]
+                                cpu_down = info["handler"].get_tensor(block_keys["down"])
+                                cpu_up = info["handler"].get_tensor(block_keys["up"])
+                                if device == 'cuda':
+                                    lora_down = transfer_to_gpu_pinned(cpu_down, device, torch.float32)
+                                    lora_up = transfer_to_gpu_pinned(cpu_up, device, torch.float32)
+                                else:
+                                    lora_down = cpu_down.to(device=device, dtype=torch.float32)
+                                    lora_up = cpu_up.to(device=device, dtype=torch.float32)
+                                del cpu_down, cpu_up
 
-                                    # Compute delta
-                                    is_conv = len(lora_down.shape) == 4
-                                    if is_conv:
-                                        in_rank, in_size, kernel_size, k_ = lora_down.shape
-                                        out_size, out_rank, _, _ = lora_up.shape
-                                        delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
-                                        delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
-                                    else:
-                                        delta = lora_up @ lora_down
-                                    del lora_down, lora_up
+                                layer_rank = lora_down.shape[0]
+                                if "alpha" in block_keys:
+                                    alpha_tensor = info["handler"].get_tensor(block_keys["alpha"])
+                                    layer_alpha = float(alpha_tensor.item())
+                                else:
+                                    layer_alpha = float(layer_rank)
+                                effective_scale = (layer_alpha / layer_rank if layer_rank > 0 else 1.0) * info["weight"]
 
-                                # Apply delta to base weight
+                                is_conv = len(lora_down.shape) == 4
+                                if is_conv:
+                                    in_rank, in_size, kernel_size, _ = lora_down.shape
+                                    out_size = lora_up.shape[0]
+                                    delta = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
+                                    delta = delta.reshape(out_size, in_size, kernel_size, kernel_size)
+                                else:
+                                    delta = lora_up @ lora_down
+                                del lora_down, lora_up
                                 base_weight = base_weight + effective_scale * delta
                                 del delta
 
-                            # Write merged weight
-                            writer.write(base_key, base_weight.to(save_dtype).cpu().contiguous())
+                            target_dtype = select_output_dtype(
+                                source_dtypes,
+                                save_dtype,
+                                is_1d_diff=applied_1d_diff,
+                            )
+                            writer.write(base_key, base_weight.to(target_dtype).cpu().contiguous())
                             del base_weight
                             stats["merged"] += 1
-                        else:
-                            # No LoRA contribution, write as-is
-                            writer.write(base_key, cpu_base.to(save_dtype).contiguous())
-                            del cpu_base
-                            stats["copied"] += 1
                     else:
-                        # Non-weight tensor (bias, norm, etc.), write as-is
-                        writer.write(base_key, cpu_base.to(save_dtype).contiguous())
+                        target_dtype = select_output_dtype(
+                            [base_handler.get_dtype(base_key)],
+                            save_dtype,
+                        )
+                        writer.write(base_key, cpu_base.to(target_dtype).contiguous())
                         del cpu_base
                         stats["copied"] += 1
 
@@ -989,6 +1146,8 @@ class LoRAMergeToModel(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
+                io.Boolean.Input("include_1d_diffs", default=False,
+                                 tooltip="Apply 1D direct-diff tensors as FP32. Disabled preserves prior behavior."),
             ],
             outputs=[io.String.Output(display_name="output_path")],
             is_output_node=True,
@@ -998,7 +1157,8 @@ class LoRAMergeToModel(io.ComfyNode):
     def execute(cls, base_model, lora_count,
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
-                skip_patterns, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
+                skip_patterns, output_filename, save_dtype, device, lazy_load, force_clear_cache,
+                include_1d_diffs) -> io.NodeOutput:
 
         # Build LoRA list based on count
         count = int(lora_count)
@@ -1025,5 +1185,6 @@ class LoRAMergeToModel(io.ComfyNode):
             skip_patterns_str=skip_patterns,
             lazy_load=lazy_load,
             force_clear_cache=force_clear_cache,
+            include_1d_diffs=include_1d_diffs,
         )
         return io.NodeOutput(path)
