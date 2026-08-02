@@ -3,6 +3,7 @@ LoRA Multi-Merge - Merge multiple LoRAs into a single LoRA file.
 Resolves different naming conventions and ranks via concatenation.
 """
 import os
+import logging
 import torch
 import folder_paths
 import comfy.utils
@@ -11,10 +12,14 @@ from comfy_api.latest import io
 from typing import List, Dict, Tuple, Optional
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 from .lora_resize import (
+    canonical_lora_key,
     detect_lora_format,
     detect_lora_rank,
+    layer_has_companions,
+    layer_tensor_keys,
     parse_lora_layers,
     select_output_dtype,
+    validate_canonical_blocks,
 )
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 
@@ -69,10 +74,10 @@ def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> 
             if "down" in block_keys or "up" in block_keys:
                 candidate = f"{core}.weight"
                 target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
-            elif "diff_b" in block_keys:
+            elif "diff_b" in block_keys or "b_norm" in block_keys:
                 candidate = f"{core}.bias"
                 target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
-            elif "diff" in block_keys:
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
                 target = normalized_base.get(core) or normalized_base.get(core.replace(".", "_"))
                 if target is None:
                     candidate = f"{core}.weight"
@@ -81,11 +86,11 @@ def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> 
             if target is None:
                 continue
             normalized_target = _strip_prefix(target, BASE_PREFIXES)
-            if "diff_b" in block_keys and normalized_target.endswith(".bias"):
+            if ("diff_b" in block_keys or "b_norm" in block_keys) and normalized_target.endswith(".bias"):
                 output_core = normalized_target[:-5]
-            elif "diff" in block_keys and normalized_target.endswith(".weight"):
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")) and normalized_target.endswith(".weight"):
                 output_core = normalized_target[:-7]
-            elif "diff" in block_keys:
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
                 output_core = normalized_target
             else:
                 output_core = normalized_target[:-7] if normalized_target.endswith(".weight") else normalized_target
@@ -96,7 +101,9 @@ def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> 
     # Direct patches must not disappear merely because a reference model cannot resolve them.
     for idx, info in enumerate(lora_infos):
         for block_name, block_keys in info["pairs"].items():
-            if (idx, block_name) not in mapped and ("diff" in block_keys or "diff_b" in block_keys):
+            if (idx, block_name) not in mapped and any(
+                role in block_keys for role in ("diff", "diff_b", "w_norm", "b_norm", "set_weight")
+            ):
                 layer_map.setdefault(block_name, []).append((idx, block_name))
     return layer_map
 
@@ -128,7 +135,10 @@ def _logical_layer_dtypes(indices, lora_infos, handlers):
     source_dtypes = []
     for idx, orig_block in indices:
         block_keys = lora_infos[idx]["pairs"][orig_block]
-        for name in ("down", "up", "alpha", "diff", "diff_b"):
+        for name in (
+            "down", "up", "alpha", "mid", "reshape", "dora_scale",
+            "diff", "diff_b", "w_norm", "b_norm", "set_weight",
+        ):
             if name in block_keys:
                 source_dtypes.append(handlers[idx].get_dtype(block_keys[name]))
     return source_dtypes
@@ -165,17 +175,35 @@ def _preserve_earliest_layer(writer, indices, lora_infos, handlers, written_keys
     idx, block_name = min(indices, key=lambda item: item[0])
     block_keys = lora_infos[idx]["pairs"][block_name]
     count = 0
-    for name in ("down", "up", "alpha", "diff", "diff_b"):
-        key = block_keys.get(name)
-        if key is None or key in written_keys:
+    for name, key in layer_tensor_keys(block_keys).items():
+        output_key = canonical_lora_key(block_name, name)
+        if output_key in written_keys:
             continue
-        write_preserved_tensor(writer, key, handlers[idx])
-        written_keys.add(key)
+        write_preserved_tensor(writer, key, handlers[idx], output_key)
+        written_keys.add(output_key)
         count += 1
     for key in lora_infos[idx]["passthrough_keys"]:
         if not key.startswith(f"{block_name}.") or key in written_keys:
             continue
         write_preserved_tensor(writer, key, handlers[idx])
+        written_keys.add(key)
+        count += 1
+    return count
+
+
+def _indices_have_companions(indices, lora_infos):
+    return any(
+        layer_has_companions(lora_infos[idx]["pairs"][block_name])
+        for idx, block_name in indices
+    )
+
+
+def _preserve_primary_passthrough(writer, lora_infos, handlers, written_keys):
+    count = 0
+    for key in lora_infos[0]["passthrough_keys"]:
+        if key in written_keys:
+            continue
+        write_preserved_tensor(writer, key, handlers[0])
         written_keys.add(key)
         count += 1
     return count
@@ -276,6 +304,7 @@ def merge_multi_loras(
                 print(f"[LoRA Multi-Merge] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}, format={fmt['format']}")
 
         layer_map = _build_layer_map(lora_infos, base_model_path)
+        validate_canonical_blocks(layer_map, "LoRA Multi-Merge")
         _ensure_guarded_layers_mapped(layer_map, lora_infos)
 
         if verbose:
@@ -286,12 +315,13 @@ def merge_multi_loras(
             "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via concatenation",
             "ss_network_module": "networks.lora",
         }
-        output_dir = folder_paths.get_folder_paths("loras")[0]
+        output_dir = os.path.join(folder_paths.models_dir, "loras")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
         pbar = comfy.utils.ProgressBar(len(layer_map))
         tensor_count = 0
+        preserved_companion_groups = 0
         written_keys = set()
 
         writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
@@ -300,6 +330,13 @@ def merge_multi_loras(
             # 2. Merge each core layer
             with torch.no_grad():
                 for core, indices in tqdm(layer_map.items(), desc="Merging layers", unit="layers"):
+                    if _indices_have_companions(indices, lora_infos):
+                        tensor_count += _preserve_earliest_layer(
+                            writer, indices, lora_infos, handlers, written_keys
+                        )
+                        preserved_companion_groups += 1
+                        pbar.update(1)
+                        continue
                     if _indices_have_low_bit(indices, lora_infos):
                         tensor_count += _preserve_earliest_layer(
                             writer, indices, lora_infos, handlers, written_keys
@@ -393,13 +430,15 @@ def merge_multi_loras(
                     if downs:
                         layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
                         writer.write_dict({
-                            f"{core}.lora_down.weight": merged_down.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.lora_up.weight": merged_up.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.alpha": torch.tensor(new_alpha, dtype=layer_dtype),
+                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "alpha"): torch.tensor(new_alpha, dtype=layer_dtype),
                         })
                         tensor_count += 3
                         written_keys.update({
-                            f"{core}.lora_down.weight", f"{core}.lora_up.weight", f"{core}.alpha"
+                            canonical_lora_key(core, "down"),
+                            canonical_lora_key(core, "up"),
+                            canonical_lora_key(core, "alpha"),
                         })
                         del merged_down, merged_up
                         for d, _ in downs: del d
@@ -407,7 +446,7 @@ def merge_multi_loras(
                         downs.clear()
                         ups.clear()
 
-                    for kind in ("diff", "diff_b"):
+                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
                         direct_inputs, _ = _load_direct_inputs(
                             indices, lora_infos, handlers, kind, device, include_1d_diffs
                         )
@@ -420,11 +459,11 @@ def merge_multi_loras(
                             is_1d_diff=merged_direct.ndim == 1,
                         )
                         writer.write(
-                            f"{core}.{kind}",
+                            canonical_lora_key(core, kind),
                             merged_direct.to(direct_dtype).cpu().contiguous(),
                         )
                         tensor_count += 1
-                        written_keys.add(f"{core}.{kind}")
+                        written_keys.add(canonical_lora_key(core, kind))
                         del merged_direct
                         for tensor, _ in direct_inputs:
                             del tensor
@@ -437,6 +476,14 @@ def merge_multi_loras(
                     pbar.update(1)
                 tensor_count += _preserve_low_bit_auxiliaries(
                     writer, lora_infos, handlers, written_keys
+                )
+                tensor_count += _preserve_primary_passthrough(
+                    writer, lora_infos, handlers, written_keys
+                )
+            if preserved_companion_groups:
+                logging.warning(
+                    "[LoRA Multi-Merge] Preserved %d companion-bearing group(s) from the earliest input",
+                    preserved_companion_groups,
                 )
         finally:
             writer.__exit__(None, None, None)
@@ -698,18 +745,20 @@ def merge_multi_loras_dare(
                 print(f"[LoRA Multi-Merge DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
         layer_map = _build_layer_map(lora_infos, base_model_path)
+        validate_canonical_blocks(layer_map, "LoRA Multi-Merge DARE")
         _ensure_guarded_layers_mapped(layer_map, lora_infos)
 
         if verbose:
             print(f"[LoRA Multi-Merge DARE] Total unique layers after resolving naming: {len(layer_map)}")
 
         # Build output path before loop
-        output_dir = folder_paths.get_folder_paths("loras")[0]
+        output_dir = os.path.join(folder_paths.models_dir, "loras")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
         pbar = comfy.utils.ProgressBar(len(layer_map))
         tensor_count = 0
+        preserved_companion_groups = 0
         written_keys = set()
 
         writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via DARE-Ties"})
@@ -718,6 +767,13 @@ def merge_multi_loras_dare(
             # 2. Merge
             with torch.no_grad():
                 for core, indices in tqdm(layer_map.items(), desc="Merging layers (DARE)", unit="layers"):
+                    if _indices_have_companions(indices, lora_infos):
+                        tensor_count += _preserve_earliest_layer(
+                            writer, indices, lora_infos, handlers, written_keys
+                        )
+                        preserved_companion_groups += 1
+                        pbar.update(1)
+                        continue
                     if _indices_have_low_bit(indices, lora_infos):
                         tensor_count += _preserve_earliest_layer(
                             writer, indices, lora_infos, handlers, written_keys
@@ -790,13 +846,15 @@ def merge_multi_loras_dare(
                         merged_up = process_ties_dare(ups, [1.0]*len(ups), 1)
                         layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
                         writer.write_dict({
-                            f"{core}.lora_down.weight": merged_down.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.lora_up.weight": merged_up.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.alpha": torch.tensor(float(max_rank), dtype=layer_dtype),
+                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "alpha"): torch.tensor(float(max_rank), dtype=layer_dtype),
                         })
                         tensor_count += 3
                         written_keys.update({
-                            f"{core}.lora_down.weight", f"{core}.lora_up.weight", f"{core}.alpha"
+                            canonical_lora_key(core, "down"),
+                            canonical_lora_key(core, "up"),
+                            canonical_lora_key(core, "alpha"),
                         })
                         del merged_down, merged_up
                         for d, _ in downs: del d
@@ -804,7 +862,7 @@ def merge_multi_loras_dare(
                         downs.clear()
                         ups.clear()
 
-                    for kind in ("diff", "diff_b"):
+                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
                         direct_inputs, _ = _load_direct_inputs(
                             indices, lora_infos, handlers, kind, device, include_1d_diffs
                         )
@@ -818,9 +876,9 @@ def merge_multi_loras_dare(
                             save_dtype,
                             is_1d_diff=merged_direct.ndim == 1,
                         )
-                        writer.write(f"{core}.{kind}", merged_direct.to(direct_dtype).cpu().contiguous())
+                        writer.write(canonical_lora_key(core, kind), merged_direct.to(direct_dtype).cpu().contiguous())
                         tensor_count += 1
-                        written_keys.add(f"{core}.{kind}")
+                        written_keys.add(canonical_lora_key(core, kind))
                         del merged_direct
                         for tensor, _ in direct_inputs:
                             del tensor
@@ -832,6 +890,14 @@ def merge_multi_loras_dare(
                     pbar.update(1)
                 tensor_count += _preserve_low_bit_auxiliaries(
                     writer, lora_infos, handlers, written_keys
+                )
+                tensor_count += _preserve_primary_passthrough(
+                    writer, lora_infos, handlers, written_keys
+                )
+            if preserved_companion_groups:
+                logging.warning(
+                    "[LoRA Multi-Merge DARE] Preserved %d companion-bearing group(s) from the earliest input",
+                    preserved_companion_groups,
                 )
         finally:
             writer.__exit__(None, None, None)
@@ -1004,18 +1070,20 @@ def merge_multi_loras_dare_enhanced(
                 print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
 
         layer_map = _build_layer_map(lora_infos, base_model_path)
+        validate_canonical_blocks(layer_map, "LoRA Multi-Merge Enhanced DARE")
         _ensure_guarded_layers_mapped(layer_map, lora_infos)
 
         if verbose:
             print(f"[LoRA Multi-Merge Enhanced DARE] Total unique layers after resolving naming: {len(layer_map)}")
 
         # Build output path before loop
-        output_dir = folder_paths.get_folder_paths("loras")[0]
+        output_dir = os.path.join(folder_paths.models_dir, "loras")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
         pbar = comfy.utils.ProgressBar(len(layer_map))
         tensor_count = 0
+        preserved_companion_groups = 0
         written_keys = set()
 
         writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via Enhanced DARE-Ties"})
@@ -1024,6 +1092,13 @@ def merge_multi_loras_dare_enhanced(
             # 2. Merge
             with torch.no_grad():
                 for core, indices in tqdm(layer_map.items(), desc="Merging layers (Enhanced DARE)", unit="layers"):
+                    if _indices_have_companions(indices, lora_infos):
+                        tensor_count += _preserve_earliest_layer(
+                            writer, indices, lora_infos, handlers, written_keys
+                        )
+                        preserved_companion_groups += 1
+                        pbar.update(1)
+                        continue
                     if _indices_have_low_bit(indices, lora_infos):
                         tensor_count += _preserve_earliest_layer(
                             writer, indices, lora_infos, handlers, written_keys
@@ -1098,13 +1173,15 @@ def merge_multi_loras_dare_enhanced(
                         merged_up = process_ties_dare_enhanced(ups, [1.0]*len(ups), 1)
                         layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
                         writer.write_dict({
-                            f"{core}.lora_down.weight": merged_down.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.lora_up.weight": merged_up.to(layer_dtype).cpu().contiguous(),
-                            f"{core}.alpha": torch.tensor(float(max_rank), dtype=layer_dtype),
+                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
+                            canonical_lora_key(core, "alpha"): torch.tensor(float(max_rank), dtype=layer_dtype),
                         })
                         tensor_count += 3
                         written_keys.update({
-                            f"{core}.lora_down.weight", f"{core}.lora_up.weight", f"{core}.alpha"
+                            canonical_lora_key(core, "down"),
+                            canonical_lora_key(core, "up"),
+                            canonical_lora_key(core, "alpha"),
                         })
                         del merged_down, merged_up
                         for d, _ in downs: del d
@@ -1112,7 +1189,7 @@ def merge_multi_loras_dare_enhanced(
                         downs.clear()
                         ups.clear()
 
-                    for kind in ("diff", "diff_b"):
+                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
                         direct_inputs, _ = _load_direct_inputs(
                             indices, lora_infos, handlers, kind, device, include_1d_diffs
                         )
@@ -1126,9 +1203,9 @@ def merge_multi_loras_dare_enhanced(
                             save_dtype,
                             is_1d_diff=merged_direct.ndim == 1,
                         )
-                        writer.write(f"{core}.{kind}", merged_direct.to(direct_dtype).cpu().contiguous())
+                        writer.write(canonical_lora_key(core, kind), merged_direct.to(direct_dtype).cpu().contiguous())
                         tensor_count += 1
-                        written_keys.add(f"{core}.{kind}")
+                        written_keys.add(canonical_lora_key(core, kind))
                         del merged_direct
                         for tensor, _ in direct_inputs:
                             del tensor
@@ -1140,6 +1217,14 @@ def merge_multi_loras_dare_enhanced(
                     pbar.update(1)
                 tensor_count += _preserve_low_bit_auxiliaries(
                     writer, lora_infos, handlers, written_keys
+                )
+                tensor_count += _preserve_primary_passthrough(
+                    writer, lora_infos, handlers, written_keys
+                )
+            if preserved_companion_groups:
+                logging.warning(
+                    "[LoRA Multi-Merge Enhanced DARE] Preserved %d companion-bearing group(s) from the earliest input",
+                    preserved_companion_groups,
                 )
         finally:
             writer.__exit__(None, None, None)

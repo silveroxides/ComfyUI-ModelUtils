@@ -47,17 +47,23 @@ syntax instead.
 
 ## LoRA behavior
 
-LoRA inputs use the same parser as the resize and multi-merge nodes. This
-includes the repository's plain `.lora_A.weight` / `.lora_B.weight` extraction
-output, already-supported alternative A/B or down/up suffixes, and direct
-`.diff` / `.diff_b` layers.
+LoRA inputs use the same parser as the resize and multi-merge nodes. It accepts
+all seven low-rank A/B spellings recognized by ComfyUI's `LoRAAdapter`, plus
+direct `.diff`, `.diff_b`, `.w_norm`, `.b_norm`, and `.set_weight` layers.
 
-Model A's exact keys and suffix convention are retained. Secondary formats are
-matched by normalized logical layer name. Differing ranks are zero-padded like
-the DARE/TIES mergers: A/down tensors on dimension 0 and B/up tensors on
-dimension 1. An existing Model A alpha key is updated to the resulting maximum
-rank; no alpha key is invented when Model A has none. Incomplete pairs,
-auxiliary tensors, and unrecognized Model A tensors are copied unchanged.
+Recognized diffusion-model outputs use the canonical
+`diffusion_model.<layer>.lora_A.weight` / `.lora_B.weight` convention.
+Secondary formats are matched by normalized logical layer name. Differing
+ranks are zero-padded like the DARE/TIES mergers: A/down tensors on dimension 0
+and B/up tensors on dimension 1. An existing Model A alpha key is updated to
+the resulting maximum rank; no alpha key is invented when Model A has none.
+Similarity alignment operates on paired latent-rank components. A rows and B
+columns share one mapping; fixed input/output feature axes are never reordered.
+Input alpha scaling is absorbed into the B factor before blending, and global
+scale is applied once to the resulting pair rather than once per factor.
+Incomplete pairs and unrecognized Model A tensors are copied unchanged.
+Companion-bearing groups (`lora_mid`, reshape, DoRA, or set-weight) are kept
+atomically from Model A rather than partially transformed.
 
 `include_1d_diffs` is disabled by default. Disabled 1D direct layers preserve
 Model A. Enabled 1D direct layers participate as complete tensors and are
@@ -74,3 +80,16 @@ opened. Files with three or more bare INT8, UINT8, FP8, or FP4 tensors are also
 rejected. One or two isolated low-bit tensors produce one warning per input and
 are preserved without CWB arithmetic; an affected LoRA causes its complete
 logical layer to be preserved.
+
+## Streaming and failure safety
+
+Model parameters and direct patches use fixed-coordinate blending; similarity
+row matching is limited to embeddings and LoRA rank components. Each logical
+layer is loaded, transferred to the processing device, completed, copied back
+to CPU, queued for writing, and released before the next layer. Outputs are
+written to a temporary sibling and atomically published only after every layer
+and asynchronous write succeeds. Failed merges do not replace or finalize the
+requested output. A CUDA OOM retries only the affected layer on CPU after
+releasing the failed GPU working set; failure of that retry aborts atomically.
+Generated files are published under the matching category inside
+`folder_paths.models_dir`, never ComfyUI's general output directory.

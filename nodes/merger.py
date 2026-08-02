@@ -176,8 +176,7 @@ class MergerLogic:
         error_keys = []
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
+        output_dir = os.path.join(folder_paths.models_dir, output_folder)
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
@@ -334,8 +333,7 @@ class MergerLogic:
             handler.__exit__(None, None, None)
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
+        output_dir = os.path.join(folder_paths.models_dir, output_folder)
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")

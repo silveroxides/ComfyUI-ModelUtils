@@ -87,27 +87,31 @@ def inspect_low_bit_input(handler, label: str, operation: str) -> set[str]:
 def layer_has_low_bit(block_keys: dict, low_bit_keys: set[str]) -> bool:
     return any(
         block_keys.get(name) in low_bit_keys
-        for name in ("down", "up", "alpha", "diff", "diff_b")
+        for name in (
+            "down", "up", "alpha", "mid", "reshape", "dora_scale",
+            "diff", "diff_b", "w_norm", "b_norm", "set_weight",
+        )
     )
 
 
-def write_preserved_tensor(writer, key: str, handler) -> None:
+def write_preserved_tensor(writer, key: str, handler, output_key: str | None = None) -> None:
     """Copy one tensor's original safetensors bytes and dtype into an active writer."""
+    destination = output_key or key
     header = _header(handler)
     entry = header[key]
     if entry["dtype"] in UPSTREAM_WRITER_STORAGE_CODES:
-        writer.write(key, handler.get_tensor(key).cpu().contiguous())
+        writer.write(destination, handler.get_tensor(key).cpu().contiguous())
         return
 
     source_start, source_end = entry["data_offsets"]
     byte_size = source_end - source_start
 
     with writer._lock:
-        if key in writer._manifest:
-            raise ValueError(f"Tensor '{key}' has already been written.")
+        if destination in writer._manifest:
+            raise ValueError(f"Tensor '{destination}' has already been written.")
         target_start = writer._current_data_offset
         target_end = target_start + byte_size
-        writer._manifest[key] = {
+        writer._manifest[destination] = {
             "dtype": entry["dtype"],
             "shape": entry["shape"],
             "data_offsets": [target_start, target_end],

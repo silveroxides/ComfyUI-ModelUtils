@@ -590,7 +590,8 @@ def extract_lora_from_files(
             if include_1d_diffs and is_direct_diff:
                 direct_diff_dtype = torch.float32 if weight_diff.ndim == 1 else layer_save_dtype
                 layer_results = {
-                    f"{lora_name}.diff": weight_diff.to(direct_diff_dtype).cpu().contiguous()
+                    _format_direct_diff_key(key, lora_name):
+                        weight_diff.to(direct_diff_dtype).cpu().contiguous()
                 }
                 del weight_diff
                 return "full", layer_results
@@ -735,6 +736,13 @@ def _format_lora_key(key: str) -> str:
 
     # Default fallback
     return f"diffusion_model.{key}"
+
+
+def _format_direct_diff_key(source_key: str, lora_name: str) -> str:
+    """Map a full delta to ComfyUI's canonical direct-patch key."""
+    if source_key.endswith(".bias"):
+        return f"{lora_name[:-5]}.diff_b"
+    return f"{lora_name}.diff"
 
 
 def _get_common_inputs():

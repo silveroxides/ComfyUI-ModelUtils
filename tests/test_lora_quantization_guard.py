@@ -37,6 +37,7 @@ def modules():
 
 def _patch_output(monkeypatch, module, output_dir):
     monkeypatch.setattr(module.folder_paths, "get_folder_paths", lambda _: [str(output_dir)])
+    monkeypatch.setattr(module.folder_paths, "models_dir", str(output_dir))
     monkeypatch.setattr(module, "prepare_for_large_operation", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "cleanup_after_operation", lambda: None)
 
@@ -188,11 +189,11 @@ def test_resize_preserves_complete_low_bit_layer_and_resizes_normal(
         str(source), 1, None, None, "cpu", torch.float16, "resize_guarded", verbose=False
     )
     result = load_file(output)
-    torch.testing.assert_close(result["diffusion_model.guarded.lora_down.weight"], guarded_down)
-    assert result["diffusion_model.guarded.lora_down.weight"].dtype == torch.uint8
-    assert result["diffusion_model.guarded.lora_up.weight"].dtype == torch.float32
+    torch.testing.assert_close(result["diffusion_model.guarded.lora_A.weight"], guarded_down)
+    assert result["diffusion_model.guarded.lora_A.weight"].dtype == torch.uint8
+    assert result["diffusion_model.guarded.lora_B.weight"].dtype == torch.float32
     assert result["diffusion_model.guarded.dora_scale"].dtype == torch.float32
-    assert result["diffusion_model.normal.lora_down.weight"].shape[0] == 1
+    assert result["diffusion_model.normal.lora_A.weight"].shape[0] == 1
     assert result["isolated_aux"].dtype == torch.int8
 
 
@@ -221,6 +222,44 @@ def test_extract_excludes_low_bit_candidate_and_extracts_float_layer(
     result = load_file(str(output))
     assert any("normal" in key for key in result)
     assert not any("quant" in key for key in result)
+
+
+def test_extract_bias_diff_round_trips_through_merge_to_model(
+    monkeypatch, tmp_path, modules
+):
+    extract = modules["extract"]
+    resize = modules["resize"]
+    monkeypatch.setattr(extract, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(extract, "cleanup_after_operation", lambda: None)
+    _patch_output(monkeypatch, resize, tmp_path)
+
+    finetuned = tmp_path / "bias_finetuned.safetensors"
+    base = tmp_path / "bias_base.safetensors"
+    adapter = tmp_path / "bias_adapter.safetensors"
+    save_file({
+        "model.diffusion_model.layer.bias": torch.tensor([0.25, -0.5]),
+    }, str(finetuned))
+    save_file({
+        "model.diffusion_model.layer.bias": torch.tensor([0.0, 0.5]),
+    }, str(base))
+
+    extract.extract_lora_from_files(
+        str(finetuned), str(base), "fixed", 1, 1, "cpu", "fp16", str(adapter),
+        force_clear_cache=False, include_1d_diffs=True,
+    )
+    extracted = load_file(str(adapter))
+    assert set(extracted) == {"diffusion_model.layer.diff_b"}
+    assert extracted["diffusion_model.layer.diff_b"].dtype == torch.float32
+
+    merged_path = resize.merge_loras_to_model(
+        [str(adapter)], [1.0], str(base), "cpu", torch.float32,
+        "bias_round_trip", verbose=False, include_1d_diffs=True,
+    )
+    merged = load_file(merged_path)
+    torch.testing.assert_close(
+        merged["model.diffusion_model.layer.bias"],
+        load_file(str(finetuned))["model.diffusion_model.layer.bias"],
+    )
 
 
 def _run_multi_variant(module, variant, paths, output_name):
@@ -265,9 +304,9 @@ def test_multi_variants_preserve_earliest_complete_affected_layer(
 
     output = _run_multi_variant(multi, variant, [str(first), str(second)], f"guard_{variant}")
     result = load_file(output)
-    torch.testing.assert_close(result["diffusion_model.guarded.lora_down.weight"], first_down)
+    torch.testing.assert_close(result["diffusion_model.guarded.lora_A.weight"], first_down)
     torch.testing.assert_close(
-        result["diffusion_model.guarded.lora_up.weight"], torch.tensor([[3.0], [4.0]])
+        result["diffusion_model.guarded.lora_B.weight"], torch.tensor([[3.0], [4.0]])
     )
     torch.testing.assert_close(
         result["diffusion_model.guarded.dora_scale"], torch.tensor([0.125, 0.25])
@@ -338,6 +377,7 @@ def test_generic_merge_preserves_model_a_when_either_source_key_is_low_bit(
     paths = {"a": str(model_a), "b": str(model_b)}
     monkeypatch.setattr(generic.folder_paths, "get_full_path", lambda _, name: paths[name])
     monkeypatch.setattr(generic.folder_paths, "get_folder_paths", lambda _: [str(tmp_path)])
+    monkeypatch.setattr(generic.folder_paths, "models_dir", str(tmp_path))
     monkeypatch.setattr(generic, "prepare_for_large_operation", lambda *args, **kwargs: None)
     monkeypatch.setattr(generic, "cleanup_after_operation", lambda: None)
     params = _generic_params("generic_guarded")
@@ -347,7 +387,9 @@ def test_generic_merge_preserves_model_a_when_either_source_key_is_low_bit(
         {"model_a": "a", "model_b": "b"}, "Weight-Sum",
         operations.TWO_MODEL_MODES, params, "loras",
     )
-    result = load_file(str(tmp_path / "generic_guarded.safetensors"))
+    result = load_file(
+        str(tmp_path / "loras" / "generic_guarded.safetensors")
+    )
     torch.testing.assert_close(result["a_low"], a_tensors["a_low"])
     torch.testing.assert_close(result["b_low"], a_tensors["b_low"])
     assert result["a_low"].dtype == torch.uint8
@@ -375,9 +417,9 @@ def test_merge_to_model_preserves_low_bit_base_and_skips_low_bit_adapter_layer(
         "diffusion_model.normal.diff": torch.ones((2, 2)),
     }, str(adapter))
 
-    output = resize.merge_loras_to_model(
+    output, report = resize.merge_loras_to_model(
         [str(adapter)], [1.0], str(base), "cpu", torch.float16, "merge_guarded",
-        verbose=False, include_1d_diffs=True,
+        verbose=False, include_1d_diffs=True, return_report=True,
     )
     result = load_file(output)
     torch.testing.assert_close(result["model.diffusion_model.base_quant.weight"], base_quant)
@@ -388,3 +430,8 @@ def test_merge_to_model_preserves_low_bit_base_and_skips_low_bit_adapter_layer(
     torch.testing.assert_close(
         result["model.diffusion_model.normal.weight"].float(), torch.ones((2, 2))
     )
+    assert report.startswith("COMPLETED WITH EXCLUSIONS: 1/2")
+    assert "[GUARDED] (1)" in report
+    assert "diffusion_model.guarded.lora_down.weight" in report
+    assert "torch.int8" in report
+    assert "model.diffusion_model.base_quant.weight" in report

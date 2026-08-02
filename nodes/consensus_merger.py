@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -24,7 +26,14 @@ from .device_utils import (
     estimate_model_size,
     prepare_for_large_operation,
 )
-from .lora_resize import parse_lora_layers, select_output_dtype
+from .lora_resize import (
+    canonical_lora_key,
+    layer_has_companions,
+    layer_tensor_keys,
+    parse_lora_layers,
+    select_output_dtype,
+    validate_canonical_blocks,
+)
 from .merger import (
     _compile_patterns,
     _matches_any_pattern,
@@ -205,7 +214,10 @@ def _position_biased_scores(scores: torch.Tensor, weight: float) -> torch.Tensor
 
 
 def merge_consensus_group(
-    stacked: torch.Tensor, settings: CWBSettings
+    stacked: torch.Tensor,
+    settings: CWBSettings,
+    *,
+    apply_global_scale: bool = True,
 ) -> torch.Tensor:
     """Merge one aligned vector group using CWB."""
     if stacked.shape[0] == 1:
@@ -253,9 +265,30 @@ def merge_consensus_group(
             merged_norm = torch.norm(merged, p=2)
             if merged_norm > 0:
                 merged = (merged / merged_norm) * average_norm
-    if settings.global_scale != 1.0:
+    if apply_global_scale and settings.global_scale != 1.0:
         merged *= settings.global_scale
     return merged
+
+
+def _greedy_similarity_matches(
+    similarities: torch.Tensor,
+    settings: CWBSettings,
+) -> list[int]:
+    """Match source rows to reference rows without duplicating the score matrix."""
+    scores = _position_biased_scores(similarities, settings.position_weight)
+    scores.masked_fill_(similarities < settings.alignment_threshold, -100.0)
+    matched = [-1] * similarities.shape[0]
+    for _ in range(min(similarities.shape)):
+        flat_index = torch.argmax(scores)
+        best = scores.flatten()[flat_index].item()
+        if best <= -100.0:
+            break
+        ref_row = int((flat_index // similarities.shape[1]).item())
+        source_row = int((flat_index % similarities.shape[1]).item())
+        matched[ref_row] = source_row
+        scores[ref_row, :] = -100.0
+        scores[:, source_row] = -100.0
+    return matched
 
 
 def merge_cwb_tensors(
@@ -263,6 +296,7 @@ def merge_cwb_tensors(
     settings: CWBSettings,
     *,
     reference_index: int = 0,
+    allow_similarity_alignment: bool = True,
 ) -> torch.Tensor:
     """CWB tensors with a shared rank and trailing vector dimensions."""
     if not tensors:
@@ -315,7 +349,7 @@ def merge_cwb_tensors(
         if index == adjusted_reference or tensor.shape[0] == 0:
             continue
         flat = tensor.reshape(tensor.shape[0], -1)
-        if settings.alignment_method == "index":
+        if settings.alignment_method == "index" or not allow_similarity_alignment:
             for row in range(min(reference.shape[0], tensor.shape[0])):
                 groups[row].append(tensor[row])
             continue
@@ -324,23 +358,7 @@ def merge_cwb_tensors(
             F.normalize(reference_flat, p=2, dim=1, eps=1e-8),
             F.normalize(flat, p=2, dim=1, eps=1e-8).t(),
         )
-        scores = _position_biased_scores(similarities, settings.position_weight)
-        scores = scores.masked_fill(
-            similarities < settings.alignment_threshold,
-            -100.0,
-        )
-        matched = [-1] * reference.shape[0]
-        working = scores.clone()
-        for _ in range(min(reference.shape[0], tensor.shape[0])):
-            flat_index = torch.argmax(working)
-            best = working.flatten()[flat_index].item()
-            if best <= -100.0:
-                break
-            ref_row = int((flat_index // tensor.shape[0]).item())
-            source_row = int((flat_index % tensor.shape[0]).item())
-            matched[ref_row] = source_row
-            working[ref_row, :] = -100.0
-            working[:, source_row] = -100.0
+        matched = _greedy_similarity_matches(similarities, settings)
         for ref_row, source_row in enumerate(matched):
             if source_row >= 0:
                 groups[ref_row].append(tensor[source_row])
@@ -353,6 +371,113 @@ def merge_cwb_tensors(
     if prefix_length:
         merged = torch.cat([preserved_prefix, merged], dim=0)
     return merged
+
+
+def _common_lora_prefix_length(
+    downs: list[torch.Tensor],
+    ups: list[torch.Tensor],
+    reference_index: int,
+) -> int:
+    reference_down = downs[reference_index]
+    reference_up = ups[reference_index]
+    limit = reference_down.shape[0]
+    common = torch.ones(limit, dtype=torch.bool, device=reference_down.device)
+    for down, up in zip(downs, ups):
+        down_equal = torch.isclose(
+            reference_down, down, rtol=1e-5, atol=1e-6
+        ).reshape(limit, -1).all(dim=1)
+        up_equal = torch.isclose(
+            reference_up.movedim(1, 0),
+            up.movedim(1, 0),
+            rtol=1e-5,
+            atol=1e-6,
+        ).reshape(limit, -1).all(dim=1)
+        common &= down_equal & up_equal
+    mismatch = torch.nonzero(~common, as_tuple=False)
+    return limit if mismatch.numel() == 0 else int(mismatch[0].item())
+
+
+def merge_cwb_lora_pairs(
+    downs: list[torch.Tensor],
+    ups: list[torch.Tensor],
+    settings: CWBSettings,
+    *,
+    reference_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CWB LoRA rank components while keeping A rows paired with B columns."""
+    if not downs or len(downs) != len(ups):
+        raise ValueError("CWB requires matching LoRA A/B source lists.")
+    rank = downs[reference_index].shape[0]
+    if any(down.shape[0] != rank or up.shape[1] != rank for down, up in zip(downs, ups)):
+        raise ValueError("CWB LoRA sources must be padded to one shared rank.")
+
+    prefix = (
+        _common_lora_prefix_length(downs, ups, reference_index)
+        if settings.preserve_common_prefix else 0
+    )
+    reference_down = downs[reference_index]
+    reference_up = ups[reference_index]
+    reference_up_components = reference_up.movedim(1, 0)
+    down_groups = [[reference_down[row]] for row in range(prefix, rank)]
+    up_groups = [[reference_up_components[row]] for row in range(prefix, rank)]
+
+    ref_down_body = reference_down[prefix:].reshape(rank - prefix, -1)
+    ref_up_body = reference_up_components[prefix:].reshape(rank - prefix, -1)
+    for index, (down, up) in enumerate(zip(downs, ups)):
+        if index == reference_index or not down_groups:
+            continue
+        source_down_components = down[prefix:]
+        source_up_components = up.movedim(1, 0)[prefix:]
+        source_down = source_down_components.reshape(rank - prefix, -1)
+        source_up = source_up_components.reshape(rank - prefix, -1)
+        if settings.alignment_method == "index":
+            matched = list(range(source_down.shape[0]))
+            down_similarities = up_similarities = None
+        else:
+            down_similarities = torch.mm(
+                F.normalize(ref_down_body, p=2, dim=1, eps=1e-8),
+                F.normalize(source_down, p=2, dim=1, eps=1e-8).T,
+            )
+            up_similarities = torch.mm(
+                F.normalize(ref_up_body, p=2, dim=1, eps=1e-8),
+                F.normalize(source_up, p=2, dim=1, eps=1e-8).T,
+            )
+            contribution_similarities = down_similarities * up_similarities
+            matched = _greedy_similarity_matches(contribution_similarities, settings)
+
+        for ref_row, source_row in enumerate(matched):
+            if source_row < 0 or ref_row >= len(down_groups):
+                continue
+            source_down_row = source_down_components[source_row]
+            source_up_column = source_up_components[source_row]
+            if (
+                down_similarities is not None
+                and down_similarities[ref_row, source_row] < 0
+                and up_similarities[ref_row, source_row] < 0
+            ):
+                source_down_row = -source_down_row
+                source_up_column = -source_up_column
+            down_groups[ref_row].append(source_down_row)
+            up_groups[ref_row].append(source_up_column)
+
+    merged_down_rows = [
+        merge_consensus_group(
+            torch.stack([component.reshape(-1) for component in group]),
+            settings,
+            apply_global_scale=False,
+        ).reshape(group[0].shape)
+        for group in down_groups
+    ]
+    merged_up_columns = [
+        merge_consensus_group(
+            torch.stack([component.reshape(-1) for component in group]), settings
+        ).reshape(group[0].shape)
+        for group in up_groups
+    ]
+    if prefix:
+        merged_down_rows = [*reference_down[:prefix], *merged_down_rows]
+        merged_up_columns = [*reference_up_components[:prefix], *merged_up_columns]
+    return torch.stack(merged_down_rows), torch.stack(merged_up_columns).movedim(0, 1)
 
 
 def _copy_to_target_shape(tensor: torch.Tensor, target: torch.Size) -> torch.Tensor | None:
@@ -371,6 +496,120 @@ def _to_compute(tensor: torch.Tensor, device: str) -> torch.Tensor:
     if device == "cuda":
         return transfer_to_gpu_pinned(tensor, device, torch.float32)
     return tensor.to(device=device, dtype=torch.float32)
+
+
+def _release_failed_cuda_operation() -> None:
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _merge_tensors_to_cpu(
+    tensors: list[torch.Tensor],
+    settings: CWBSettings,
+    device: str,
+    target_dtype: torch.dtype,
+    *,
+    reference_index: int = 0,
+    allow_similarity_alignment: bool,
+    operation_label: str = "tensor",
+) -> torch.Tensor:
+    """Own one tensor operation's GPU lifetime and return only its CPU result."""
+    def execute(target_device: str) -> torch.Tensor:
+        compute_tensors = [_to_compute(tensor, target_device) for tensor in tensors]
+        try:
+            merged = merge_cwb_tensors(
+                compute_tensors,
+                settings,
+                reference_index=reference_index,
+                allow_similarity_alignment=allow_similarity_alignment,
+            )
+            return merged.to(target_dtype).cpu().contiguous()
+        finally:
+            del compute_tensors
+
+    try:
+        return execute(device)
+    except torch.OutOfMemoryError:
+        if not str(device).startswith("cuda"):
+            raise
+        _release_failed_cuda_operation()
+        logging.warning(
+            "[CWB Merge] CUDA OOM for '%s'; retrying this layer on CPU.",
+            operation_label,
+        )
+        return execute("cpu")
+
+
+def _merge_lora_pair_to_cpu(
+    pair_sources: list[tuple[int, torch.Tensor, torch.Tensor, float]],
+    settings: CWBSettings,
+    device: str,
+    target_dtype: torch.dtype,
+    operation_label: str = "LoRA pair",
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Own one LoRA pair operation's GPU lifetime and return CPU A/B tensors."""
+    max_rank = max(down.shape[0] for _, down, _, _ in pair_sources)
+    reference_index = max(
+        range(len(pair_sources)),
+        key=lambda index: pair_sources[index][1].shape[0],
+    )
+    def execute(target_device: str) -> tuple[torch.Tensor, torch.Tensor, int]:
+        downs = [
+            _to_compute(_pad_rank_axis(down, 0, max_rank), target_device)
+            for _, down, _, _ in pair_sources
+        ]
+        ups = [
+            _to_compute(_pad_rank_axis(up, 1, max_rank), target_device) * scale
+            for _, _, up, scale in pair_sources
+        ]
+        try:
+            merged_down, merged_up = merge_cwb_lora_pairs(
+                downs,
+                ups,
+                settings,
+                reference_index=reference_index,
+            )
+            return (
+                merged_down.to(target_dtype).cpu().contiguous(),
+                merged_up.to(target_dtype).cpu().contiguous(),
+                max_rank,
+            )
+        finally:
+            del downs, ups
+
+    try:
+        return execute(device)
+    except torch.OutOfMemoryError:
+        if not str(device).startswith("cuda"):
+            raise
+        _release_failed_cuda_operation()
+        logging.warning(
+            "[CWB Merge] CUDA OOM for '%s'; retrying this layer on CPU.",
+            operation_label,
+        )
+        return execute("cpu")
+
+
+@contextmanager
+def _atomic_output_writer(output_path: str, metadata: dict):
+    """Publish a completed safetensors file atomically and remove failed partials."""
+    directory = os.path.dirname(output_path) or "."
+    basename = os.path.basename(output_path)
+    temporary_path = os.path.join(directory, f".{basename}.{uuid.uuid4().hex}.tmp")
+    try:
+        with IncrementalSafetensorsWriter(temporary_path, metadata=metadata) as writer:
+            yield writer
+        os.replace(temporary_path, output_path)
+        logging.info("[CWB Merge] Published '%s'.", output_path)
+    except BaseException:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _clear_previous_layer(params: dict) -> None:
@@ -481,7 +720,7 @@ class ConsensusMergerLogic:
 
     @staticmethod
     def _output_path(model_type: str, output_filename: str) -> str:
-        output_dir = folder_paths.get_folder_paths(model_type)[-1]
+        output_dir = os.path.join(folder_paths.models_dir, model_type)
         os.makedirs(output_dir, exist_ok=True)
         return os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
@@ -510,8 +749,8 @@ class ConsensusMergerLogic:
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         pbar = comfy.utils.ProgressBar(len(keys))
 
-        writer = IncrementalSafetensorsWriter(output_path, metadata=primary.metadata())
-        writer.__enter__()
+        writer_context = _atomic_output_writer(output_path, primary.metadata())
+        writer = writer_context.__enter__()
         try:
             with torch.no_grad():
                 for key in tqdm(keys, desc="CWB merging tensors", unit="tensors"):
@@ -570,7 +809,6 @@ class ConsensusMergerLogic:
                                 tensors.append(torch.zeros(
                                     reference_shape,
                                     dtype=torch.float32,
-                                    device=params["process_device"],
                                 ))
                             continue
                         aligned = raw[source_index]
@@ -587,37 +825,45 @@ class ConsensusMergerLogic:
                                 tensors.append(torch.zeros(
                                     reference_shape,
                                     dtype=torch.float32,
-                                    device=params["process_device"],
                                 ))
                             continue
                         if source_index == reference_source:
                             reference_index = len(tensors)
-                        tensors.append(_to_compute(aligned, params["process_device"]))
+                        tensors.append(aligned)
                         actual_dtypes.append(handler.get_dtype(key))
 
                     if not tensors:
                         pbar.update(1)
                         continue
-                    merged = merge_cwb_tensors(
-                        tensors,
-                        settings,
-                        reference_index=reference_index,
-                    )
                     target_dtype = select_output_dtype(
                         actual_dtypes,
                         requested_dtype,
                         force=params["override_dtype"],
                     )
-                    writer.write(key, merged.to(target_dtype).cpu().contiguous())
+                    merged = _merge_tensors_to_cpu(
+                        tensors,
+                        settings,
+                        params["process_device"],
+                        target_dtype,
+                        reference_index=reference_index,
+                        allow_similarity_alignment=embedding_union,
+                        operation_label=key,
+                    )
+                    writer.write(key, merged)
+                    del merged
                     pbar.update(1)
-        finally:
-            writer.__exit__(None, None, None)
+        except BaseException as exc:
+            writer_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            writer_context.__exit__(None, None, None)
         return os.path.basename(output_path)
 
     @classmethod
     def _merge_loras(cls, handlers, low_bit_sets, model_type, params, settings):
         parsed = [parse_lora_layers(handler.keys()) for handler in handlers]
         primary_pairs, primary_passthrough = parsed[0]
+        validate_canonical_blocks(primary_pairs, "CWB LoRA Merge")
         secondary_maps = [_secondary_lora_map(pairs) for pairs, _ in parsed]
         output_path = cls._output_path(model_type, params["output_filename"])
         requested_dtype = _requested_dtype(params["save_dtype"])
@@ -627,6 +873,7 @@ class ConsensusMergerLogic:
         exclude = _compile_patterns(params["exclude_patterns"], glob_mode=glob_mode)
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         written = set()
+        preserved_companion_groups = 0
         pbar = comfy.utils.ProgressBar(len(primary_pairs) + len(primary_passthrough))
 
         def preserve_keys(writer, keys: Iterable[str]):
@@ -635,8 +882,32 @@ class ConsensusMergerLogic:
                     write_preserved_tensor(writer, key, handlers[0])
                     written.add(key)
 
-        writer = IncrementalSafetensorsWriter(output_path, metadata=handlers[0].metadata())
-        writer.__enter__()
+        def preserve_roles(writer, block_name: str, keys: dict[str, str], roles):
+            recognized_sources = set()
+            for role, source_key in layer_tensor_keys(keys).items():
+                if role not in roles:
+                    continue
+                output_key = canonical_lora_key(block_name, role)
+                recognized_sources.add(source_key)
+                if output_key not in written:
+                    write_preserved_tensor(writer, source_key, handlers[0], output_key)
+                    written.add(output_key)
+            return recognized_sources
+
+        def preserve_layer(writer, block_name: str, keys: dict[str, str]):
+            recognized_sources = preserve_roles(
+                writer, block_name, keys, layer_tensor_keys(keys)
+            )
+            preserve_keys(
+                writer,
+                (
+                    key for key in handlers[0].keys()
+                    if key.startswith(f"{block_name}.") and key not in recognized_sources
+                ),
+            )
+
+        writer_context = _atomic_output_writer(output_path, handlers[0].metadata())
+        writer = writer_context.__enter__()
         try:
             with torch.no_grad():
                 for primary_block, primary_keys in tqdm(
@@ -664,8 +935,17 @@ class ConsensusMergerLogic:
                         _matches_any_pattern(key, exclude, glob_mode=glob_mode)
                         for key in layer_keys
                     )
+                    companion_bearing = any(
+                        keys is not None and layer_has_companions(keys)
+                        for _, _, keys in matches
+                    )
+                    if companion_bearing:
+                        preserve_layer(writer, primary_block, primary_keys)
+                        preserved_companion_groups += 1
+                        pbar.update(1)
+                        continue
                     if guarded or excluded:
-                        preserve_keys(writer, layer_keys)
+                        preserve_layer(writer, primary_block, primary_keys)
                         pbar.update(1)
                         continue
 
@@ -694,6 +974,7 @@ class ConsensusMergerLogic:
                                     index,
                                     torch.zeros_like(primary_down_template),
                                     torch.zeros_like(primary_up_template),
+                                    1.0,
                                 ))
                                 continue
                             down = handlers[index].get_tensor(keys["down"])
@@ -708,18 +989,25 @@ class ConsensusMergerLogic:
                                     index,
                                     torch.zeros_like(primary_down_template),
                                     torch.zeros_like(primary_up_template),
+                                    1.0,
                                 ))
                                 continue
-                            pair_sources.append((index, down, up))
+                            scale = 1.0
+                            if "alpha" in keys:
+                                alpha = handlers[index].get_tensor(keys["alpha"])
+                                if alpha.numel() != 1:
+                                    raise ValueError(
+                                        f"LoRA alpha for '{primary_block}' must be scalar."
+                                    )
+                                scale = float(alpha.reshape(-1)[0].item()) / down.shape[0]
+                            pair_sources.append((index, down, up, scale))
                         if pair_failed:
-                            preserve_keys(writer, [primary_keys["down"], primary_keys["up"]])
-                            if "alpha" in primary_keys:
-                                preserve_keys(writer, [primary_keys["alpha"]])
+                            preserve_roles(writer, primary_block, primary_keys, {"down", "up", "alpha"})
                         elif pair_sources:
                             primary_down = pair_sources[0][1]
                             primary_up = pair_sources[0][2]
                             compatible = []
-                            for index, down, up in pair_sources:
+                            for index, down, up, scale in pair_sources:
                                 valid = (
                                     tuple(down.shape[1:]) == tuple(primary_down.shape[1:])
                                     and up.shape[0] == primary_up.shape[0]
@@ -735,53 +1023,55 @@ class ConsensusMergerLogic:
                                         index,
                                         torch.zeros_like(primary_down),
                                         torch.zeros_like(primary_up),
+                                        1.0,
                                     ))
                                     continue
-                                compatible.append((index, down, up))
+                                compatible.append((index, down, up, scale))
                             if not compatible:
-                                preserve_keys(writer, [primary_keys["down"], primary_keys["up"]])
-                                if "alpha" in primary_keys:
-                                    preserve_keys(writer, [primary_keys["alpha"]])
+                                preserve_roles(writer, primary_block, primary_keys, {"down", "up", "alpha"})
                             else:
-                                max_rank = max(down.shape[0] for _, down, _ in compatible)
-                                downs = [
-                                    _to_compute(_pad_rank_axis(down, 0, max_rank), params["process_device"])
-                                    for _, down, _ in compatible
-                                ]
-                                ups = [
-                                    _to_compute(_pad_rank_axis(up, 1, max_rank), params["process_device"])
-                                    for _, _, up in compatible
-                                ]
-                                merged_down = merge_cwb_tensors(downs, settings)
-                                merged_up = merge_cwb_tensors(ups, settings)
                                 target_dtype = select_output_dtype(
                                     logical_dtypes,
                                     requested_dtype,
                                     force=params["override_dtype"],
                                 )
-                                writer.write(
-                                    primary_keys["down"],
-                                    merged_down.to(target_dtype).cpu().contiguous(),
+                                merged_down, merged_up, max_rank = _merge_lora_pair_to_cpu(
+                                    compatible,
+                                    settings,
+                                    params["process_device"],
+                                    target_dtype,
+                                    operation_label=primary_block,
                                 )
                                 writer.write(
-                                    primary_keys["up"],
-                                    merged_up.to(target_dtype).cpu().contiguous(),
+                                    canonical_lora_key(primary_block, "down"),
+                                    merged_down,
                                 )
-                                written.update({primary_keys["down"], primary_keys["up"]})
+                                writer.write(
+                                    canonical_lora_key(primary_block, "up"),
+                                    merged_up,
+                                )
+                                del merged_down, merged_up
+                                written.update({
+                                    canonical_lora_key(primary_block, "down"),
+                                    canonical_lora_key(primary_block, "up"),
+                                })
                                 if "alpha" in primary_keys:
                                     writer.write(
-                                        primary_keys["alpha"],
+                                        canonical_lora_key(primary_block, "alpha"),
                                         torch.tensor(float(max_rank), dtype=target_dtype),
                                     )
-                                    written.add(primary_keys["alpha"])
+                                    written.add(canonical_lora_key(primary_block, "alpha"))
 
-                    for kind in ("diff", "diff_b"):
+                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
                         if kind not in primary_keys:
                             continue
                         primary_key = primary_keys[kind]
+                        output_key = canonical_lora_key(primary_block, kind)
                         primary_tensor = handlers[0].get_tensor(primary_key)
                         if primary_tensor.ndim == 1 and not include_1d:
-                            preserve_keys(writer, [primary_key])
+                            if output_key not in written:
+                                write_preserved_tensor(writer, primary_key, handlers[0], output_key)
+                                written.add(output_key)
                             continue
                         direct = []
                         direct_dtypes = []
@@ -793,7 +1083,7 @@ class ConsensusMergerLogic:
                                 if mismatch_mode == "skip":
                                     failed = True
                                     break
-                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32, device=params["process_device"]))
+                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32))
                                 continue
                             tensor = handlers[index].get_tensor(keys[kind])
                             if tensor.shape != primary_tensor.shape:
@@ -802,24 +1092,34 @@ class ConsensusMergerLogic:
                                 if mismatch_mode == "skip":
                                     failed = True
                                     break
-                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32, device=params["process_device"]))
+                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32))
                                 continue
-                            direct.append(_to_compute(tensor, params["process_device"]))
+                            direct.append(tensor)
                             direct_dtypes.append(handlers[index].get_dtype(keys[kind]))
                         if failed:
-                            preserve_keys(writer, [primary_key])
+                            if output_key not in written:
+                                write_preserved_tensor(writer, primary_key, handlers[0], output_key)
+                                written.add(output_key)
                             continue
-                        merged = merge_cwb_tensors(direct, settings)
                         target_dtype = select_output_dtype(
                             direct_dtypes,
                             requested_dtype,
                             force=params["override_dtype"],
-                            is_1d_diff=merged.ndim == 1,
+                            is_1d_diff=primary_tensor.ndim == 1,
                         )
-                        writer.write(primary_key, merged.to(target_dtype).cpu().contiguous())
-                        written.add(primary_key)
+                        merged = _merge_tensors_to_cpu(
+                            direct,
+                            settings,
+                            params["process_device"],
+                            target_dtype,
+                            allow_similarity_alignment=False,
+                            operation_label=output_key,
+                        )
+                        writer.write(output_key, merged)
+                        del merged
+                        written.add(output_key)
 
-                    preserve_keys(writer, [key for key in layer_keys if key not in written])
+                    preserve_layer(writer, primary_block, primary_keys)
                     pbar.update(1)
 
                 for key in primary_passthrough:
@@ -831,8 +1131,16 @@ class ConsensusMergerLogic:
                         continue
                     preserve_keys(writer, [key])
                     pbar.update(1)
-        finally:
-            writer.__exit__(None, None, None)
+        except BaseException as exc:
+            writer_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            writer_context.__exit__(None, None, None)
+        if preserved_companion_groups:
+            logging.warning(
+                "[CWB LoRA Merge] Preserved %d companion-bearing Model-A group(s)",
+                preserved_companion_groups,
+            )
         return os.path.basename(output_path)
 
 
