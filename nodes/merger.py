@@ -12,6 +12,8 @@ from .device_utils import (
 )
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from .quantization_guard import inspect_low_bit_input, write_preserved_tensor
+from .lora_resize import is_direct_diff_key
 
 
 def load_documentation_from_file(filename):
@@ -105,6 +107,18 @@ class MergerLogic:
         all_keys = primary_handler.keys()
         metadata = primary_handler.metadata()
 
+        low_bit_keys_by_name = {}
+        if model_type == "loras":
+            try:
+                for name, handler in handlers.items():
+                    low_bit_keys_by_name[name] = inspect_low_bit_input(
+                        handler, f"LoRA ({name})", "Generic LoRA Merge"
+                    )
+            except Exception:
+                for handler in handlers.values():
+                    handler.__exit__(None, None, None)
+                raise
+
         # Convert mismatch_mode string to enum
         mismatch_mode_str = recipe_params.get('mismatch_mode', 'skip')
         mismatch_mode = MissingTensorBehavior(mismatch_mode_str)
@@ -133,6 +147,7 @@ class MergerLogic:
         save_dtype = recipe_params.pop('save_dtype')
         save_torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(save_dtype)
         override_dtype = recipe_params.pop('override_dtype', False)
+        include_1d_diffs = recipe_params.pop('include_1d_diffs', False)
 
         def determine_target_dtype(original_dtypes, target_dtype, override):
             if override:
@@ -161,8 +176,7 @@ class MergerLogic:
         error_keys = []
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
+        output_dir = os.path.join(folder_paths.models_dir, output_folder)
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
@@ -193,6 +207,14 @@ class MergerLogic:
 
         with torch.no_grad():
             for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
+                preserve_low_bit = model_type == "loras" and any(
+                    key in low_bit_keys for low_bit_keys in low_bit_keys_by_name.values()
+                )
+                if preserve_low_bit:
+                    _flush_batch()
+                    write_preserved_tensor(writer, key, primary_handler)
+                    pbar.update(1)
+                    continue
                 # Check discard patterns first - skip entirely
                 if _matches_any_pattern(key, discard_patterns, glob_mode=glob_mode):
                     discarded_keys += 1
@@ -208,6 +230,13 @@ class MergerLogic:
                         original_dtypes.append(handler.get_dtype(key))
 
                 target_dtype = determine_target_dtype(original_dtypes, save_torch_dtype, override_dtype)
+                preserve_model_a_1d = model_type == "loras" and cpu_tensor.ndim == 1 and not include_1d_diffs
+                if preserve_model_a_1d:
+                    target_dtype = determine_target_dtype(
+                        [primary_handler.get_dtype(key)], save_torch_dtype, override_dtype
+                    )
+                elif model_type == "loras" and is_direct_diff_key(key) and cpu_tensor.ndim == 1:
+                    target_dtype = torch.float32
 
                 if process_device == 'cuda':
                     tensor_a = transfer_to_gpu_pinned(cpu_tensor, process_device, process_dtype)
@@ -216,13 +245,14 @@ class MergerLogic:
                 del cpu_tensor
 
                 # Check exclude patterns - use Model A only, no merge
-                if _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode):
+                if preserve_model_a_1d or _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode):
                     t = tensor_a.detach().to(target_dtype).cpu()
 
                     batch_buffer[key] = t
                     batch_bytes += t.numel() * t.element_size()
                     batch_key_count += 1
-                    excluded_keys += 1
+                    if not preserve_model_a_1d:
+                        excluded_keys += 1
                     del tensor_a
                     if (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
                         _flush_batch()
@@ -303,8 +333,7 @@ class MergerLogic:
             handler.__exit__(None, None, None)
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-        output_dir = folder_paths.get_folder_paths(output_folder)[-1]
+        output_dir = os.path.join(folder_paths.models_dir, output_folder)
         os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
@@ -549,7 +578,9 @@ class LoRATwoMerger(io.ComfyNode):
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
-                io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
+                io.Boolean.Input("include_1d_diffs", default=False,
+                                 tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -562,7 +593,8 @@ class LoRATwoMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool,
+                include_1d_diffs: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -576,6 +608,7 @@ class LoRATwoMerger(io.ComfyNode):
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
+            "include_1d_diffs": include_1d_diffs,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
         filename = MergerLogic.execute_merge(model_names, calc_mode, TWO_MODEL_MODES, recipe_params, cls.MODEL_TYPE)
@@ -885,7 +918,9 @@ class LoRAThreeMerger(io.ComfyNode):
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
-                io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
+                io.Boolean.Input("include_1d_diffs", default=False,
+                                 tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
             ],
             outputs=[
                 io.String.Output(display_name="output_filename"),
@@ -898,7 +933,8 @@ class LoRAThreeMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool,
+                include_1d_diffs: bool) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -912,6 +948,7 @@ class LoRAThreeMerger(io.ComfyNode):
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
+            "include_1d_diffs": include_1d_diffs,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
         filename = MergerLogic.execute_merge(model_names, calc_mode, THREE_MODEL_MODES, recipe_params, cls.MODEL_TYPE)

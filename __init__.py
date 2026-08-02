@@ -20,6 +20,7 @@ from .nodes.merger import (
     ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
     CheckpointThreeMerger, EmbeddingThreeMerger
 )
+from .nodes.consensus_merger import CWB_MERGER_NODES
 from .nodes.lora_extract_svd import (
     LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
     LoRAExtractKnee, LoRAExtractFrobenius
@@ -68,6 +69,8 @@ class ModelUtilsExtension(ComfyExtension):
             # Three-Model Mergers
             ModelThreeMerger, TextEncoderThreeMerger, LoRAThreeMerger,
             CheckpointThreeMerger, EmbeddingThreeMerger,
+            # Dedicated CWB Mergers
+            *CWB_MERGER_NODES,
             # LoRA Extraction
             LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
             LoRAExtractKnee, LoRAExtractFrobenius,
