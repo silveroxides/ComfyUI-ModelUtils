@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-ModelUtils"
 description = "[WIP]Custom nodes for handling, inspecting, modifying and creating various model files."
-version = "0.5.1"
+version = "0.5.2"
 license = { file = "LICENSE" }
 
 classifiers = [
@@ -15,8 +15,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = { file = ["requirements.txt"] }
-
 [project.urls]
 Repository = "https://github.com/silveroxides/ComfyUI-ModelUtils"
 #  Used by Comfy Registry https://comfyregistry.org
