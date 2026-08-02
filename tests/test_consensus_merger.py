@@ -337,7 +337,7 @@ def test_all_ten_schemas_and_lora_switch_contract(cwb):
             assert "include_1d_diffs" not in ids
 
 
-def test_model_a_anchored_streaming_dtype_and_nonfloat_preservation(
+def test_streaming_dtype_nonfloat_and_secondary_preservation(
     monkeypatch, tmp_path, cwb
 ):
     a = tmp_path / "a.safetensors"
@@ -359,11 +359,12 @@ def test_model_a_anchored_streaming_dtype_and_nonfloat_preservation(
         ["a", "b"], "diffusion_models", _params("anchored")
     )
     tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
-    assert set(tensors) == {"shared", "only_a", "metadata_tensor"}
+    assert set(tensors) == {"shared", "only_a", "extra", "metadata_tensor"}
     torch.testing.assert_close(tensors["shared"], torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
     assert tensors["shared"].dtype == torch.float32
     torch.testing.assert_close(tensors["only_a"], torch.tensor([5.0, 6.0], dtype=torch.float16))
     torch.testing.assert_close(tensors["metadata_tensor"], torch.tensor([1, 2]))
+    torch.testing.assert_close(tensors["extra"], torch.ones((2, 2)))
 
     overridden = cwb.ConsensusMergerLogic.execute(
         ["a", "b"],
@@ -442,6 +443,97 @@ def test_three_input_streaming_merge(monkeypatch, tmp_path, cwb):
     torch.testing.assert_close(tensor, torch.tensor([[3.0, 0.0]]))
 
 
+def test_two_input_preserves_secondary_only_tensor_exactly(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "secondary_a.safetensors"
+    b = tmp_path / "secondary_b.safetensors"
+    save_file({"shared": torch.tensor([1.0])}, str(a))
+    save_file({
+        "shared": torch.tensor([1.0]),
+        "secondary": torch.tensor([2.0, 3.0], dtype=torch.float32),
+    }, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "diffusion_models",
+        _params(
+            "secondary_exact",
+            global_scale=2.0,
+            override_dtype=True,
+            save_dtype="fp16",
+        ),
+    )
+    tensor = load_file(str(_result_path(tmp_path, "diffusion_models", result)))["secondary"]
+    torch.testing.assert_close(tensor, torch.tensor([2.0, 3.0]))
+    assert tensor.dtype == torch.float32
+
+
+def test_three_input_merges_available_secondary_sources(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "union_a.safetensors"
+    b = tmp_path / "union_b.safetensors"
+    c = tmp_path / "union_c.safetensors"
+    save_file({"shared": torch.tensor([1.0])}, str(a))
+    save_file({
+        "shared": torch.tensor([1.0]),
+        "secondary_shared": torch.tensor([2.0]),
+        "b_only": torch.tensor([7.0]),
+    }, str(b))
+    save_file({
+        "shared": torch.tensor([1.0]),
+        "secondary_shared": torch.tensor([4.0]),
+        "c_only": torch.tensor([9.0]),
+    }, str(c))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b), "c": str(c)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b", "c"], "diffusion_models", _params("secondary_union")
+    )
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
+    torch.testing.assert_close(tensors["secondary_shared"], torch.tensor([3.0]))
+    torch.testing.assert_close(tensors["b_only"], torch.tensor([7.0]))
+    torch.testing.assert_close(tensors["c_only"], torch.tensor([9.0]))
+
+
+def test_secondary_shape_conflict_skip_preserves_earliest_source(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "shape_a.safetensors"
+    b = tmp_path / "shape_b.safetensors"
+    c = tmp_path / "shape_c.safetensors"
+    save_file({"shared": torch.tensor([1.0])}, str(a))
+    save_file({"secondary": torch.tensor([2.0, 3.0])}, str(b))
+    save_file({"secondary": torch.tensor([[8.0, 9.0]])}, str(c))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b), "c": str(c)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b", "c"],
+        "diffusion_models",
+        _params("secondary_shape_skip", mismatch_mode="skip"),
+    )
+    tensor = load_file(str(_result_path(tmp_path, "diffusion_models", result)))["secondary"]
+    torch.testing.assert_close(tensor, torch.tensor([2.0, 3.0]))
+
+
+def test_secondary_only_filters_and_low_bit_preservation(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "filter_a.safetensors"
+    b = tmp_path / "filter_b.safetensors"
+    save_file({"shared": torch.tensor([1.0])}, str(a))
+    save_file({
+        "secondary.keep": torch.tensor([4, 5], dtype=torch.uint8),
+        "secondary.drop": torch.tensor([6.0]),
+    }, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "diffusion_models",
+        _params("secondary_filters", discard_patterns=r"secondary\.drop"),
+    )
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
+    assert "secondary.drop" not in tensors
+    torch.testing.assert_close(
+        tensors["secondary.keep"], torch.tensor([4, 5], dtype=torch.uint8)
+    )
+
+
 def test_lora_cross_format_companion_group_preserves_model_a_canonically(
     monkeypatch, tmp_path, cwb
 ):
@@ -468,6 +560,8 @@ def test_lora_cross_format_companion_group_preserves_model_a_canonically(
         "diffusion_model.foo.lora_A.weight",
         "diffusion_model.foo.lora_B.weight",
         "diffusion_model.foo.dora_scale",
+        "lora_unet_secondary.lora_A.weight",
+        "lora_unet_secondary.lora_B.weight",
     }
     assert tensors["diffusion_model.foo.lora_A.weight"].shape == (1, 2)
     assert tensors["diffusion_model.foo.lora_B.weight"].shape == (2, 1)
@@ -475,6 +569,126 @@ def test_lora_cross_format_companion_group_preserves_model_a_canonically(
     torch.testing.assert_close(
         tensors["diffusion_model.foo.dora_scale"], torch.tensor([1.0, 1.0])
     )
+    torch.testing.assert_close(
+        tensors["lora_unet_secondary.lora_A.weight"], torch.ones((1, 2))
+    )
+    torch.testing.assert_close(
+        tensors["lora_unet_secondary.lora_B.weight"], torch.ones((2, 1))
+    )
+
+
+def test_lora_secondary_only_pair_is_preserved_without_scaling(
+    monkeypatch, tmp_path, cwb
+):
+    a = tmp_path / "lora_secondary_a.safetensors"
+    b = tmp_path / "lora_secondary_b.safetensors"
+    save_file({
+        "diffusion_model.base.diff": torch.tensor([[1.0]]),
+    }, str(a))
+    save_file({
+        "transformer.extra.lora_down.weight": torch.tensor([[2.0, 3.0]]),
+        "transformer.extra.lora_up.weight": torch.tensor([[4.0], [5.0]]),
+        "transformer.extra.alpha": torch.tensor(1.0),
+    }, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "loras",
+        _params(
+            "lora_secondary_exact",
+            global_scale=2.0,
+            override_dtype=True,
+            save_dtype="fp16",
+        ),
+        lora_mode=True,
+    )
+    tensors = load_file(str(_result_path(tmp_path, "loras", result)))
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_A.weight"],
+        torch.tensor([[2.0, 3.0]]),
+    )
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_B.weight"],
+        torch.tensor([[4.0], [5.0]]),
+    )
+    assert tensors["diffusion_model.extra.lora_A.weight"].dtype == torch.float32
+    assert tensors["diffusion_model.extra.alpha"].item() == pytest.approx(1.0)
+
+
+def test_lora_three_input_merges_b_and_c_group_without_a(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "lora_union_a.safetensors"
+    b = tmp_path / "lora_union_b.safetensors"
+    c = tmp_path / "lora_union_c.safetensors"
+    save_file({"diffusion_model.base.diff": torch.tensor([[1.0]])}, str(a))
+    save_file({
+        "diffusion_model.extra.lora_A.weight": torch.full((1, 2), 1.0),
+        "diffusion_model.extra.lora_B.weight": torch.full((2, 1), 1.0),
+    }, str(b))
+    save_file({
+        "transformer.extra.lora_down.weight": torch.full((1, 2), 3.0),
+        "transformer.extra.lora_up.weight": torch.full((2, 1), 3.0),
+    }, str(c))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b), "c": str(c)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b", "c"], "loras", _params("lora_secondary_union"), lora_mode=True
+    )
+    tensors = load_file(str(_result_path(tmp_path, "loras", result)))
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_A.weight"], torch.full((1, 2), 2.0)
+    )
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_B.weight"], torch.full((2, 1), 2.0)
+    )
+
+
+def test_lora_secondary_direct_and_companion_groups_are_atomic(
+    monkeypatch, tmp_path, cwb
+):
+    a = tmp_path / "lora_atomic_a.safetensors"
+    b = tmp_path / "lora_atomic_b.safetensors"
+    save_file({"diffusion_model.base.diff": torch.tensor([[1.0]])}, str(a))
+    save_file({
+        "diffusion_model.norm.diff": torch.tensor([2.0, 3.0], dtype=torch.bfloat16),
+        "diffusion_model.extra.lora_A.weight": torch.tensor([[4.0, 5.0]]),
+        "diffusion_model.extra.lora_B.weight": torch.tensor([[6.0], [7.0]]),
+        "diffusion_model.extra.dora_scale": torch.tensor([8.0, 9.0]),
+    }, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "loras",
+        _params("lora_secondary_atomic", global_scale=3.0),
+        lora_mode=True,
+    )
+    tensors = load_file(str(_result_path(tmp_path, "loras", result)))
+    torch.testing.assert_close(
+        tensors["diffusion_model.norm.diff"],
+        torch.tensor([2.0, 3.0], dtype=torch.bfloat16),
+    )
+    assert tensors["diffusion_model.norm.diff"].dtype == torch.bfloat16
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_A.weight"], torch.tensor([[4.0, 5.0]])
+    )
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.lora_B.weight"], torch.tensor([[6.0], [7.0]])
+    )
+    torch.testing.assert_close(
+        tensors["diffusion_model.extra.dora_scale"], torch.tensor([8.0, 9.0])
+    )
+
+
+def test_lora_rejects_duplicate_normalized_cores_in_secondary_input(cwb):
+    with pytest.raises(ValueError, match="same logical layer 'foo'.*input 2"):
+        cwb._secondary_lora_map(
+            {
+                "diffusion_model.foo": {},
+                "transformer.foo": {},
+            },
+            input_index=1,
+        )
 
 
 def test_lora_peft_prefix_matching_and_existing_alpha(monkeypatch, tmp_path, cwb):

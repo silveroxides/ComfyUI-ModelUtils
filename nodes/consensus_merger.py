@@ -651,10 +651,22 @@ def _normalized_lora_core(block_name: str) -> str:
     return core.replace(".", "_")
 
 
-def _secondary_lora_map(pairs: dict[str, dict[str, str]]) -> dict[str, str]:
+def _secondary_lora_map(
+    pairs: dict[str, dict[str, str]],
+    *,
+    input_index: int | None = None,
+) -> dict[str, str]:
     result = {}
     for block_name in pairs:
-        result.setdefault(_normalized_lora_core(block_name), block_name)
+        core = _normalized_lora_core(block_name)
+        previous = result.get(core)
+        if previous is not None and previous != block_name:
+            label = f" in input {input_index + 1}" if input_index is not None else ""
+            raise ValueError(
+                f"[CWB LoRA Merge] LoRA keys '{previous}' and '{block_name}' "
+                f"normalize to the same logical layer '{core}'{label}."
+            )
+        result[core] = block_name
     return result
 
 
@@ -736,10 +748,9 @@ class ConsensusMergerLogic:
         embedding_union,
     ):
         primary = handlers[0]
-        keys = set(primary.keys())
-        if embedding_union:
-            for handler in handlers[1:]:
-                keys.update(handler.keys())
+        keys = set()
+        for handler in handlers:
+            keys.update(handler.keys())
         keys = sorted(keys)
         output_path = cls._output_path(model_type, params["output_filename"])
         requested_dtype = _requested_dtype(params["save_dtype"])
@@ -748,6 +759,8 @@ class ConsensusMergerLogic:
         exclude = _compile_patterns(params["exclude_patterns"], glob_mode=glob_mode)
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         pbar = comfy.utils.ProgressBar(len(keys))
+        secondary_only_copied = 0
+        secondary_only_merged = 0
 
         writer_context = _atomic_output_writer(output_path, primary.metadata())
         writer = writer_context.__enter__()
@@ -759,11 +772,21 @@ class ConsensusMergerLogic:
                         pbar.update(1)
                         continue
                     source_indices = [i for i, handler in enumerate(handlers) if key in handler.keys()]
-                    preserve_index = 0 if key in primary.keys() else source_indices[0]
+                    primary_owned = key in primary.keys()
+                    secondary_only = not primary_owned
+                    preserve_index = 0 if primary_owned else source_indices[0]
                     guarded = any(key in low_bit_sets[i] for i in source_indices)
                     excluded = _matches_any_pattern(key, exclude, glob_mode=glob_mode)
                     if guarded or excluded:
                         write_preserved_tensor(writer, key, handlers[preserve_index])
+                        if secondary_only:
+                            secondary_only_copied += 1
+                        pbar.update(1)
+                        continue
+
+                    if secondary_only and len(source_indices) == 1:
+                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
@@ -775,10 +798,12 @@ class ConsensusMergerLogic:
                             preserve_index + 1,
                         )
                         write_preserved_tensor(writer, key, handlers[preserve_index])
+                        if secondary_only:
+                            secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
-                    if not embedding_union and len(source_indices) != len(handlers):
+                    if primary_owned and not embedding_union and len(source_indices) != len(handlers):
                         if mismatch_mode == "error":
                             raise ValueError(f"Tensor '{key}' is missing from a CWB input.")
                         if mismatch_mode == "skip":
@@ -795,13 +820,16 @@ class ConsensusMergerLogic:
                         )
                         reference_shape = raw[reference_source].shape
                     else:
-                        reference_source = 0
-                        reference_shape = raw[0].shape
+                        reference_source = preserve_index
+                        reference_shape = raw[preserve_index].shape
 
                     tensors = []
                     actual_dtypes = []
                     reference_index = 0
-                    for source_index, handler in enumerate(handlers):
+                    preserve_for_mismatch = False
+                    candidate_indices = range(len(handlers)) if primary_owned else source_indices
+                    for source_index in candidate_indices:
+                        handler = handlers[source_index]
                         if source_index not in raw:
                             if mismatch_mode == "error":
                                 raise ValueError(f"Tensor '{key}' is missing from input {source_index + 1}.")
@@ -821,6 +849,9 @@ class ConsensusMergerLogic:
                         if aligned is None:
                             if mismatch_mode == "error":
                                 raise ValueError(f"Tensor shape mismatch for '{key}'.")
+                            if mismatch_mode == "skip":
+                                preserve_for_mismatch = True
+                                break
                             if mismatch_mode == "zeros":
                                 tensors.append(torch.zeros(
                                     reference_shape,
@@ -832,6 +863,12 @@ class ConsensusMergerLogic:
                         tensors.append(aligned)
                         actual_dtypes.append(handler.get_dtype(key))
 
+                    if preserve_for_mismatch:
+                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        if secondary_only:
+                            secondary_only_copied += 1
+                        pbar.update(1)
+                        continue
                     if not tensors:
                         pbar.update(1)
                         continue
@@ -851,20 +888,38 @@ class ConsensusMergerLogic:
                     )
                     writer.write(key, merged)
                     del merged
+                    if secondary_only:
+                        secondary_only_merged += 1
                     pbar.update(1)
         except BaseException as exc:
             writer_context.__exit__(type(exc), exc, exc.__traceback__)
             raise
         else:
             writer_context.__exit__(None, None, None)
+        if secondary_only_copied or secondary_only_merged:
+            logging.info(
+                "[CWB Merge] Secondary-only tensors: %d copied, %d merged.",
+                secondary_only_copied,
+                secondary_only_merged,
+            )
         return os.path.basename(output_path)
 
     @classmethod
     def _merge_loras(cls, handlers, low_bit_sets, model_type, params, settings):
         parsed = [parse_lora_layers(handler.keys()) for handler in handlers]
-        primary_pairs, primary_passthrough = parsed[0]
-        validate_canonical_blocks(primary_pairs, "CWB LoRA Merge")
-        secondary_maps = [_secondary_lora_map(pairs) for pairs, _ in parsed]
+        logical_maps = []
+        logical_cores = []
+        seen_cores = set()
+        passthrough_keys = set()
+        for input_index, (pairs, passthrough) in enumerate(parsed):
+            validate_canonical_blocks(pairs, f"CWB LoRA Merge input {input_index + 1}")
+            logical_map = _secondary_lora_map(pairs, input_index=input_index)
+            logical_maps.append(logical_map)
+            passthrough_keys.update(passthrough)
+            for core in logical_map:
+                if core not in seen_cores:
+                    logical_cores.append(core)
+                    seen_cores.add(core)
         output_path = cls._output_path(model_type, params["output_filename"])
         requested_dtype = _requested_dtype(params["save_dtype"])
         mismatch_mode = params["mismatch_mode"]
@@ -874,15 +929,23 @@ class ConsensusMergerLogic:
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         written = set()
         preserved_companion_groups = 0
-        pbar = comfy.utils.ProgressBar(len(primary_pairs) + len(primary_passthrough))
+        secondary_only_copied = 0
+        secondary_only_merged = 0
+        pbar = comfy.utils.ProgressBar(len(logical_cores) + len(passthrough_keys))
 
-        def preserve_keys(writer, keys: Iterable[str]):
+        def preserve_keys(writer, keys: Iterable[str], source_index: int = 0):
             for key in keys:
                 if key not in written:
-                    write_preserved_tensor(writer, key, handlers[0])
+                    write_preserved_tensor(writer, key, handlers[source_index])
                     written.add(key)
 
-        def preserve_roles(writer, block_name: str, keys: dict[str, str], roles):
+        def preserve_roles(
+            writer,
+            block_name: str,
+            keys: dict[str, str],
+            roles,
+            source_index: int = 0,
+        ):
             recognized_sources = set()
             for role, source_key in layer_tensor_keys(keys).items():
                 if role not in roles:
@@ -890,39 +953,63 @@ class ConsensusMergerLogic:
                 output_key = canonical_lora_key(block_name, role)
                 recognized_sources.add(source_key)
                 if output_key not in written:
-                    write_preserved_tensor(writer, source_key, handlers[0], output_key)
+                    write_preserved_tensor(
+                        writer,
+                        source_key,
+                        handlers[source_index],
+                        output_key,
+                    )
                     written.add(output_key)
             return recognized_sources
 
-        def preserve_layer(writer, block_name: str, keys: dict[str, str]):
+        def preserve_layer(
+            writer,
+            block_name: str,
+            keys: dict[str, str],
+            source_index: int = 0,
+        ):
             recognized_sources = preserve_roles(
-                writer, block_name, keys, layer_tensor_keys(keys)
+                writer,
+                block_name,
+                keys,
+                layer_tensor_keys(keys),
+                source_index,
             )
             preserve_keys(
                 writer,
                 (
-                    key for key in handlers[0].keys()
+                    key for key in handlers[source_index].keys()
                     if key.startswith(f"{block_name}.") and key not in recognized_sources
                 ),
+                source_index,
             )
 
         writer_context = _atomic_output_writer(output_path, handlers[0].metadata())
         writer = writer_context.__enter__()
         try:
             with torch.no_grad():
-                for primary_block, primary_keys in tqdm(
-                    primary_pairs.items(), desc="CWB merging LoRA layers", unit="layers"
+                for core in tqdm(
+                    logical_cores, desc="CWB merging LoRA layers", unit="layers"
                 ):
                     _clear_previous_layer(params)
-                    core = _normalized_lora_core(primary_block)
                     matches = []
-                    for index, (pairs, _) in enumerate(parsed):
-                        block = primary_block if index == 0 else secondary_maps[index].get(core)
+                    for index, ((pairs, _), logical_map) in enumerate(zip(parsed, logical_maps)):
+                        block = logical_map.get(core)
                         matches.append((index, block, pairs.get(block) if block else None))
+                    anchor_index, anchor_block, anchor_keys = next(
+                        (index, block, keys)
+                        for index, block, keys in matches
+                        if block is not None and keys is not None
+                    )
+                    primary_owned = matches[0][2] is not None
+                    secondary_only = not primary_owned
 
                     layer_keys = [
-                        key for key in handlers[0].keys()
-                        if key in primary_keys.values() or key.startswith(f"{primary_block}.")
+                        key
+                        for index, block, keys in matches
+                        if block is not None and keys is not None
+                        for key in handlers[index].keys()
+                        if key in keys.values() or key.startswith(f"{block}.")
                     ]
                     if any(_matches_any_pattern(key, discard, glob_mode=glob_mode) for key in layer_keys):
                         pbar.update(1)
@@ -940,12 +1027,23 @@ class ConsensusMergerLogic:
                         for _, _, keys in matches
                     )
                     if companion_bearing:
-                        preserve_layer(writer, primary_block, primary_keys)
+                        preserve_layer(writer, anchor_block, anchor_keys, anchor_index)
                         preserved_companion_groups += 1
+                        if secondary_only:
+                            secondary_only_copied += 1
                         pbar.update(1)
                         continue
                     if guarded or excluded:
-                        preserve_layer(writer, primary_block, primary_keys)
+                        preserve_layer(writer, anchor_block, anchor_keys, anchor_index)
+                        if secondary_only:
+                            secondary_only_copied += 1
+                        pbar.update(1)
+                        continue
+
+                    available_matches = [match for match in matches if match[2] is not None]
+                    if secondary_only and len(available_matches) == 1:
+                        preserve_layer(writer, anchor_block, anchor_keys, anchor_index)
+                        secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
@@ -958,37 +1056,53 @@ class ConsensusMergerLogic:
                                 if name in {"down", "up", "alpha", "diff", "diff_b"}
                             )
 
-                    if "down" in primary_keys and "up" in primary_keys:
+                    group_merged = False
+                    if "down" in anchor_keys and "up" in anchor_keys:
                         pair_sources = []
                         pair_failed = False
-                        primary_down_template = handlers[0].get_tensor(primary_keys["down"])
-                        primary_up_template = handlers[0].get_tensor(primary_keys["up"])
+                        anchor_down_template = handlers[anchor_index].get_tensor(anchor_keys["down"])
+                        anchor_up_template = handlers[anchor_index].get_tensor(anchor_keys["up"])
                         for index, _, keys in matches:
-                            if not keys or "down" not in keys or "up" not in keys:
+                            if not keys:
+                                if secondary_only:
+                                    continue
                                 if mismatch_mode == "error":
-                                    raise ValueError(f"LoRA pair '{primary_block}' is missing from input {index + 1}.")
+                                    raise ValueError(f"LoRA pair '{anchor_block}' is missing from input {index + 1}.")
                                 if mismatch_mode == "skip":
                                     pair_failed = True
                                     break
                                 pair_sources.append((
                                     index,
-                                    torch.zeros_like(primary_down_template),
-                                    torch.zeros_like(primary_up_template),
+                                    torch.zeros_like(anchor_down_template),
+                                    torch.zeros_like(anchor_up_template),
+                                    1.0,
+                                ))
+                                continue
+                            if "down" not in keys or "up" not in keys:
+                                if mismatch_mode == "error":
+                                    raise ValueError(f"LoRA pair '{anchor_block}' is incomplete in input {index + 1}.")
+                                if mismatch_mode == "skip":
+                                    pair_failed = True
+                                    break
+                                pair_sources.append((
+                                    index,
+                                    torch.zeros_like(anchor_down_template),
+                                    torch.zeros_like(anchor_up_template),
                                     1.0,
                                 ))
                                 continue
                             down = handlers[index].get_tensor(keys["down"])
                             up = handlers[index].get_tensor(keys["up"])
                             if down.ndim < 2 or up.ndim < 2 or down.shape[0] != up.shape[1]:
-                                if mismatch_mode == "error" or index == 0:
-                                    raise ValueError(f"Invalid LoRA rank dimensions for '{primary_block}'.")
+                                if mismatch_mode == "error" or index == anchor_index:
+                                    raise ValueError(f"Invalid LoRA rank dimensions for '{anchor_block}'.")
                                 if mismatch_mode == "skip":
                                     pair_failed = True
                                     break
                                 pair_sources.append((
                                     index,
-                                    torch.zeros_like(primary_down_template),
-                                    torch.zeros_like(primary_up_template),
+                                    torch.zeros_like(anchor_down_template),
+                                    torch.zeros_like(anchor_up_template),
                                     1.0,
                                 ))
                                 continue
@@ -997,38 +1111,50 @@ class ConsensusMergerLogic:
                                 alpha = handlers[index].get_tensor(keys["alpha"])
                                 if alpha.numel() != 1:
                                     raise ValueError(
-                                        f"LoRA alpha for '{primary_block}' must be scalar."
+                                        f"LoRA alpha for '{anchor_block}' must be scalar."
                                     )
                                 scale = float(alpha.reshape(-1)[0].item()) / down.shape[0]
                             pair_sources.append((index, down, up, scale))
                         if pair_failed:
-                            preserve_roles(writer, primary_block, primary_keys, {"down", "up", "alpha"})
+                            preserve_roles(
+                                writer,
+                                anchor_block,
+                                anchor_keys,
+                                {"down", "up", "alpha"},
+                                anchor_index,
+                            )
                         elif pair_sources:
-                            primary_down = pair_sources[0][1]
-                            primary_up = pair_sources[0][2]
+                            anchor_down = pair_sources[0][1]
+                            anchor_up = pair_sources[0][2]
                             compatible = []
                             for index, down, up, scale in pair_sources:
                                 valid = (
-                                    tuple(down.shape[1:]) == tuple(primary_down.shape[1:])
-                                    and up.shape[0] == primary_up.shape[0]
-                                    and tuple(up.shape[2:]) == tuple(primary_up.shape[2:])
+                                    tuple(down.shape[1:]) == tuple(anchor_down.shape[1:])
+                                    and up.shape[0] == anchor_up.shape[0]
+                                    and tuple(up.shape[2:]) == tuple(anchor_up.shape[2:])
                                 )
                                 if not valid:
                                     if mismatch_mode == "error":
-                                        raise ValueError(f"LoRA pair shape mismatch for '{primary_block}'.")
+                                        raise ValueError(f"LoRA pair shape mismatch for '{anchor_block}'.")
                                     if mismatch_mode == "skip":
                                         compatible = []
                                         break
                                     compatible.append((
                                         index,
-                                        torch.zeros_like(primary_down),
-                                        torch.zeros_like(primary_up),
+                                        torch.zeros_like(anchor_down),
+                                        torch.zeros_like(anchor_up),
                                         1.0,
                                     ))
                                     continue
                                 compatible.append((index, down, up, scale))
                             if not compatible:
-                                preserve_roles(writer, primary_block, primary_keys, {"down", "up", "alpha"})
+                                preserve_roles(
+                                    writer,
+                                    anchor_block,
+                                    anchor_keys,
+                                    {"down", "up", "alpha"},
+                                    anchor_index,
+                                )
                             else:
                                 target_dtype = select_output_dtype(
                                     logical_dtypes,
@@ -1040,72 +1166,105 @@ class ConsensusMergerLogic:
                                     settings,
                                     params["process_device"],
                                     target_dtype,
-                                    operation_label=primary_block,
+                                    operation_label=anchor_block,
                                 )
                                 writer.write(
-                                    canonical_lora_key(primary_block, "down"),
+                                    canonical_lora_key(anchor_block, "down"),
                                     merged_down,
                                 )
                                 writer.write(
-                                    canonical_lora_key(primary_block, "up"),
+                                    canonical_lora_key(anchor_block, "up"),
                                     merged_up,
                                 )
                                 del merged_down, merged_up
                                 written.update({
-                                    canonical_lora_key(primary_block, "down"),
-                                    canonical_lora_key(primary_block, "up"),
+                                    canonical_lora_key(anchor_block, "down"),
+                                    canonical_lora_key(anchor_block, "up"),
                                 })
-                                if "alpha" in primary_keys:
+                                if "alpha" in anchor_keys:
                                     writer.write(
-                                        canonical_lora_key(primary_block, "alpha"),
+                                        canonical_lora_key(anchor_block, "alpha"),
                                         torch.tensor(float(max_rank), dtype=target_dtype),
                                     )
-                                    written.add(canonical_lora_key(primary_block, "alpha"))
+                                    written.add(canonical_lora_key(anchor_block, "alpha"))
+                                group_merged = True
 
                     for kind in ("diff", "diff_b", "w_norm", "b_norm"):
-                        if kind not in primary_keys:
+                        if kind not in anchor_keys:
                             continue
-                        primary_key = primary_keys[kind]
-                        output_key = canonical_lora_key(primary_block, kind)
-                        primary_tensor = handlers[0].get_tensor(primary_key)
-                        if primary_tensor.ndim == 1 and not include_1d:
+                        anchor_key = anchor_keys[kind]
+                        output_key = canonical_lora_key(anchor_block, kind)
+                        anchor_tensor = handlers[anchor_index].get_tensor(anchor_key)
+                        if anchor_tensor.ndim == 1 and not include_1d:
                             if output_key not in written:
-                                write_preserved_tensor(writer, primary_key, handlers[0], output_key)
+                                write_preserved_tensor(
+                                    writer,
+                                    anchor_key,
+                                    handlers[anchor_index],
+                                    output_key,
+                                )
                                 written.add(output_key)
                             continue
                         direct = []
                         direct_dtypes = []
                         failed = False
                         for index, _, keys in matches:
-                            if not keys or kind not in keys:
+                            if not keys:
+                                if secondary_only:
+                                    continue
                                 if mismatch_mode == "error":
-                                    raise ValueError(f"Direct LoRA layer '{primary_block}.{kind}' is missing from input {index + 1}.")
+                                    raise ValueError(f"Direct LoRA layer '{anchor_block}.{kind}' is missing from input {index + 1}.")
                                 if mismatch_mode == "skip":
                                     failed = True
                                     break
-                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32))
+                                direct.append(torch.zeros_like(anchor_tensor, dtype=torch.float32))
+                                continue
+                            if kind not in keys:
+                                if secondary_only:
+                                    continue
+                                if mismatch_mode == "error":
+                                    raise ValueError(f"Direct LoRA layer '{anchor_block}.{kind}' is missing from input {index + 1}.")
+                                if mismatch_mode == "skip":
+                                    failed = True
+                                    break
+                                direct.append(torch.zeros_like(anchor_tensor, dtype=torch.float32))
                                 continue
                             tensor = handlers[index].get_tensor(keys[kind])
-                            if tensor.shape != primary_tensor.shape:
+                            if tensor.shape != anchor_tensor.shape:
                                 if mismatch_mode == "error":
-                                    raise ValueError(f"Direct LoRA shape mismatch for '{primary_block}.{kind}'.")
+                                    raise ValueError(f"Direct LoRA shape mismatch for '{anchor_block}.{kind}'.")
                                 if mismatch_mode == "skip":
                                     failed = True
                                     break
-                                direct.append(torch.zeros_like(primary_tensor, dtype=torch.float32))
+                                direct.append(torch.zeros_like(anchor_tensor, dtype=torch.float32))
                                 continue
                             direct.append(tensor)
                             direct_dtypes.append(handlers[index].get_dtype(keys[kind]))
                         if failed:
                             if output_key not in written:
-                                write_preserved_tensor(writer, primary_key, handlers[0], output_key)
+                                write_preserved_tensor(
+                                    writer,
+                                    anchor_key,
+                                    handlers[anchor_index],
+                                    output_key,
+                                )
+                                written.add(output_key)
+                            continue
+                        if secondary_only and len(direct) == 1:
+                            if output_key not in written:
+                                write_preserved_tensor(
+                                    writer,
+                                    anchor_key,
+                                    handlers[anchor_index],
+                                    output_key,
+                                )
                                 written.add(output_key)
                             continue
                         target_dtype = select_output_dtype(
                             direct_dtypes,
                             requested_dtype,
                             force=params["override_dtype"],
-                            is_1d_diff=primary_tensor.ndim == 1,
+                            is_1d_diff=anchor_tensor.ndim == 1,
                         )
                         merged = _merge_tensors_to_cpu(
                             direct,
@@ -1118,18 +1277,30 @@ class ConsensusMergerLogic:
                         writer.write(output_key, merged)
                         del merged
                         written.add(output_key)
+                        group_merged = True
 
-                    preserve_layer(writer, primary_block, primary_keys)
+                    preserve_layer(writer, anchor_block, anchor_keys, anchor_index)
+                    if secondary_only:
+                        if group_merged:
+                            secondary_only_merged += 1
+                        else:
+                            secondary_only_copied += 1
                     pbar.update(1)
 
-                for key in primary_passthrough:
+                for key in sorted(passthrough_keys):
                     _clear_previous_layer(params)
                     if key in written:
                         continue
                     if _matches_any_pattern(key, discard, glob_mode=glob_mode):
                         pbar.update(1)
                         continue
-                    preserve_keys(writer, [key])
+                    source_index = next(
+                        index for index, (_, passthrough) in enumerate(parsed)
+                        if key in passthrough
+                    )
+                    preserve_keys(writer, [key], source_index)
+                    if source_index > 0:
+                        secondary_only_copied += 1
                     pbar.update(1)
         except BaseException as exc:
             writer_context.__exit__(type(exc), exc, exc.__traceback__)
@@ -1138,8 +1309,14 @@ class ConsensusMergerLogic:
             writer_context.__exit__(None, None, None)
         if preserved_companion_groups:
             logging.warning(
-                "[CWB LoRA Merge] Preserved %d companion-bearing Model-A group(s)",
+                "[CWB LoRA Merge] Preserved %d companion-bearing group(s)",
                 preserved_companion_groups,
+            )
+        if secondary_only_copied or secondary_only_merged:
+            logging.info(
+                "[CWB LoRA Merge] Secondary-only groups: %d copied, %d merged.",
+                secondary_only_copied,
+                secondary_only_merged,
             )
         return os.path.basename(output_path)
 

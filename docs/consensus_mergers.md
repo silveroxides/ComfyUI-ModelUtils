@@ -10,11 +10,13 @@ similarity-derived weights before producing the output vector.
 Two-input and three-input variants are provided for checkpoints, standalone
 diffusion models, text encoders, LoRAs, and embeddings.
 
-Checkpoint, diffusion-model, text-encoder, and LoRA outputs are anchored to
-Model A. Model A supplies the output key set, metadata, and naming. Keys found
-only in later inputs are ignored. Embedding mergers instead use the union of
-all keys and use the longest compatible first dimension as the alignment
-reference.
+Model A supplies output metadata and anchors shared-layer shape, naming, and
+mismatch behavior. The output key set is the union of all inputs. A valid
+tensor found only in a secondary input is copied unchanged. When Model A lacks
+a tensor that is present in multiple secondary inputs, those available sources
+are CWB-merged without inserting a zero contribution for Model A. Embedding
+mergers additionally use the longest compatible first dimension as their
+alignment reference.
 
 ## Presets and custom controls
 
@@ -42,6 +44,11 @@ or receives zero weight, CWB falls back to equal weighting.
 - Exclude patterns preserve the anchored source tensor.
 - Discard patterns remove the matching output tensor or logical LoRA layer.
 
+The missing-input modes above apply to Model-A-owned layers. Model A being
+absent from a secondary-only layer is not itself a mismatch. A shape conflict
+between multiple available secondary providers does use the selected mismatch
+mode, with the earliest available input as its preservation anchor.
+
 Patterns use regular expressions by default. Enable Glob Patterns to use glob
 syntax instead.
 
@@ -55,19 +62,26 @@ Recognized diffusion-model outputs use the canonical
 `diffusion_model.<layer>.lora_A.weight` / `.lora_B.weight` convention.
 Secondary formats are matched by normalized logical layer name. Differing
 ranks are zero-padded like the DARE/TIES mergers: A/down tensors on dimension 0
-and B/up tensors on dimension 1. An existing Model A alpha key is updated to
-the resulting maximum rank; no alpha key is invented when Model A has none.
+and B/up tensors on dimension 1. An existing anchor-source alpha key is updated
+to the resulting maximum rank; no alpha key is invented when the anchor has
+none.
 Similarity alignment operates on paired latent-rank components. A rows and B
 columns share one mapping; fixed input/output feature axes are never reordered.
 Input alpha scaling is absorbed into the B factor before blending, and global
 scale is applied once to the resulting pair rather than once per factor.
-Incomplete pairs and unrecognized Model A tensors are copied unchanged.
+Incomplete pairs and unrecognized tensors are copied from the earliest
+available source unchanged.
 Companion-bearing groups (`lora_mid`, reshape, DoRA, or set-weight) are kept
-atomically from Model A rather than partially transformed.
+atomically from their earliest available source rather than partially
+transformed. Secondary-only logical groups are included automatically: a group
+from one source is copied unchanged, while compatible groups from multiple
+secondary sources are merged using only those sources. Recognized roles are
+written with the same canonical output convention as shared layers.
 
-`include_1d_diffs` is disabled by default. Disabled 1D direct layers preserve
-Model A. Enabled 1D direct layers participate as complete tensors and are
-always saved in FP32.
+`include_1d_diffs` is disabled by default. Disabled shared 1D direct layers
+preserve Model A, while secondary-only layers preserve their earliest source.
+Enabled 1D direct layers participate as complete tensors and are always saved
+in FP32.
 
 ## Precision and quantized inputs
 
