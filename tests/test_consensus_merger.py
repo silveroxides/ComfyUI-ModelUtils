@@ -69,6 +69,11 @@ def _params(output_filename, **overrides):
 
 
 def test_preset_resolution_matches_extended_contract(cwb):
+    assert all(
+        preset["global_scale"] == pytest.approx(1.0)
+        for preset in cwb.CWB_PRESETS.values()
+    )
+
     power = cwb.resolve_cwb_settings(cwb_preset="power_blend")
     assert power.consensus_type == "median"
     assert power.alignment_threshold == pytest.approx(0.9)

@@ -23,7 +23,9 @@ alignment reference.
 `baseline` is the default. The standard clarity, smooth, varied, and diversity
 presets are joined by `power_blend` and the DSC presets demonstrated by the CWB
 conditioning implementation. Select `custom` to make every manual CWB control
-authoritative.
+authoritative. Every named merger preset keeps `global_scale` at `1.0`; scaling
+persisted model or LoRA weights is only performed when explicitly selected in
+the custom controls.
 
 Similarity alignment greedily matches source rows to the reference by cosine
 similarity. Index alignment keeps absolute row positions. Position weight can

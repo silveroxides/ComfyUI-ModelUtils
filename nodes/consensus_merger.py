@@ -72,17 +72,17 @@ CWB_PRESETS = {
     "varied_merge": {
         "consensus_type": "median", "power_alpha": 2.0,
         "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
     },
     "diverse_concept": {
         "consensus_type": "median", "power_alpha": 2.0,
         "similarity_threshold": 0.0, "diversity_beta": 1.0,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
     },
     "high_diversity_concept": {
         "consensus_type": "median", "power_alpha": 2.0,
         "similarity_threshold": 0.0, "diversity_beta": 2.0,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
     },
     "dsc_baseline": {
         "consensus_type": "median", "power_alpha": 2.0,
@@ -105,19 +105,19 @@ CWB_PRESETS = {
     "dsc_varied_merge": {
         "consensus_type": "median", "power_alpha": 2.5,
         "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
         "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
     },
     "dsc_diverse_concept": {
         "consensus_type": "median", "power_alpha": 2.0,
         "similarity_threshold": 0.0, "diversity_beta": 1.5,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
         "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
     },
     "dsc_high_diversity_concept": {
         "consensus_type": "median", "power_alpha": 2.0,
         "similarity_threshold": 0.0, "diversity_beta": 3.0,
-        "rescale_norm": True, "global_scale": 0.7,
+        "rescale_norm": True, "global_scale": 1.0,
         "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
     },
 }
