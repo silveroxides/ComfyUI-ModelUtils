@@ -21,6 +21,7 @@ from .nodes.merger import (
     CheckpointThreeMerger, EmbeddingThreeMerger
 )
 from .nodes.consensus_merger import CWB_MERGER_NODES
+from .nodes.model_analysis import MODEL_ANALYSIS_NODES
 from .nodes.lora_extract_svd import (
     LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
     LoRAExtractKnee, LoRAExtractFrobenius
@@ -32,6 +33,13 @@ from .nodes.dora_extract_wd import (
 from .nodes.dora_learned_wd import (
     DoRALearnedExtractFixed, DoRALearnedExtractRatio, DoRALearnedExtractQuantile,
     DoRALearnedExtractKnee, DoRALearnedExtractFrobenius
+)
+from .nodes.text_encoder_extract import (
+    TextEncoderLoRAExtractFixed, TextEncoderLoRAExtractRatio,
+    TextEncoderLoRAExtractQuantile, TextEncoderLoRAExtractKnee,
+    TextEncoderLoRAExtractFrobenius, TextEncoderDoRAExtractFixed,
+    TextEncoderDoRAExtractRatio, TextEncoderDoRAExtractQuantile,
+    TextEncoderDoRAExtractKnee, TextEncoderDoRAExtractFrobenius,
 )
 from .nodes.lora_resize import (
     LoRAResizeFixed, LoRAResizeRatio,
@@ -71,6 +79,8 @@ class ModelUtilsExtension(ComfyExtension):
             CheckpointThreeMerger, EmbeddingThreeMerger,
             # Dedicated CWB Mergers
             *CWB_MERGER_NODES,
+            # Two-Model Analysis
+            *MODEL_ANALYSIS_NODES,
             # LoRA Extraction
             LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
             LoRAExtractKnee, LoRAExtractFrobenius,
@@ -80,6 +90,12 @@ class ModelUtilsExtension(ComfyExtension):
             # Learned DoRA Extraction
             DoRALearnedExtractFixed, DoRALearnedExtractRatio, DoRALearnedExtractQuantile,
             DoRALearnedExtractKnee, DoRALearnedExtractFrobenius,
+            # Text Encoder LoRA/DoRA Extraction
+            TextEncoderLoRAExtractFixed, TextEncoderLoRAExtractRatio,
+            TextEncoderLoRAExtractQuantile, TextEncoderLoRAExtractKnee,
+            TextEncoderLoRAExtractFrobenius, TextEncoderDoRAExtractFixed,
+            TextEncoderDoRAExtractRatio, TextEncoderDoRAExtractQuantile,
+            TextEncoderDoRAExtractKnee, TextEncoderDoRAExtractFrobenius,
             # LoRA Resize
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
