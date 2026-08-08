@@ -1,15 +1,14 @@
 """
-LoRA Resize - Resize existing LoRAs to different ranks.
+LoRA Resize - Resize existing LoRAs in factor space.
 
-Based on kohya_ss resize_lora.py. Merges LoRA weights and re-extracts via SVD.
-Supports fixed rank and dynamic methods (sv_ratio, sv_fro, sv_cumulative).
+Uses bounded asynchronous UEL streaming and rank-space SVD for fixed rank and
+dynamic methods (sv_ratio, sv_fro, sv_cumulative).
 """
 import os
-import re
+import gc
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 import torch
-import torch.linalg as linalg
 import folder_paths
 import comfy.utils
 from comfy.weight_adapter import LoRAAdapter
@@ -356,110 +355,173 @@ def detect_lora_rank(
 
 
 # =============================================================================
-# Merge Functions
+# Factor-space resize engine
 # =============================================================================
 
-def _merge_linear(lora_down: torch.Tensor, lora_up: torch.Tensor, device: str) -> torch.Tensor:
-    """Merge linear LoRA weights: lora_up @ lora_down."""
-    lora_down = lora_down.to(device=device, dtype=torch.float32)
-    lora_up = lora_up.to(device=device, dtype=torch.float32)
-    return lora_up @ lora_down
+def _is_cuda_oom(error: BaseException) -> bool:
+    return isinstance(error, torch.cuda.OutOfMemoryError) or (
+        isinstance(error, RuntimeError)
+        and "out of memory" in str(error).lower()
+        and "cuda" in str(error).lower()
+    )
 
 
-def _merge_conv(lora_down: torch.Tensor, lora_up: torch.Tensor, device: str) -> torch.Tensor:
-    """Merge conv LoRA weights."""
-    in_rank, in_size, kernel_size, k_ = lora_down.shape
-    out_size, out_rank, _, _ = lora_up.shape
-    assert in_rank == out_rank, f"rank mismatch: {in_rank} vs {out_rank}"
-
-    lora_down = lora_down.to(device=device, dtype=torch.float32)
-    lora_up = lora_up.to(device=device, dtype=torch.float32)
-
-    merged = lora_up.reshape(out_size, -1) @ lora_down.reshape(in_rank, -1)
-    return merged.reshape(out_size, in_size, kernel_size, kernel_size)
+def _release_cuda_after_oom() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
-# =============================================================================
-# Extract Functions (after merge)
-# =============================================================================
+def _factor_matrices(
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[int, int, int]]]:
+    """Return down/up matrices and optional convolution output layout."""
+    if lora_down.ndim == 2:
+        if lora_up.ndim != 2:
+            raise ValueError("Linear LoRA up/down tensors must both be two-dimensional")
+        if lora_down.shape[0] != lora_up.shape[1]:
+            raise ValueError(
+                f"LoRA rank mismatch: down={tuple(lora_down.shape)}, "
+                f"up={tuple(lora_up.shape)}"
+            )
+        return lora_down, lora_up, None
 
-def _extract_linear(
-    weight: torch.Tensor,
+    if lora_down.ndim != 4 or lora_up.ndim != 4:
+        raise ValueError("LoRA resize supports linear and convolutional factor pairs")
+    if tuple(lora_up.shape[2:]) != (1, 1):
+        raise ValueError("Convolutional LoRA up tensor must use a 1x1 kernel")
+    rank, in_channels, kernel_h, kernel_w = lora_down.shape
+    if lora_up.shape[1] != rank:
+        raise ValueError(
+            f"LoRA rank mismatch: down={tuple(lora_down.shape)}, "
+            f"up={tuple(lora_up.shape)}"
+        )
+    return (
+        lora_down.reshape(rank, in_channels * kernel_h * kernel_w),
+        lora_up.reshape(lora_up.shape[0], rank),
+        (in_channels, kernel_h, kernel_w),
+    )
+
+
+def _resize_factors_on_device(
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
     max_rank: int,
     dynamic_method: Optional[str],
     dynamic_param: Optional[float],
     scale: float,
-    niter: int = 2,
+    min_rank: int,
+    process_device: str,
 ) -> Dict:
-    """Extract LoRA from merged linear weight."""
-    out_size, in_size = weight.shape
-
-    if dynamic_method is None:
-        # Fixed rank - use svd_lowrank for 10x speedup
-        rank = min(max_rank, min(out_size, in_size) - 1)
-        U, S, Vh = torch.svd_lowrank(weight, q=rank, niter=niter)
-        Vh = Vh.T  # svd_lowrank returns V, not Vh
-        new_rank = rank
-        new_alpha = float(scale * new_rank)
-        stats = {"sum_retained": 1.0, "fro_retained": 1.0}  # Not computed for lowrank
+    """Resize a LoRA pair using only its rank-space core."""
+    down_matrix, up_matrix, conv_layout = _factor_matrices(lora_down, lora_up)
+    if str(process_device).startswith("cuda"):
+        down_device = transfer_to_gpu_pinned(
+            down_matrix, process_device, torch.float32
+        )
+        up_device = transfer_to_gpu_pinned(
+            up_matrix, process_device, torch.float32
+        )
     else:
-        # Dynamic methods need full SVD to compute rank from all singular values
-        U, S, Vh = linalg.svd(weight, full_matrices=False)
-        new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
-        U = U[:, :new_rank]
-        S = S[:new_rank]
-        Vh = Vh[:new_rank, :]
+        down_device = down_matrix.to(device=process_device, dtype=torch.float32)
+        up_device = up_matrix.to(device=process_device, dtype=torch.float32)
 
-    lora_up = U @ torch.diag(S)
-    lora_down = Vh
+    q_up, r_up = torch.linalg.qr(up_device, mode="reduced")
+    q_down, r_down = torch.linalg.qr(down_device.T, mode="reduced")
+    core = r_up @ r_down.T
+    core_u, singular_values, core_vh = torch.linalg.svd(
+        core, full_matrices=False
+    )
+    new_rank, new_alpha, stats = _compute_resize(
+        singular_values,
+        max_rank,
+        dynamic_method,
+        dynamic_param,
+        scale,
+        min_rank,
+    )
 
-    return {
-        "lora_down": lora_down.cpu().contiguous(),
-        "lora_up": lora_up.cpu().contiguous(),
+    new_up = (q_up @ core_u[:, :new_rank]) * singular_values[:new_rank]
+    new_down = core_vh[:new_rank, :] @ q_down.T
+
+    if conv_layout is not None:
+        in_channels, kernel_h, kernel_w = conv_layout
+        new_up = new_up.reshape(new_up.shape[0], new_rank, 1, 1)
+        new_down = new_down.reshape(
+            new_rank, in_channels, kernel_h, kernel_w
+        )
+
+    result = {
+        "lora_down": new_down.cpu().contiguous(),
+        "lora_up": new_up.cpu().contiguous(),
         "new_rank": new_rank,
         "new_alpha": new_alpha,
-        **stats
+        **stats,
     }
+    del (
+        down_device,
+        up_device,
+        q_up,
+        r_up,
+        q_down,
+        r_down,
+        core,
+        core_u,
+        singular_values,
+        core_vh,
+        new_up,
+        new_down,
+    )
+    return result
 
 
-def _extract_conv(
-    weight: torch.Tensor,
+def _resize_lora_factors(
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
     max_rank: int,
     dynamic_method: Optional[str],
     dynamic_param: Optional[float],
     scale: float,
-    niter: int = 2,
+    min_rank: int = 1,
+    process_device: str = "cpu",
 ) -> Dict:
-    """Extract LoRA from merged conv weight."""
-    out_ch, in_ch, kh, kw = weight.shape
-    mat = weight.reshape(out_ch, -1)
-
-    if dynamic_method is None:
-        # Fixed rank - use svd_lowrank for 10x speedup
-        rank = min(max_rank, min(mat.shape) - 1)
-        U, S, Vh = torch.svd_lowrank(mat, q=rank, niter=niter)
-        Vh = Vh.T  # svd_lowrank returns V, not Vh
-        new_rank = rank
-        new_alpha = float(scale * new_rank)
-        stats = {"sum_retained": 1.0, "fro_retained": 1.0}  # Not computed for lowrank
-    else:
-        # Dynamic methods need full SVD to compute rank from all singular values
-        U, S, Vh = linalg.svd(mat, full_matrices=False)
-        new_rank, new_alpha, stats = _compute_resize(S, max_rank, dynamic_method, dynamic_param, scale)
-        U = U[:, :new_rank]
-        S = S[:new_rank]
-        Vh = Vh[:new_rank, :]
-
-    lora_up = (U @ torch.diag(S)).reshape(out_ch, new_rank, 1, 1)
-    lora_down = Vh.reshape(new_rank, in_ch, kh, kw)
-
-    return {
-        "lora_down": lora_down.cpu().contiguous(),
-        "lora_up": lora_up.cpu().contiguous(),
-        "new_rank": new_rank,
-        "new_alpha": new_alpha,
-        **stats
-    }
+    """Resize one pair with per-layer CUDA OOM fallback."""
+    try:
+        result = _resize_factors_on_device(
+            lora_down,
+            lora_up,
+            max_rank,
+            dynamic_method,
+            dynamic_param,
+            scale,
+            min_rank,
+            process_device,
+        )
+        result["cpu_fallback"] = False
+        return result
+    except BaseException as error:
+        if not str(process_device).startswith("cuda") or not _is_cuda_oom(error):
+            raise
+        error.__traceback__ = None
+        _release_cuda_after_oom()
+        try:
+            result = _resize_factors_on_device(
+                lora_down,
+                lora_up,
+                max_rank,
+                dynamic_method,
+                dynamic_param,
+                scale,
+                min_rank,
+                "cpu",
+            )
+        except BaseException as cpu_error:
+            raise RuntimeError(
+                f"CPU fallback failed while resizing LoRA layer: {cpu_error}"
+            ) from error
+        result["cpu_fallback"] = True
+        return result
 
 
 def _compute_resize(
@@ -467,7 +529,8 @@ def _compute_resize(
     max_rank: int,
     dynamic_method: Optional[str],
     dynamic_param: Optional[float],
-    scale: float
+    scale: float,
+    min_rank: int = 1,
 ) -> Tuple[int, float, Dict]:
     """Compute new rank and alpha based on resize method."""
 
@@ -482,11 +545,15 @@ def _compute_resize(
     else:
         new_rank = max_rank
 
-    # Clamp rank
+    available_rank = max(1, len(S))
+    effective_min_rank = min(max(1, min_rank), max_rank, available_rank)
     if S[0] < MIN_SV:
-        new_rank = 1
+        new_rank = effective_min_rank
     else:
-        new_rank = max(1, min(new_rank, max_rank, len(S) - 1))
+        new_rank = max(
+            effective_min_rank,
+            min(new_rank, max_rank, available_rank),
+        )
 
     new_alpha = float(scale * new_rank)
 
@@ -506,6 +573,73 @@ def _compute_resize(
     return new_rank, new_alpha, stats
 
 
+def _build_resize_work_units(handler, pairs, passthrough_keys, low_bit_keys):
+    """Plan raw-copy and streamed work without loading tensor payloads."""
+    raw_units = []
+    stream_units = []
+    claimed = set()
+    rank_counts = Counter()
+    preserved_companion_groups = 0
+
+    for block_name, block_keys in pairs.items():
+        tensor_keys = layer_tensor_keys(block_keys)
+        if "down" in block_keys:
+            rank_counts[int(handler.get_shape(block_keys["down"])[0])] += 1
+
+        entries = [
+            (role, key, canonical_lora_key(block_name, role))
+            for role, key in tensor_keys.items()
+        ]
+        related_passthrough = [
+            (None, key, key)
+            for key in passthrough_keys
+            if key.startswith(f"{block_name}.") and key not in claimed
+        ]
+
+        if layer_has_low_bit(block_keys, low_bit_keys):
+            raw_entries = entries + related_passthrough
+            raw_units.append({"entries": raw_entries})
+            claimed.update(key for _, key, _ in raw_entries)
+            continue
+
+        if layer_has_companions(block_keys):
+            preserved_companion_groups += 1
+            stream_units.append({"kind": "preserve", "entries": entries})
+        elif "down" in block_keys and "up" in block_keys:
+            stream_units.append({
+                "kind": "resize",
+                "entries": entries,
+                "alpha_output": (
+                    canonical_lora_key(block_name, "alpha")
+                    if "alpha" in block_keys
+                    else None
+                ),
+            })
+        else:
+            stream_units.append({"kind": "copy", "entries": entries})
+        claimed.update(key for _, key, _ in entries)
+
+    for key in passthrough_keys:
+        if key in claimed:
+            continue
+        entry = (None, key, key)
+        if key in low_bit_keys:
+            raw_units.append({"entries": [entry]})
+        else:
+            stream_units.append({"kind": "copy", "entries": [entry]})
+        claimed.add(key)
+
+    return raw_units, stream_units, rank_counts, preserved_companion_groups
+
+
+def _rank_summary(rank_counts: Counter) -> str:
+    if not rank_counts:
+        return "none"
+    return ", ".join(
+        f"{rank}x{count}" for rank, count in sorted(rank_counts.items())
+    )
+
+
 # =============================================================================
 # Main Resize Function
 # =============================================================================
@@ -519,202 +653,245 @@ def resize_lora_file(
     save_dtype: torch.dtype,
     output_filename: str,
     verbose: bool = True,
-    svd_niter: int = 2,
-    lazy_load: bool = True,
     force_clear_cache: bool = False,
+    min_rank: int = 1,
 ) -> str:
-    """
-    Resize a LoRA file to a new rank.
+    """Resize a LoRA through one bounded UEL stream and factor-space SVD."""
+    if min_rank < 1:
+        raise ValueError("min_rank must be at least 1")
+    if min_rank > new_rank:
+        raise ValueError("min_rank cannot exceed max rank")
 
-    Args:
-        lora_path: Path to input LoRA
-        new_rank: Target rank (max rank for dynamic methods)
-        dynamic_method: None, "sv_ratio", "sv_fro", "sv_cumulative"
-        dynamic_param: Parameter for dynamic method
-        device: Processing device
-        save_dtype: Output dtype
-        output_filename: Output filename (without extension)
-        verbose: Print progress info
-        svd_niter: Power iterations for SVD accuracy
-        lazy_load: Low memory mode: load tensors from disk on demand
-        force_clear_cache: Clear CUDA cache after each layer
-
-    Returns:
-        Path to saved resized LoRA
-    """
-    # Prepare memory
     lora_size_gb = estimate_model_size(lora_path)
-    prepare_for_large_operation(lora_size_gb * 2, torch.device(device))
+    prepare_for_large_operation(lora_size_gb, torch.device(device))
 
-    handler = MemoryEfficientSafeOpen(lora_path, low_memory=lazy_load)
+    handler = MemoryEfficientSafeOpen(lora_path, low_memory=True)
 
     try:
         low_bit_keys = inspect_low_bit_input(handler, f"LoRA ({lora_path})", "LoRA Resize")
         metadata = (handler.metadata() or {}).copy()
         all_keys = handler.keys()
 
-        # Detect format and extract pairs
         format_info = detect_lora_format(all_keys)
         pairs, passthrough_keys = parse_lora_layers(all_keys)
         validate_canonical_blocks(pairs, "LoRA Resize")
-        network_dim, network_alpha = detect_lora_rank(handler, pairs, low_bit_keys)
-
-        scale = network_alpha / network_dim if network_dim > 0 else 1.0
+        raw_units, stream_units, rank_counts, preserved_companion_groups = (
+            _build_resize_work_units(
+                handler, pairs, passthrough_keys, low_bit_keys
+            )
+        )
+        rank_text = _rank_summary(rank_counts)
 
         if verbose:
             method_str = f"{dynamic_method}: {dynamic_param}" if dynamic_method else "fixed"
             print(f"[LoRA Resize] Format: {format_info['format']}, layers: {format_info['key_count']}")
-            print(f"[LoRA Resize] Original dim={network_dim}, alpha={network_alpha:.1f}, scale={scale:.3f}")
-            print(f"[LoRA Resize] Resizing with method={method_str}, max_rank={new_rank}")
+            print(f"[LoRA Resize] Source ranks: {rank_text}")
+            print(
+                f"[LoRA Resize] Resizing with method={method_str}, "
+                f"min_rank={min_rank}, max_rank={new_rank}"
+            )
 
-        # Build metadata and output path before loop (all values known at this point)
         if dynamic_method:
-            metadata["ss_training_comment"] = f"Dynamic resize with {dynamic_method}: {dynamic_param} from dim {network_dim}"
-            metadata["ss_network_dim"] = "Dynamic"
-            metadata["ss_network_alpha"] = "Dynamic"
+            resize_description = f"Dynamic resize with {dynamic_method}: {dynamic_param}"
         else:
-            metadata["ss_training_comment"] = f"Resized from dim {network_dim} to {new_rank}"
-            metadata["ss_network_dim"] = str(new_rank)
-            metadata["ss_network_alpha"] = str(scale * new_rank)
+            resize_description = f"Fixed resize with maximum rank {new_rank}"
+        metadata["ss_training_comment"] = (
+            f"{resize_description}; source ranks {rank_text}"
+        )
+        metadata["ss_network_dim"] = "Dynamic"
+        metadata["ss_network_alpha"] = "Dynamic"
 
         output_dir = os.path.join(folder_paths.models_dir, "loras")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
 
         fro_list = []
-        preserved_companion_groups = 0
-        pbar = comfy.utils.ProgressBar(len(pairs) + len(passthrough_keys))
+        cpu_fallbacks = 0
+        total_units = len(raw_units) + len(stream_units)
+        pbar = comfy.utils.ProgressBar(total_units)
 
-        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
+        writer = IncrementalSafetensorsWriter(
+            output_path, metadata=metadata, max_workers=1
+        )
         writer.__enter__()
+        stream = None
         try:
-            preserved_keys = set()
             with torch.no_grad():
-                for block_name, block_keys in tqdm(pairs.items(), desc="Resizing layers", unit="layers"):
-                    tensor_keys = layer_tensor_keys(block_keys)
-                    if layer_has_companions(block_keys):
-                        for role, key in tensor_keys.items():
-                            output_key = canonical_lora_key(block_name, role)
-                            if key not in preserved_keys:
-                                write_preserved_tensor(writer, key, handler, output_key)
-                                preserved_keys.add(key)
-                        preserved_companion_groups += 1
-                        pbar.update(1)
-                        continue
-                    if layer_has_low_bit(block_keys, low_bit_keys):
-                        layer_keys = list(tensor_keys.items())
-                        layer_keys.extend(
-                            (None, key) for key in passthrough_keys if key.startswith(f"{block_name}.")
+                for unit in raw_units:
+                    for _, key, output_key in unit["entries"]:
+                        write_preserved_tensor(
+                            writer,
+                            key,
+                            handler,
+                            output_key,
+                            force_raw=True,
                         )
-                        for role, key in layer_keys:
-                            if key not in preserved_keys:
-                                output_key = canonical_lora_key(block_name, role) if role else key
-                                write_preserved_tensor(writer, key, handler, output_key)
-                                preserved_keys.add(key)
-                        pbar.update(1)
-                        continue
-                    direct_roles = [
-                        name for name in ("diff", "diff_b", "w_norm", "b_norm")
-                        if name in block_keys
-                    ]
-                    direct_keys = [block_keys[name] for name in direct_roles]
-                    layer_source_keys = [
-                        block_keys[name]
-                        for name in (
-                            "down", "up", "alpha", "mid", "reshape", "dora_scale",
-                            "diff", "diff_b", "w_norm", "b_norm", "set_weight",
-                        )
-                        if name in block_keys
-                    ]
-                    layer_source_dtypes = [handler.get_dtype(key) for key in layer_source_keys]
-                    if direct_keys:
-                        for role, key in zip(direct_roles, direct_keys):
-                            tensor = handler.get_tensor(key)
-                            target_dtype = select_output_dtype(
-                                layer_source_dtypes,
-                                save_dtype,
-                                is_1d_diff=tensor.ndim == 1,
-                            )
-                            writer.write(
-                                canonical_lora_key(block_name, role),
-                                tensor.to(target_dtype).cpu().contiguous(),
-                            )
-                        if "down" not in block_keys or "up" not in block_keys:
-                            pbar.update(1)
-                            continue
+                    pbar.update(1)
 
-                    if "down" not in block_keys or "up" not in block_keys:
-                        pbar.update(1)
-                        continue
-
-                    lora_down = handler.get_tensor(block_keys["down"])
-                    lora_up = handler.get_tensor(block_keys["up"])
-
-                    is_conv = len(lora_down.shape) == 4
-
-                    # Transfer to GPU with pinned memory if available
-                    if device == 'cuda':
-                        lora_down = transfer_to_gpu_pinned(lora_down, device, torch.float32)
-                        lora_up = transfer_to_gpu_pinned(lora_up, device, torch.float32)
-
-                    # Merge and re-extract
-                    if is_conv:
-                        weight = _merge_conv(lora_down, lora_up, device)
-                        result = _extract_conv(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
-                    else:
-                        weight = _merge_linear(lora_down, lora_up, device)
-                        result = _extract_linear(weight, new_rank, dynamic_method, dynamic_param, scale, svd_niter)
-
-                    del weight, lora_down, lora_up
-
-                    fro_list.append(result['fro_retained'])
-
-                    layer_dtype = select_output_dtype(
-                        layer_source_dtypes,
-                        save_dtype,
+                stream_keys = [
+                    key
+                    for unit in stream_units
+                    for _, key, _ in unit["entries"]
+                ]
+                if stream_keys:
+                    stream = handler.async_stream(
+                        stream_keys,
+                        batch_size=1,
+                        prefetch_batches=1,
+                        pin_memory=str(device).startswith("cuda"),
                     )
+                    stream_iterator = iter(stream)
+                    iterator = tqdm(
+                        stream_units, desc="Resizing layers", unit="layers"
+                    )
+                    for unit in iterator:
+                        loaded = {}
+                        unit_keys = []
+                        outputs = []
+                        result = None
+                        try:
+                            for role, expected_key, output_key in unit["entries"]:
+                                batch = next(stream_iterator)
+                                if len(batch) != 1 or batch[0][0] != expected_key:
+                                    raise RuntimeError(
+                                        "UEL resize stream returned tensors out of order"
+                                    )
+                                loaded[expected_key] = batch[0][1]
+                                unit_keys.append(expected_key)
 
-                    block_sd = {
-                        canonical_lora_key(block_name, "down"): result["lora_down"].to(layer_dtype),
-                        canonical_lora_key(block_name, "up"): result["lora_up"].to(layer_dtype),
-                    }
-                    alpha_key = canonical_lora_key(block_name, "alpha")
-                    block_sd[alpha_key] = torch.tensor(result["new_alpha"], dtype=layer_dtype)
+                            source_dtypes = [
+                                handler.get_dtype(key) for key in unit_keys
+                            ]
+                            if unit["kind"] == "preserve":
+                                outputs = [
+                                    (output_key, loaded[key].cpu().contiguous())
+                                    for _, key, output_key in unit["entries"]
+                                ]
+                            elif unit["kind"] == "copy":
+                                for role, key, output_key in unit["entries"]:
+                                    tensor = loaded[key]
+                                    target_dtype = select_output_dtype(
+                                        source_dtypes,
+                                        save_dtype,
+                                        is_1d_diff=(
+                                            role in {"diff", "diff_b", "w_norm", "b_norm"}
+                                            and tensor.ndim == 1
+                                        ),
+                                    )
+                                    outputs.append(
+                                        (
+                                            output_key,
+                                            tensor.to(target_dtype).cpu().contiguous(),
+                                        )
+                                    )
+                            else:
+                                by_role = {
+                                    role: (key, output_key)
+                                    for role, key, output_key in unit["entries"]
+                                    if role is not None
+                                }
+                                down_key, down_output = by_role["down"]
+                                up_key, up_output = by_role["up"]
+                                source_rank = int(loaded[down_key].shape[0])
+                                if "alpha" in by_role:
+                                    alpha_key, _ = by_role["alpha"]
+                                    scale = float(loaded[alpha_key].item()) / source_rank
+                                else:
+                                    scale = 1.0
 
-                    writer.write_dict(block_sd)
+                                result = _resize_lora_factors(
+                                    loaded[down_key],
+                                    loaded[up_key],
+                                    new_rank,
+                                    dynamic_method,
+                                    dynamic_param,
+                                    scale,
+                                    min_rank,
+                                    device,
+                                )
+                                fro_list.append(result["fro_retained"])
+                                cpu_fallbacks += int(result["cpu_fallback"])
+                                layer_dtype = select_output_dtype(
+                                    source_dtypes, save_dtype
+                                )
+                                outputs.extend(
+                                    [
+                                        (
+                                            down_output,
+                                            result["lora_down"].to(layer_dtype),
+                                        ),
+                                        (
+                                            up_output,
+                                            result["lora_up"].to(layer_dtype),
+                                        ),
+                                    ]
+                                )
+                                if unit["alpha_output"] is not None:
+                                    outputs.append(
+                                        (
+                                            unit["alpha_output"],
+                                            torch.tensor(
+                                                result["new_alpha"],
+                                                dtype=layer_dtype,
+                                            ),
+                                        )
+                                    )
+                                for role in ("diff", "diff_b", "w_norm", "b_norm"):
+                                    if role not in by_role:
+                                        continue
+                                    key, output_key = by_role[role]
+                                    tensor = loaded[key]
+                                    target_dtype = select_output_dtype(
+                                        source_dtypes,
+                                        save_dtype,
+                                        is_1d_diff=tensor.ndim == 1,
+                                    )
+                                    outputs.append(
+                                        (
+                                            output_key,
+                                            tensor.to(target_dtype).cpu().contiguous(),
+                                        )
+                                    )
 
-                    del result
-                    if force_clear_cache:
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                            writer.write_batch(outputs)
+                        finally:
+                            outputs.clear()
+                            if result is not None:
+                                result.clear()
+                            loaded.clear()
+                            for key in unit_keys:
+                                handler.mark_processed(key)
+                            if force_clear_cache:
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            pbar.update(1)
 
-                    pbar.update(1)
-
-                for key in tqdm(passthrough_keys, desc="Copying auxiliary tensors", unit="layers"):
-                    if key in preserved_keys:
+                    try:
+                        next(stream_iterator)
+                    except StopIteration:
                         pass
-                    elif key in low_bit_keys:
-                        write_preserved_tensor(writer, key, handler)
                     else:
-                        tensor = handler.get_tensor(key)
-                        target_dtype = select_output_dtype([handler.get_dtype(key)], save_dtype)
-                        writer.write(key, tensor.to(target_dtype).cpu().contiguous())
-                    pbar.update(1)
+                        raise RuntimeError("UEL resize stream returned extra tensors")
         finally:
+            if stream is not None:
+                close_stream = getattr(stream, "close", None)
+                if close_stream is not None:
+                    close_stream()
             writer.__exit__(None, None, None)
 
         if verbose and fro_list:
-            import numpy as np
-            avg_fro = np.mean(fro_list)
-            std_fro = np.std(fro_list)
+            avg_fro = sum(fro_list) / len(fro_list)
+            variance = sum((value - avg_fro) ** 2 for value in fro_list) / len(fro_list)
+            std_fro = variance ** 0.5
             print(f"[LoRA Resize] Average Frobenius retention: {avg_fro:.1%} ± {std_fro:.3f}")
         if preserved_companion_groups:
             logging.warning(
                 "[LoRA Resize] Preserved %d companion-bearing LoRA group(s) without rank transformation",
                 preserved_companion_groups,
             )
+        if verbose:
+            print(f"[LoRA Resize] CUDA OOM CPU fallbacks: {cpu_fallbacks}")
 
         print(f"[LoRA Resize] Saved to {output_path}")
         return output_path
@@ -737,18 +914,15 @@ class LoRAResizeFixed(io.ComfyNode):
             node_id="LoRAResizeFixed",
             display_name="LoRA Resize (Fixed Rank)",
             category="ModelUtils/LoRA/Resize",
-            description="Resize existing LoRA to a specific rank by merging and re-extracting via SVD.",
+            description="Resize existing LoRA to a specific supported rank using factor-space SVD.",
             inputs=[
                 io.Combo.Input("lora_name", options=folder_paths.get_filename_list("loras"),
                               tooltip="LoRA to resize"),
                 io.Int.Input("new_rank", default=64, min=1, max=3072,
                             tooltip="Target rank"),
-                io.Int.Input("svd_niter", default=2, min=0, max=10,
-                            tooltip="SVD power iterations (higher = more accurate but slower)"),
                 io.String.Input("output_filename", default="resized_lora"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
-                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -756,13 +930,13 @@ class LoRAResizeFixed(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, new_rank, svd_niter, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         path = resize_lora_file(
             lora_path, new_rank, None, None, device, dtype, output_filename,
-            svd_niter=svd_niter, lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            force_clear_cache=force_clear_cache,
         )
         return io.NodeOutput(path)
 
@@ -787,7 +961,6 @@ class LoRAResizeRatio(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora_ratio"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
-                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -795,13 +968,13 @@ class LoRAResizeRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         path = resize_lora_file(
             lora_path, max_rank, "sv_ratio", ratio, device, dtype, output_filename,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            force_clear_cache=force_clear_cache,
         )
         return io.NodeOutput(path)
 
@@ -821,12 +994,13 @@ class LoRAResizeFrobenius(io.ComfyNode):
                               tooltip="LoRA to resize"),
                 io.Int.Input("max_rank", default=128, min=1, max=3072,
                             tooltip="Maximum allowed rank"),
+                io.Int.Input("min_rank", default=1, min=1, max=3072,
+                            tooltip="Minimum retained rank when layer dimensions permit"),
                 io.Float.Input("target", default=0.9, min=0.1, max=1.0, step=0.01,
                               tooltip="Target Frobenius norm retention (0.9 = 90%)"),
                 io.String.Input("output_filename", default="resized_lora_fro"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
-                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -834,13 +1008,14 @@ class LoRAResizeFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         path = resize_lora_file(
             lora_path, max_rank, "sv_fro", target, device, dtype, output_filename,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            force_clear_cache=force_clear_cache,
+            min_rank=min_rank,
         )
         return io.NodeOutput(path)
 
@@ -865,7 +1040,6 @@ class LoRAResizeCumulative(io.ComfyNode):
                 io.String.Input("output_filename", default="resized_lora_cumulative"),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16"),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
-                io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
             outputs=[io.String.Output(display_name="output_path")],
@@ -873,13 +1047,13 @@ class LoRAResizeCumulative(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, lazy_load, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         path = resize_lora_file(
             lora_path, max_rank, "sv_cumulative", target, device, dtype, output_filename,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache
+            force_clear_cache=force_clear_cache,
         )
         return io.NodeOutput(path)
 

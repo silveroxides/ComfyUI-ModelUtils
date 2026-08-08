@@ -94,12 +94,19 @@ def layer_has_low_bit(block_keys: dict, low_bit_keys: set[str]) -> bool:
     )
 
 
-def write_preserved_tensor(writer, key: str, handler, output_key: str | None = None) -> None:
+def write_preserved_tensor(
+    writer,
+    key: str,
+    handler,
+    output_key: str | None = None,
+    *,
+    force_raw: bool = False,
+) -> None:
     """Copy one tensor's original safetensors bytes and dtype into an active writer."""
     destination = output_key or key
     header = _header(handler)
     entry = header[key]
-    if entry["dtype"] in UPSTREAM_WRITER_STORAGE_CODES:
+    if not force_raw and entry["dtype"] in UPSTREAM_WRITER_STORAGE_CODES:
         writer.write(destination, handler.get_tensor(key).cpu().contiguous())
         return
 
