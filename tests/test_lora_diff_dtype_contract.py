@@ -583,7 +583,6 @@ def test_standard_multi_merge_normalizes_mochi_pair_to_preferred_output(
     assert set(tensors) == {
         "diffusion_model.layer.lora_A.weight",
         "diffusion_model.layer.lora_B.weight",
-        "diffusion_model.layer.alpha",
     }
 
 
@@ -634,7 +633,7 @@ def test_standard_multi_merge_emits_weighted_direct_union(monkeypatch, tmp_path,
     assert tensors["diffusion_model.lowrank.lora_A.weight"].shape[0] == 2
     assert tensors["diffusion_model.lowrank.lora_A.weight"].dtype == torch.float32
     assert tensors["diffusion_model.lowrank.lora_B.weight"].dtype == torch.float32
-    assert tensors["diffusion_model.lowrank.alpha"].dtype == torch.float32
+    assert "diffusion_model.lowrank.alpha" not in tensors
 
     default_output = merger.merge_multi_loras(
         [str(first), str(second)], [2.0, -1.0], "concatenate", "cpu",

@@ -3,7 +3,8 @@ LoRA Multi-Merge - Merge multiple LoRAs into a single LoRA file.
 Resolves different naming conventions and ranks via concatenation.
 """
 import os
-import logging
+import gc
+from collections import Counter, deque
 import torch
 import folder_paths
 import comfy.utils
@@ -14,7 +15,6 @@ from .device_utils import estimate_model_size, prepare_for_large_operation, clea
 from .lora_resize import (
     canonical_lora_key,
     detect_lora_format,
-    detect_lora_rank,
     layer_has_companions,
     layer_tensor_keys,
     parse_lora_layers,
@@ -108,29 +108,6 @@ def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> 
     return layer_map
 
 
-def _load_direct_inputs(indices, lora_infos, handlers, kind, device, include_1d_diffs):
-    tensors = []
-    source_dtypes = []
-    expected_shape = None
-    for idx, orig_block in indices:
-        block_keys = lora_infos[idx]["pairs"][orig_block]
-        if kind not in block_keys:
-            continue  # Missing direct layers are implicit zero contributions.
-        key = block_keys[kind]
-        tensor = handlers[idx].get_tensor(key)
-        if tensor.ndim == 1 and not include_1d_diffs:
-            continue
-        if expected_shape is None:
-            expected_shape = tuple(tensor.shape)
-        elif tuple(tensor.shape) != expected_shape:
-            raise ValueError(
-                f"Direct LoRA shape mismatch for {key}: {tuple(tensor.shape)} != {expected_shape}"
-            )
-        source_dtypes.append(handlers[idx].get_dtype(key))
-        tensors.append((tensor.to(device=device, dtype=torch.float32), lora_infos[idx]["weight"]))
-    return tensors, source_dtypes
-
-
 def _logical_layer_dtypes(indices, lora_infos, handlers):
     source_dtypes = []
     for idx, orig_block in indices:
@@ -170,64 +147,11 @@ def _indices_have_low_bit(indices, lora_infos):
     )
 
 
-def _preserve_earliest_layer(writer, indices, lora_infos, handlers, written_keys):
-    """Write the earliest selected adapter's original representation unchanged."""
-    idx, block_name = min(indices, key=lambda item: item[0])
-    block_keys = lora_infos[idx]["pairs"][block_name]
-    count = 0
-    for name, key in layer_tensor_keys(block_keys).items():
-        output_key = canonical_lora_key(block_name, name)
-        if output_key in written_keys:
-            continue
-        write_preserved_tensor(writer, key, handlers[idx], output_key)
-        written_keys.add(output_key)
-        count += 1
-    for key in lora_infos[idx]["passthrough_keys"]:
-        if not key.startswith(f"{block_name}.") or key in written_keys:
-            continue
-        write_preserved_tensor(writer, key, handlers[idx])
-        written_keys.add(key)
-        count += 1
-    return count
-
-
 def _indices_have_companions(indices, lora_infos):
     return any(
         layer_has_companions(lora_infos[idx]["pairs"][block_name])
         for idx, block_name in indices
     )
-
-
-def _preserve_primary_passthrough(writer, lora_infos, handlers, written_keys):
-    count = 0
-    for key in lora_infos[0]["passthrough_keys"]:
-        if key in written_keys:
-            continue
-        write_preserved_tensor(writer, key, handlers[0])
-        written_keys.add(key)
-        count += 1
-    return count
-
-
-def _preserve_low_bit_auxiliaries(writer, lora_infos, handlers, written_keys):
-    """Preserve isolated unparsed low-bit tensors from the earliest adapter."""
-    count = 0
-    affected_keys = {
-        key
-        for info in lora_infos
-        for key in info["passthrough_keys"]
-        if key in info["low_bit_keys"]
-    }
-    for key in sorted(affected_keys):
-        for idx, info in enumerate(lora_infos):
-            if key not in info["passthrough_keys"]:
-                continue
-            if key not in written_keys:
-                write_preserved_tensor(writer, key, handlers[idx])
-                written_keys.add(key)
-                count += 1
-            break
-    return count
 
 
 def _ensure_guarded_layers_mapped(layer_map, lora_infos):
@@ -243,6 +167,708 @@ def _ensure_guarded_layers_mapped(layer_map, lora_infos):
                 layer_map.setdefault(block_name, []).append(entry)
 
 
+_DIRECT_MERGE_ROLES = ("diff", "diff_b", "w_norm", "b_norm")
+
+
+def _rank_distribution(handler, pairs, low_bit_keys):
+    ranks = Counter()
+    for block_keys in pairs.values():
+        if (
+            "down" in block_keys
+            and "up" in block_keys
+            and not layer_has_low_bit(block_keys, low_bit_keys)
+        ):
+            ranks[int(handler.get_shape(block_keys["down"])[0])] += 1
+    return ranks
+
+
+def _format_rank_distribution(ranks):
+    if not ranks:
+        return "none"
+    return ", ".join(f"{rank}x{count}" for rank, count in sorted(ranks.items()))
+
+
+def _append_work_entry(unit, claimed_sources, idx, key, output_key, role):
+    source = (idx, key)
+    if source in claimed_sources:
+        return
+    unit["entries"].append({
+        "idx": idx,
+        "key": key,
+        "output_key": output_key,
+        "role": role,
+    })
+    claimed_sources.add(source)
+
+
+def _build_merge_work_units(
+    layer_map, lora_infos, handlers, include_1d_diffs
+):
+    units = []
+    claimed_sources = set()
+    claimed_outputs = set()
+
+    for core, indices in layer_map.items():
+        guarded = _indices_have_companions(indices, lora_infos)
+        raw = _indices_have_low_bit(indices, lora_infos)
+        if guarded or raw:
+            idx, block_name = min(indices, key=lambda item: item[0])
+            block_keys = lora_infos[idx]["pairs"][block_name]
+            unit = {
+                "kind": "raw_copy" if raw else "copy",
+                "core": core,
+                "entries": [],
+            }
+            for role, key in layer_tensor_keys(block_keys).items():
+                output_key = canonical_lora_key(core, role)
+                if output_key in claimed_outputs:
+                    continue
+                _append_work_entry(
+                    unit, claimed_sources, idx, key, output_key, role
+                )
+                claimed_outputs.add(output_key)
+            for key in lora_infos[idx]["passthrough_keys"]:
+                if not key.startswith(f"{block_name}.") or key in claimed_outputs:
+                    continue
+                _append_work_entry(unit, claimed_sources, idx, key, key, None)
+                claimed_outputs.add(key)
+            if unit["entries"]:
+                units.append(unit)
+            continue
+
+        unit = {
+            "kind": "merge",
+            "core": core,
+            "indices": list(indices),
+            "entries": [],
+            "source_dtypes": _logical_layer_dtypes(
+                indices, lora_infos, handlers
+            ),
+        }
+        for idx, block_name in indices:
+            block_keys = lora_infos[idx]["pairs"][block_name]
+            if "down" in block_keys and "up" in block_keys:
+                for role in ("down", "up", "alpha"):
+                    if role in block_keys:
+                        _append_work_entry(
+                            unit,
+                            claimed_sources,
+                            idx,
+                            block_keys[role],
+                            None,
+                            role,
+                        )
+            for role in _DIRECT_MERGE_ROLES:
+                if role not in block_keys:
+                    continue
+                key = block_keys[role]
+                if (
+                    len(handlers[idx].get_shape(key)) == 1
+                    and not include_1d_diffs
+                ):
+                    continue
+                _append_work_entry(
+                    unit, claimed_sources, idx, key, None, role
+                )
+        if unit["entries"]:
+            units.append(unit)
+
+    affected_low_bit_passthrough = {
+        key
+        for info in lora_infos
+        for key in info["passthrough_keys"]
+        if key in info["low_bit_keys"]
+    }
+    for key in sorted(affected_low_bit_passthrough):
+        if key in claimed_outputs:
+            continue
+        for idx, info in enumerate(lora_infos):
+            if key not in info["passthrough_keys"]:
+                continue
+            unit = {"kind": "raw_copy", "core": key, "entries": []}
+            _append_work_entry(unit, claimed_sources, idx, key, key, None)
+            claimed_outputs.add(key)
+            units.append(unit)
+            break
+
+    for key in lora_infos[0]["passthrough_keys"]:
+        if (0, key) in claimed_sources or key in claimed_outputs:
+            continue
+        unit = {
+            "kind": (
+                "raw_copy"
+                if key in lora_infos[0]["low_bit_keys"]
+                else "copy"
+            ),
+            "core": key,
+            "entries": [],
+        }
+        _append_work_entry(unit, claimed_sources, 0, key, key, None)
+        claimed_outputs.add(key)
+        units.append(unit)
+
+    stream_keys = [[] for _ in handlers]
+    for unit in units:
+        if unit["kind"] == "raw_copy":
+            continue
+        for entry in unit["entries"]:
+            stream_keys[entry["idx"]].append(entry["key"])
+    return units, stream_keys
+
+
+class _AsyncTensorCursor:
+    def __init__(self, handler, keys, pin_memory):
+        self.handler = handler
+        self.expected = tuple(keys)
+        self.position = 0
+        self.pending = deque()
+        self.stream = None
+        if self.expected:
+            self.stream = handler.async_stream(
+                list(self.expected),
+                batch_size=1,
+                prefetch_batches=1,
+                pin_memory=pin_memory,
+            )
+
+    def take(self, expected_key):
+        if self.position >= len(self.expected):
+            raise RuntimeError(f"Unexpected tensor request: {expected_key}")
+        planned_key = self.expected[self.position]
+        if planned_key != expected_key:
+            raise RuntimeError(
+                f"UEL stream order mismatch: expected {planned_key}, requested {expected_key}"
+            )
+        if not self.pending:
+            self.pending.extend(next(self.stream))
+        key, tensor = self.pending.popleft()
+        if key != expected_key:
+            raise RuntimeError(
+                f"UEL yielded {key} while {expected_key} was expected"
+            )
+        self.position += 1
+        return tensor
+
+    def release(self, key):
+        self.handler.mark_processed(key)
+
+    def finish(self):
+        if self.position != len(self.expected) or self.pending:
+            raise RuntimeError("UEL stream ended before all planned tensors were consumed")
+        if self.stream is not None:
+            try:
+                next(self.stream)
+            except StopIteration:
+                pass
+            else:
+                raise RuntimeError("UEL stream yielded unplanned tensors")
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
+
+
+def _is_cuda_oom_error(error):
+    return isinstance(error, torch.cuda.OutOfMemoryError) or (
+        isinstance(error, RuntimeError)
+        and "out of memory" in str(error).lower()
+        and "cuda" in str(error).lower()
+    )
+
+
+def _release_cuda_oom_state():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _to_processing_device(tensor, process_device):
+    if process_device.type == "cuda":
+        return transfer_to_gpu_pinned(tensor, process_device, torch.float32)
+    return tensor.to(device=process_device, dtype=torch.float32)
+
+
+def _pad_rank(tensor, rank_dimension, target_rank):
+    if rank_dimension is None or tensor.shape[rank_dimension] == target_rank:
+        return tensor
+    padding = [0] * (tensor.ndim * 2)
+    reverse_dimension = tensor.ndim - 1 - rank_dimension
+    padding[reverse_dimension * 2 + 1] = (
+        target_rank - tensor.shape[rank_dimension]
+    )
+    return torch.nn.functional.pad(tensor, tuple(padding))
+
+
+def _ties_result(values):
+    stacked = torch.stack(values)
+    signs = torch.sign(stacked)
+    dominant_sign = torch.sign(signs.sum(dim=0))
+    mask = (signs == dominant_sign) & (dominant_sign != 0)
+    filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
+    return filtered.sum(dim=0) / torch.clamp(mask.sum(dim=0), min=1.0)
+
+
+def _dare_ties_merge(
+    contributions,
+    target_rank,
+    rank_dimension,
+    drop_rate,
+    trim_quantile,
+    generator,
+):
+    values = []
+    for tensor, weight in contributions:
+        value = _pad_rank(tensor, rank_dimension, target_rank) * weight
+        if drop_rate > 0:
+            mask = (
+                torch.rand(
+                    value.shape,
+                    generator=generator,
+                    device=value.device,
+                )
+                > drop_rate
+            ).to(value.dtype)
+            value = (value * mask) / (1 - drop_rate)
+        if trim_quantile > 0:
+            flat = value.abs().flatten()
+            k = int(flat.numel() * trim_quantile)
+            if k > 0:
+                threshold = torch.kthvalue(flat, k).values
+                value = torch.where(
+                    value.abs() < threshold, torch.zeros_like(value), value
+                )
+        values.append(value)
+    return _ties_result(values)
+
+
+def _enhanced_dare_ties_merge(
+    contributions,
+    target_rank,
+    rank_dimension,
+    mask_power,
+    min_keep_prob,
+    mask_smooth,
+    trim_quantile,
+    generator,
+):
+    values = []
+    for tensor, weight in contributions:
+        value = tensor * weight
+        absolute = value.abs()
+        maximum = absolute.max()
+        if maximum > 0:
+            probability = torch.clamp(
+                (absolute / maximum) ** max(mask_power, 0.001),
+                min=min_keep_prob,
+                max=1.0,
+            )
+            probability = torch.nan_to_num(probability)
+            random_mask = torch.bernoulli(probability, generator=generator)
+            value = value * torch.lerp(random_mask, probability, mask_smooth)
+        if trim_quantile > 0:
+            flat = value.abs().flatten()
+            k = max(1, int(flat.numel() * trim_quantile))
+            threshold = torch.kthvalue(flat, k).values
+            value = torch.where(
+                value.abs() < threshold, torch.zeros_like(value), value
+            )
+        values.append(_pad_rank(value, rank_dimension, target_rank))
+    return _ties_result(values)
+
+
+def _source_pair_scale(block_keys, loaded, idx, source_rank):
+    if "alpha" not in block_keys:
+        return 1.0
+    return float(loaded[(idx, block_keys["alpha"])].item()) / source_rank
+
+
+def _process_merge_unit_on_device(
+    unit,
+    loaded,
+    lora_infos,
+    strategy,
+    settings,
+    save_dtype,
+    process_device,
+    work_index,
+):
+    pair_contributions = []
+    direct_contributions = {role: [] for role in _DIRECT_MERGE_ROLES}
+    maximum_rank = 0
+
+    for idx, block_name in unit["indices"]:
+        info = lora_infos[idx]
+        block_keys = info["pairs"][block_name]
+        if "down" in block_keys and "up" in block_keys:
+            down_cpu = loaded[(idx, block_keys["down"])]
+            up_cpu = loaded[(idx, block_keys["up"])]
+            source_rank = int(down_cpu.shape[0])
+            if up_cpu.ndim < 2 or int(up_cpu.shape[1]) != source_rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {block_keys['down']} and {block_keys['up']}"
+                )
+            maximum_rank = max(maximum_rank, source_rank)
+            scale = _source_pair_scale(
+                block_keys, loaded, idx, source_rank
+            )
+            pair_contributions.append(
+                (
+                    _to_processing_device(down_cpu, process_device),
+                    _to_processing_device(up_cpu, process_device) * scale,
+                    float(info["weight"]),
+                )
+            )
+        for role in _DIRECT_MERGE_ROLES:
+            if role not in block_keys:
+                continue
+            key = block_keys[role]
+            source = loaded.get((idx, key))
+            if source is None:
+                continue
+            direct_contributions[role].append(
+                (
+                    _to_processing_device(source, process_device),
+                    float(info["weight"]),
+                )
+            )
+
+    generator = None
+    if strategy in {"dare", "enhanced_dare"}:
+        generator = torch.Generator(device=process_device).manual_seed(
+            (int(settings["seed"]) + work_index) % (2**63 - 1)
+        )
+
+    outputs = []
+    output_rank = None
+    if pair_contributions:
+        if strategy == "concatenate":
+            merged_down = torch.cat(
+                [down for down, _, _ in pair_contributions], dim=0
+            )
+            merged_up = torch.cat(
+                [up * weight for _, up, weight in pair_contributions], dim=1
+            )
+            output_rank = int(merged_down.shape[0])
+        elif strategy == "weighted_sum":
+            first_down, first_up, _ = pair_contributions[0]
+            target_down_shape = list(first_down.shape)
+            target_down_shape[0] = maximum_rank
+            target_up_shape = list(first_up.shape)
+            target_up_shape[1] = maximum_rank
+            merged_down = torch.zeros(
+                target_down_shape,
+                device=process_device,
+                dtype=torch.float32,
+            )
+            merged_up = torch.zeros(
+                target_up_shape,
+                device=process_device,
+                dtype=torch.float32,
+            )
+            for down, up, weight in pair_contributions:
+                merged_down.add_(_pad_rank(down, 0, maximum_rank), alpha=weight)
+                merged_up.add_(_pad_rank(up, 1, maximum_rank), alpha=weight)
+            output_rank = maximum_rank
+        elif strategy == "dare":
+            merged_down = _dare_ties_merge(
+                [(down, weight) for down, _, weight in pair_contributions],
+                maximum_rank,
+                0,
+                settings["drop_rate"],
+                settings["trim_quantile"],
+                generator,
+            )
+            merged_up = _dare_ties_merge(
+                [(up, weight) for _, up, weight in pair_contributions],
+                maximum_rank,
+                1,
+                settings["drop_rate"],
+                settings["trim_quantile"],
+                generator,
+            )
+            output_rank = maximum_rank
+        else:
+            merged_down = _enhanced_dare_ties_merge(
+                [(down, weight) for down, _, weight in pair_contributions],
+                maximum_rank,
+                0,
+                settings["mask_power"],
+                settings["min_keep_prob"],
+                settings["mask_smooth"],
+                settings["trim_quantile"],
+                generator,
+            )
+            merged_up = _enhanced_dare_ties_merge(
+                [(up, weight) for _, up, weight in pair_contributions],
+                maximum_rank,
+                1,
+                settings["mask_power"],
+                settings["min_keep_prob"],
+                settings["mask_smooth"],
+                settings["trim_quantile"],
+                generator,
+            )
+            output_rank = maximum_rank
+
+        layer_dtype = select_output_dtype(unit["source_dtypes"], save_dtype)
+        outputs.extend([
+            (
+                canonical_lora_key(unit["core"], "down"),
+                merged_down.to(layer_dtype).cpu().contiguous(),
+            ),
+            (
+                canonical_lora_key(unit["core"], "up"),
+                merged_up.to(layer_dtype).cpu().contiguous(),
+            ),
+        ])
+
+    for role, contributions in direct_contributions.items():
+        if not contributions:
+            continue
+        expected_shape = tuple(contributions[0][0].shape)
+        for tensor, _ in contributions[1:]:
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"Direct LoRA shape mismatch for {unit['core']}: "
+                    f"{tuple(tensor.shape)} != {expected_shape}"
+                )
+        if strategy in {"concatenate", "weighted_sum"}:
+            merged_direct = _merge_direct_weighted(contributions)
+        elif strategy == "dare":
+            merged_direct = _dare_ties_merge(
+                contributions,
+                0,
+                None,
+                settings["drop_rate"],
+                settings["trim_quantile"],
+                generator,
+            )
+        else:
+            merged_direct = _enhanced_dare_ties_merge(
+                contributions,
+                0,
+                None,
+                settings["mask_power"],
+                settings["min_keep_prob"],
+                settings["mask_smooth"],
+                settings["trim_quantile"],
+                generator,
+            )
+        direct_dtype = select_output_dtype(
+            unit["source_dtypes"],
+            save_dtype,
+            is_1d_diff=merged_direct.ndim == 1,
+        )
+        outputs.append(
+            (
+                canonical_lora_key(unit["core"], role),
+                merged_direct.to(direct_dtype).cpu().contiguous(),
+            )
+        )
+    return outputs, output_rank
+
+
+def _process_merge_unit(
+    unit,
+    loaded,
+    lora_infos,
+    strategy,
+    settings,
+    save_dtype,
+    device,
+    work_index,
+):
+    process_device = torch.device(device)
+    try:
+        outputs, rank = _process_merge_unit_on_device(
+            unit,
+            loaded,
+            lora_infos,
+            strategy,
+            settings,
+            save_dtype,
+            process_device,
+            work_index,
+        )
+        return outputs, rank, False
+    except Exception as error:
+        if process_device.type != "cuda" or not _is_cuda_oom_error(error):
+            raise
+        _release_cuda_oom_state()
+        outputs, rank = _process_merge_unit_on_device(
+            unit,
+            loaded,
+            lora_infos,
+            strategy,
+            settings,
+            save_dtype,
+            torch.device("cpu"),
+            work_index,
+        )
+        return outputs, rank, True
+
+
+def _run_multi_lora_merge(
+    lora_paths,
+    lora_weights,
+    strategy,
+    settings,
+    device,
+    save_dtype,
+    output_filename,
+    base_model_path,
+    verbose,
+    include_1d_diffs,
+):
+    operation_names = {
+        "concatenate": "LoRA Multi-Merge",
+        "weighted_sum": "LoRA Multi-Merge",
+        "dare": "LoRA Multi-Merge DARE",
+        "enhanced_dare": "LoRA Multi-Merge Enhanced DARE",
+    }
+    operation = operation_names[strategy]
+    total_size_gb = sum(estimate_model_size(path) for path in lora_paths)
+    if verbose:
+        print(f"[{operation}] Preparing memory for {total_size_gb:.2f}GB operation...")
+
+    prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
+    handlers = [MemoryEfficientSafeOpen(path, low_memory=True) for path in lora_paths]
+    cursors = []
+    try:
+        low_bit_sets = _inspect_lora_inputs(handlers, lora_paths, operation)
+        lora_infos = []
+        for idx, handler in enumerate(handlers):
+            keys = handler.keys()
+            pairs, passthrough_keys = parse_lora_layers(keys)
+            ranks = _rank_distribution(handler, pairs, low_bit_sets[idx])
+            info = {
+                "name": os.path.basename(lora_paths[idx]),
+                "format": detect_lora_format(keys),
+                "pairs": pairs,
+                "weight": lora_weights[idx],
+                "low_bit_keys": low_bit_sets[idx],
+                "passthrough_keys": passthrough_keys,
+                "ranks": ranks,
+            }
+            lora_infos.append(info)
+            if verbose:
+                print(
+                    f"[{operation}] LoRA {idx + 1} ({info['name']}): "
+                    f"{len(pairs)} layers, ranks={_format_rank_distribution(ranks)}, "
+                    f"format={info['format']['format']}"
+                )
+
+        layer_map = _build_layer_map(lora_infos, base_model_path)
+        validate_canonical_blocks(layer_map, operation)
+        _ensure_guarded_layers_mapped(layer_map, lora_infos)
+        units, stream_keys = _build_merge_work_units(
+            layer_map, lora_infos, handlers, include_1d_diffs
+        )
+        cursors = [
+            _AsyncTensorCursor(
+                handler,
+                keys,
+                pin_memory=torch.device(device).type == "cuda",
+            )
+            for handler, keys in zip(handlers, stream_keys)
+        ]
+
+        output_dir = os.path.join(folder_paths.models_dir, "loras")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(
+            output_dir, f"{output_filename.strip()}.safetensors"
+        )
+        metadata = {
+            "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via {strategy}",
+            "ss_network_module": "networks.lora",
+        }
+        output_ranks = Counter()
+        fallback_count = 0
+        tensor_count = 0
+        pbar = comfy.utils.ProgressBar(len(units))
+
+        with IncrementalSafetensorsWriter(
+            output_path, metadata=metadata, max_workers=1
+        ) as writer:
+            with torch.no_grad():
+                for work_index, unit in enumerate(
+                    tqdm(units, desc=f"Merging layers ({strategy})", unit="units")
+                ):
+                    if unit["kind"] == "raw_copy":
+                        for entry in unit["entries"]:
+                            write_preserved_tensor(
+                                writer,
+                                entry["key"],
+                                handlers[entry["idx"]],
+                                entry["output_key"],
+                                force_raw=True,
+                            )
+                            tensor_count += 1
+                        pbar.update(1)
+                        continue
+
+                    loaded = {}
+                    try:
+                        for entry in unit["entries"]:
+                            loaded[(entry["idx"], entry["key"])] = cursors[
+                                entry["idx"]
+                            ].take(entry["key"])
+                        if unit["kind"] == "copy":
+                            outputs = [
+                                (
+                                    entry["output_key"],
+                                    loaded[(entry["idx"], entry["key"])]
+                                    .cpu()
+                                    .contiguous(),
+                                )
+                                for entry in unit["entries"]
+                            ]
+                            output_rank = None
+                            cpu_fallback = False
+                        else:
+                            outputs, output_rank, cpu_fallback = _process_merge_unit(
+                                unit,
+                                loaded,
+                                lora_infos,
+                                strategy,
+                                settings,
+                                save_dtype,
+                                device,
+                                work_index,
+                            )
+                        if outputs:
+                            writer.write_batch(outputs)
+                            tensor_count += len(outputs)
+                        if output_rank is not None:
+                            output_ranks[output_rank] += 1
+                        fallback_count += int(cpu_fallback)
+                        outputs.clear()
+                    finally:
+                        for entry in unit["entries"]:
+                            source = (entry["idx"], entry["key"])
+                            if source not in loaded:
+                                continue
+                            del loaded[source]
+                            cursors[entry["idx"]].release(entry["key"])
+                        loaded.clear()
+                    pbar.update(1)
+
+        for cursor in cursors:
+            cursor.finish()
+        if verbose:
+            print(f"[{operation}] Output ranks: {_format_rank_distribution(output_ranks)}")
+            print(f"[{operation}] CUDA OOM CPU fallbacks: {fallback_count}")
+            print(f"[{operation}] Output state dict has {tensor_count} tensors")
+            print(f"[{operation}] Saved merged LoRA to {output_path}")
+        return output_path
+    finally:
+        for cursor in cursors:
+            cursor.close()
+        for handler in handlers:
+            handler.__exit__(None, None, None)
+        cleanup_after_operation()
+
+
 
 def merge_multi_loras(
     lora_paths: List[str],
@@ -255,260 +881,18 @@ def merge_multi_loras(
     verbose: bool = True,
     include_1d_diffs: bool = False,
 ) -> str:
-    """
-    Merge multiple LoRAs into a single LoRA file.
-
-    Modes:
-    - concatenate: Mathematically sound merge by stacking ranks.
-                   New rank = sum(input ranks). Alpha set to new rank.
-    - weighted_sum: Weighted sum of A and B weights (Kohya style).
-                    If ranks differ, smaller ones are zero-padded to match the largest rank.
-                    New rank = max(input ranks).
-    """
-    # Estimate memory
-    total_size_gb = sum(estimate_model_size(p) for p in lora_paths)
-    if verbose:
-        print(f"[LoRA Multi-Merge] Preparing memory for {total_size_gb:.2f}GB operation...")
-        print(f"[LoRA Multi-Merge] Mode: {merge_mode}")
-
-    prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
-
-    handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
-
-    try:
-        # 1. Analyze all LoRAs
-        layer_map = {}
-        lora_infos = []
-        low_bit_keys = _inspect_lora_inputs(handlers, lora_paths, "LoRA Multi-Merge")
-
-        for i, handler in enumerate(handlers):
-            keys = handler.keys()
-            fmt = detect_lora_format(keys)
-            pairs, passthrough_keys = parse_lora_layers(keys)
-            rank, alpha = detect_lora_rank(handler, pairs, low_bit_keys[i])
-
-            info = {
-                "name": os.path.basename(lora_paths[i]),
-                "format": fmt,
-                "pairs": pairs,
-                "rank": rank,
-                "alpha": alpha,
-                "weight": lora_weights[i],
-                "scale": alpha / rank if rank > 0 else 1.0,
-                "low_bit_keys": low_bit_keys[i],
-                "passthrough_keys": passthrough_keys,
-            }
-            lora_infos.append(info)
-
-            if verbose:
-                print(f"[LoRA Multi-Merge] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}, format={fmt['format']}")
-
-        layer_map = _build_layer_map(lora_infos, base_model_path)
-        validate_canonical_blocks(layer_map, "LoRA Multi-Merge")
-        _ensure_guarded_layers_mapped(layer_map, lora_infos)
-
-        if verbose:
-            print(f"[LoRA Multi-Merge] Total unique layers after resolving naming: {len(layer_map)}")
-
-        # Build metadata and output path before loop
-        metadata = {
-            "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via concatenation",
-            "ss_network_module": "networks.lora",
-        }
-        output_dir = os.path.join(folder_paths.models_dir, "loras")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-
-        pbar = comfy.utils.ProgressBar(len(layer_map))
-        tensor_count = 0
-        preserved_companion_groups = 0
-        written_keys = set()
-
-        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-        writer.__enter__()
-        try:
-            # 2. Merge each core layer
-            with torch.no_grad():
-                for core, indices in tqdm(layer_map.items(), desc="Merging layers", unit="layers"):
-                    if _indices_have_companions(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        preserved_companion_groups += 1
-                        pbar.update(1)
-                        continue
-                    if _indices_have_low_bit(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        pbar.update(1)
-                        continue
-                    logical_source_dtypes = _logical_layer_dtypes(indices, lora_infos, handlers)
-                    downs = []
-                    ups = []
-                    max_rank = 0
-
-                    # First pass: load and determine max rank
-                    for idx, orig_block in indices:
-                        info = lora_infos[idx]
-                        handler = handlers[idx]
-                        block_keys = info["pairs"][orig_block]
-
-                        if "down" not in block_keys or "up" not in block_keys:
-                            continue
-
-                        t_down = handler.get_tensor(block_keys["down"])
-                        t_up = handler.get_tensor(block_keys["up"])
-                        if device == 'cuda':
-                            t_down = transfer_to_gpu_pinned(t_down, device, torch.float32)
-                            t_up = transfer_to_gpu_pinned(t_up, device, torch.float32)
-                        else:
-                            t_down = t_down.to(device=device, dtype=torch.float32)
-                            t_up = t_up.to(device=device, dtype=torch.float32)
-
-                        # Store with original info for padding/weighting
-                        current_rank = t_down.shape[0]
-                        max_rank = max(max_rank, current_rank)
-
-                        # Apply scale immediately for concatenate mode, or keep for later
-                        if merge_mode == "concatenate":
-                            effective_weight = info["weight"] * info["scale"]
-                            t_up = t_up * effective_weight
-
-                        downs.append((t_down, info))
-                        ups.append((t_up, info))
-
-                    if downs and merge_mode == "concatenate":
-                        # Stack ranks
-                        merged_down = torch.cat([d[0] for d in downs], dim=0)
-                        merged_up = torch.cat([u[0] for u in ups], dim=1)
-                        new_rank = merged_down.shape[0]
-                        new_alpha = float(new_rank)
-                    elif downs:
-                        # weighted_sum (Kohya style)
-                        # Result = sum( weight_i * Padded(B_i) ), sum( weight_i * Padded(A_i) )
-                        # Note: We apply scale to weights here to normalize different alphas
-                        merged_down = torch.zeros_like(downs[0][0])
-                        # Need to handle different ranks via padding
-                        target_down_shape = list(downs[0][0].shape)
-                        target_down_shape[0] = max_rank
-                        target_up_shape = list(ups[0][0].shape)
-                        target_up_shape[1] = max_rank
-
-                        merged_down = torch.zeros(target_down_shape, device=device, dtype=torch.float32)
-                        merged_up = torch.zeros(target_up_shape, device=device, dtype=torch.float32)
-
-                        for (t_d, info_d), (t_u, info_u) in zip(downs, ups):
-                            r = t_d.shape[0]
-                            w = info_d["weight"]
-                            # We also apply sqrt(scale) to both to distribute the scale factor?
-                            # Kohya just uses weights. But to be safe with different alphas,
-                            # we apply scale to the final delta.
-                            # For direct weight merge, we'll just use weights.
-
-                            if r < max_rank:
-                                # Pad down: [r, in...] -> [max_rank, in...]
-                                pad_d = [0] * (len(t_d.shape) * 2)
-                                pad_d[-1] = max_rank - r # last dim in pad is first dim in tensor (reversed)
-                                # Wait, F.pad uses reverse order of dims.
-                                # For [r, in], padding is (0,0, 0, max_rank-r)
-                                padding_d = [0, 0] * (len(t_d.shape) - 1) + [0, max_rank - r]
-                                t_d = torch.nn.functional.pad(t_d, tuple(padding_d))
-
-                                # Pad up: [out, r...] -> [out, max_rank...]
-                                # For [out, r], padding is (0, max_rank-r, 0, 0)
-                                padding_u = [0, max_rank - r] + [0, 0] * (len(t_u.shape) - 1)
-                                t_u = torch.nn.functional.pad(t_u, tuple(padding_u))
-
-                            merged_down += w * t_d
-                            merged_up += w * t_u
-
-                        new_rank = max_rank
-                        # Alpha is usually max of alphas or same as rank
-                        new_alpha = float(max_rank)
-
-                    if downs:
-                        layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
-                        writer.write_dict({
-                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "alpha"): torch.tensor(new_alpha, dtype=layer_dtype),
-                        })
-                        tensor_count += 3
-                        written_keys.update({
-                            canonical_lora_key(core, "down"),
-                            canonical_lora_key(core, "up"),
-                            canonical_lora_key(core, "alpha"),
-                        })
-                        del merged_down, merged_up
-                        for d, _ in downs: del d
-                        for u, _ in ups: del u
-                        downs.clear()
-                        ups.clear()
-
-                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
-                        direct_inputs, _ = _load_direct_inputs(
-                            indices, lora_infos, handlers, kind, device, include_1d_diffs
-                        )
-                        if not direct_inputs:
-                            continue
-                        merged_direct = _merge_direct_weighted(direct_inputs)
-                        direct_dtype = select_output_dtype(
-                            logical_source_dtypes,
-                            save_dtype,
-                            is_1d_diff=merged_direct.ndim == 1,
-                        )
-                        writer.write(
-                            canonical_lora_key(core, kind),
-                            merged_direct.to(direct_dtype).cpu().contiguous(),
-                        )
-                        tensor_count += 1
-                        written_keys.add(canonical_lora_key(core, kind))
-                        del merged_direct
-                        for tensor, _ in direct_inputs:
-                            del tensor
-
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                    pbar.update(1)
-                tensor_count += _preserve_low_bit_auxiliaries(
-                    writer, lora_infos, handlers, written_keys
-                )
-                tensor_count += _preserve_primary_passthrough(
-                    writer, lora_infos, handlers, written_keys
-                )
-            if preserved_companion_groups:
-                logging.warning(
-                    "[LoRA Multi-Merge] Preserved %d companion-bearing group(s) from the earliest input",
-                    preserved_companion_groups,
-                )
-        finally:
-            writer.__exit__(None, None, None)
-
-        # 3. Final Summary
-        if verbose:
-            matched_stats = {i: 0 for i in range(len(lora_paths))}
-            for indices in layer_map.values():
-                for idx, block_name in indices:
-                    matched_stats[idx] += 1
-
-            print(f"[LoRA Multi-Merge] --- Merge Summary ---")
-            for i, info in enumerate(lora_infos):
-                print(f"[LoRA Multi-Merge] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge] Output state dict has {tensor_count} tensors")
-            print(f"[LoRA Multi-Merge] Saved merged LoRA to {output_path}")
-
-        return output_path
-
-    finally:
-        for h in handlers:
-            h.__exit__(None, None, None)
-        cleanup_after_operation()
-
-
+    return _run_multi_lora_merge(
+        lora_paths,
+        lora_weights,
+        merge_mode,
+        {},
+        device,
+        save_dtype,
+        output_filename,
+        base_model_path,
+        verbose,
+        include_1d_diffs,
+    )
 class LoRAMultiMerge(io.ComfyNode):
     """Merge multiple LoRAs into a single LoRA file."""
 
@@ -704,223 +1088,22 @@ def merge_multi_loras_dare(
     verbose: bool = True,
     include_1d_diffs: bool = False,
 ) -> str:
-    """
-    Merge multiple LoRAs using DARE-Ties method applied to weights.
-    Different ranks are handled via zero-padding to the max rank.
-    """
-    total_size_gb = sum(estimate_model_size(p) for p in lora_paths)
-    if verbose:
-        print(f"[LoRA Multi-Merge DARE] Preparing memory for {total_size_gb:.2f}GB operation...")
-        print(f"[LoRA Multi-Merge DARE] Drop rate: {drop_rate}, Trim quantile: {trim_quantile}")
-
-    prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
-    handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
-
-    rng = torch.Generator(device=device).manual_seed(seed)
-
-    try:
-        # 1. Analyze
-        layer_map = {}
-        lora_infos = []
-        low_bit_keys = _inspect_lora_inputs(
-            handlers, lora_paths, "LoRA Multi-Merge DARE"
-        )
-        for i, handler in enumerate(handlers):
-            keys = handler.keys()
-            fmt = detect_lora_format(keys)
-            pairs, passthrough_keys = parse_lora_layers(keys)
-            rank, alpha = detect_lora_rank(handler, pairs, low_bit_keys[i])
-            info = {
-                "name": os.path.basename(lora_paths[i]),
-                "pairs": pairs,
-                "rank": rank,
-                "alpha": alpha,
-                "weight": lora_weights[i],
-                "low_bit_keys": low_bit_keys[i],
-                "passthrough_keys": passthrough_keys,
-            }
-            lora_infos.append(info)
-
-            if verbose:
-                print(f"[LoRA Multi-Merge DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
-
-        layer_map = _build_layer_map(lora_infos, base_model_path)
-        validate_canonical_blocks(layer_map, "LoRA Multi-Merge DARE")
-        _ensure_guarded_layers_mapped(layer_map, lora_infos)
-
-        if verbose:
-            print(f"[LoRA Multi-Merge DARE] Total unique layers after resolving naming: {len(layer_map)}")
-
-        # Build output path before loop
-        output_dir = os.path.join(folder_paths.models_dir, "loras")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-
-        pbar = comfy.utils.ProgressBar(len(layer_map))
-        tensor_count = 0
-        preserved_companion_groups = 0
-        written_keys = set()
-
-        writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via DARE-Ties"})
-        writer.__enter__()
-        try:
-            # 2. Merge
-            with torch.no_grad():
-                for core, indices in tqdm(layer_map.items(), desc="Merging layers (DARE)", unit="layers"):
-                    if _indices_have_companions(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        preserved_companion_groups += 1
-                        pbar.update(1)
-                        continue
-                    if _indices_have_low_bit(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        pbar.update(1)
-                        continue
-                    logical_source_dtypes = _logical_layer_dtypes(indices, lora_infos, handlers)
-                    downs = []
-                    ups = []
-                    max_rank = 0
-
-                    for idx, orig_block in indices:
-                        info = lora_infos[idx]
-                        block_keys = info["pairs"][orig_block]
-                        if "down" not in block_keys or "up" not in block_keys: continue
-
-                        t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
-                        t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
-
-                        max_rank = max(max_rank, t_d.shape[0])
-                        downs.append((t_d, info["weight"]))
-                        ups.append((t_u, info["weight"]))
-
-                    def process_ties_dare(tensors, weights, dim_to_pad):
-                        # Pad all to max_rank
-                        padded = []
-                        for t, w in tensors:
-                            if dim_to_pad is not None and t.shape[dim_to_pad] < max_rank:
-                                padding = [0] * (len(t.shape) * 2)
-                                # dim_to_pad 0 (down) -> last pair in pad
-                                # dim_to_pad 1 (up) -> second to last pair in pad
-                                rev_dim = len(t.shape) - 1 - dim_to_pad
-                                padding[rev_dim*2 + 1] = max_rank - t.shape[dim_to_pad]
-                                t = torch.nn.functional.pad(t, tuple(padding))
-                            padded.append(t * w)
-
-                        # DARE
-                        if drop_rate > 0:
-                            for i in range(len(padded)):
-                                mask = (torch.rand(padded[i].shape, generator=rng, device=device) > drop_rate).float()
-                                padded[i] = (padded[i] * mask) / (1 - drop_rate)
-
-                        # TIES
-                        # 1. Trim
-                        if trim_quantile > 0:
-                            for i in range(len(padded)):
-                                flat = padded[i].abs().flatten()
-                                k = int(len(flat) * trim_quantile)
-                                if k > 0:
-                                    threshold = torch.kthvalue(flat, k).values
-                                    padded[i] = torch.where(padded[i].abs() < threshold, torch.zeros_like(padded[i]), padded[i])
-
-                        # 2. Elect & Merge
-                        stacked = torch.stack(padded) # [N, ...]
-                        signs = torch.sign(stacked)
-                        sum_signs = signs.sum(dim=0)
-                        dominant_sign = torch.sign(sum_signs)
-
-                        # Filter those matching dominant sign
-                        mask = (signs == dominant_sign) & (dominant_sign != 0)
-                        filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
-
-                        # Average matching signs
-                        count = mask.sum(dim=0)
-                        result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
-                        return result
-
-                    if downs:
-                        merged_down = process_ties_dare(downs, [1.0]*len(downs), 0)
-                        merged_up = process_ties_dare(ups, [1.0]*len(ups), 1)
-                        layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
-                        writer.write_dict({
-                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "alpha"): torch.tensor(float(max_rank), dtype=layer_dtype),
-                        })
-                        tensor_count += 3
-                        written_keys.update({
-                            canonical_lora_key(core, "down"),
-                            canonical_lora_key(core, "up"),
-                            canonical_lora_key(core, "alpha"),
-                        })
-                        del merged_down, merged_up
-                        for d, _ in downs: del d
-                        for u, _ in ups: del u
-                        downs.clear()
-                        ups.clear()
-
-                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
-                        direct_inputs, _ = _load_direct_inputs(
-                            indices, lora_infos, handlers, kind, device, include_1d_diffs
-                        )
-                        if not direct_inputs:
-                            continue
-                        merged_direct = process_ties_dare(
-                            direct_inputs, [1.0] * len(direct_inputs), None
-                        )
-                        direct_dtype = select_output_dtype(
-                            logical_source_dtypes,
-                            save_dtype,
-                            is_1d_diff=merged_direct.ndim == 1,
-                        )
-                        writer.write(canonical_lora_key(core, kind), merged_direct.to(direct_dtype).cpu().contiguous())
-                        tensor_count += 1
-                        written_keys.add(canonical_lora_key(core, kind))
-                        del merged_direct
-                        for tensor, _ in direct_inputs:
-                            del tensor
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                    pbar.update(1)
-                tensor_count += _preserve_low_bit_auxiliaries(
-                    writer, lora_infos, handlers, written_keys
-                )
-                tensor_count += _preserve_primary_passthrough(
-                    writer, lora_infos, handlers, written_keys
-                )
-            if preserved_companion_groups:
-                logging.warning(
-                    "[LoRA Multi-Merge DARE] Preserved %d companion-bearing group(s) from the earliest input",
-                    preserved_companion_groups,
-                )
-        finally:
-            writer.__exit__(None, None, None)
-
-        # Final Summary
-        if verbose:
-            matched_stats = {i: 0 for i in range(len(lora_paths))}
-            for indices in layer_map.values():
-                for idx, block_name in indices:
-                    matched_stats[idx] += 1
-
-            print(f"[LoRA Multi-Merge DARE] --- Merge Summary ---")
-            for i, info in enumerate(lora_infos):
-                print(f"[LoRA Multi-Merge DARE] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge DARE] Output state dict has {tensor_count} tensors")
-
-        return output_path
-
-    finally:
-        for h in handlers: h.__exit__(None, None, None)
-        cleanup_after_operation()
-
-
+    return _run_multi_lora_merge(
+        lora_paths,
+        lora_weights,
+        "dare",
+        {
+            "drop_rate": drop_rate,
+            "trim_quantile": trim_quantile,
+            "seed": seed,
+        },
+        device,
+        save_dtype,
+        output_filename,
+        base_model_path,
+        verbose,
+        include_1d_diffs,
+    )
 class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
     """Merge multiple LoRAs into a single LoRA file using Enhanced DARE-Ties method."""
 
@@ -1030,220 +1213,21 @@ def merge_multi_loras_dare_enhanced(
     verbose: bool = True,
     include_1d_diffs: bool = False,
 ) -> str:
-    """
-    Merge multiple LoRAs using Enhanced DARE-Ties method applied to weights.
-    Different ranks are handled via zero-padding to the max rank.
-    """
-    total_size_gb = sum(estimate_model_size(p) for p in lora_paths)
-    if verbose:
-        print(f"[LoRA Multi-Merge Enhanced DARE] Preparing memory for {total_size_gb:.2f}GB operation...")
-
-    prepare_for_large_operation(total_size_gb * 2.5, torch.device(device))
-    handlers = [MemoryEfficientSafeOpen(p, low_memory=True) for p in lora_paths]
-
-    rng = torch.Generator(device=device).manual_seed(seed)
-
-    try:
-        # 1. Analyze
-        layer_map = {}
-        lora_infos = []
-        low_bit_keys = _inspect_lora_inputs(
-            handlers, lora_paths, "LoRA Multi-Merge Enhanced DARE"
-        )
-        for i, handler in enumerate(handlers):
-            keys = handler.keys()
-            fmt = detect_lora_format(keys)
-            pairs, passthrough_keys = parse_lora_layers(keys)
-            rank, alpha = detect_lora_rank(handler, pairs, low_bit_keys[i])
-            info = {
-                "name": os.path.basename(lora_paths[i]),
-                "pairs": pairs,
-                "rank": rank,
-                "alpha": alpha,
-                "weight": lora_weights[i],
-                "low_bit_keys": low_bit_keys[i],
-                "passthrough_keys": passthrough_keys,
-            }
-            lora_infos.append(info)
-
-            if verbose:
-                print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1} ({info['name']}): {len(pairs)} layers, dim={rank}")
-
-        layer_map = _build_layer_map(lora_infos, base_model_path)
-        validate_canonical_blocks(layer_map, "LoRA Multi-Merge Enhanced DARE")
-        _ensure_guarded_layers_mapped(layer_map, lora_infos)
-
-        if verbose:
-            print(f"[LoRA Multi-Merge Enhanced DARE] Total unique layers after resolving naming: {len(layer_map)}")
-
-        # Build output path before loop
-        output_dir = os.path.join(folder_paths.models_dir, "loras")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
-
-        pbar = comfy.utils.ProgressBar(len(layer_map))
-        tensor_count = 0
-        preserved_companion_groups = 0
-        written_keys = set()
-
-        writer = IncrementalSafetensorsWriter(output_path, metadata={"ss_training_comment": "Merged via Enhanced DARE-Ties"})
-        writer.__enter__()
-        try:
-            # 2. Merge
-            with torch.no_grad():
-                for core, indices in tqdm(layer_map.items(), desc="Merging layers (Enhanced DARE)", unit="layers"):
-                    if _indices_have_companions(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        preserved_companion_groups += 1
-                        pbar.update(1)
-                        continue
-                    if _indices_have_low_bit(indices, lora_infos):
-                        tensor_count += _preserve_earliest_layer(
-                            writer, indices, lora_infos, handlers, written_keys
-                        )
-                        pbar.update(1)
-                        continue
-                    logical_source_dtypes = _logical_layer_dtypes(indices, lora_infos, handlers)
-                    downs = []
-                    ups = []
-                    max_rank = 0
-
-                    for idx, orig_block in indices:
-                        info = lora_infos[idx]
-                        block_keys = info["pairs"][orig_block]
-                        if "down" not in block_keys or "up" not in block_keys: continue
-
-                        t_d = handlers[idx].get_tensor(block_keys["down"]).to(device=device, dtype=torch.float32)
-                        t_u = handlers[idx].get_tensor(block_keys["up"]).to(device=device, dtype=torch.float32)
-
-                        max_rank = max(max_rank, t_d.shape[0])
-                        downs.append((t_d, info["weight"]))
-                        ups.append((t_u, info["weight"]))
-
-                    def process_ties_dare_enhanced(tensors, weights, dim_to_pad):
-                        processed = []
-                        for t, w in tensors:
-                            t_val = t * w
-
-                            # Enhanced DARE
-                            abs_t = torch.abs(t_val)
-                            max_val = torch.max(abs_t)
-                            if max_val > 0:
-                                prob = torch.clamp((abs_t / max_val) ** max(mask_power, 0.001), min=min_keep_prob, max=1.0)
-                                prob = torch.nan_to_num(prob)
-
-                                random_mask = torch.bernoulli(prob, generator=rng)
-                                interpolated_mask = torch.lerp(random_mask, prob, mask_smooth)
-
-                                t_val = t_val * interpolated_mask
-
-                            # TIES
-                            if trim_quantile > 0:
-                                flat = t_val.abs().flatten()
-                                k = max(1, int(len(flat) * trim_quantile))
-                                if k > 0:
-                                    threshold = torch.kthvalue(flat, k).values
-                                    t_val = torch.where(t_val.abs() < threshold, torch.zeros_like(t_val), t_val)
-
-                            # Pad
-                            if dim_to_pad is not None and t_val.shape[dim_to_pad] < max_rank:
-                                padding = [0] * (len(t_val.shape) * 2)
-                                rev_dim = len(t_val.shape) - 1 - dim_to_pad
-                                padding[rev_dim*2 + 1] = max_rank - t_val.shape[dim_to_pad]
-                                t_val = torch.nn.functional.pad(t_val, tuple(padding))
-
-                            processed.append(t_val)
-
-                        stacked = torch.stack(processed)
-                        signs = torch.sign(stacked)
-                        sum_signs = signs.sum(dim=0)
-                        dominant_sign = torch.sign(sum_signs)
-
-                        mask = (signs == dominant_sign) & (dominant_sign != 0)
-                        filtered = torch.where(mask, stacked, torch.zeros_like(stacked))
-
-                        count = mask.sum(dim=0)
-                        result = filtered.sum(dim=0) / torch.clamp(count, min=1.0)
-                        return result
-
-                    if downs:
-                        merged_down = process_ties_dare_enhanced(downs, [1.0]*len(downs), 0)
-                        merged_up = process_ties_dare_enhanced(ups, [1.0]*len(ups), 1)
-                        layer_dtype = select_output_dtype(logical_source_dtypes, save_dtype)
-                        writer.write_dict({
-                            canonical_lora_key(core, "down"): merged_down.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "up"): merged_up.to(layer_dtype).cpu().contiguous(),
-                            canonical_lora_key(core, "alpha"): torch.tensor(float(max_rank), dtype=layer_dtype),
-                        })
-                        tensor_count += 3
-                        written_keys.update({
-                            canonical_lora_key(core, "down"),
-                            canonical_lora_key(core, "up"),
-                            canonical_lora_key(core, "alpha"),
-                        })
-                        del merged_down, merged_up
-                        for d, _ in downs: del d
-                        for u, _ in ups: del u
-                        downs.clear()
-                        ups.clear()
-
-                    for kind in ("diff", "diff_b", "w_norm", "b_norm"):
-                        direct_inputs, _ = _load_direct_inputs(
-                            indices, lora_infos, handlers, kind, device, include_1d_diffs
-                        )
-                        if not direct_inputs:
-                            continue
-                        merged_direct = process_ties_dare_enhanced(
-                            direct_inputs, [1.0] * len(direct_inputs), None
-                        )
-                        direct_dtype = select_output_dtype(
-                            logical_source_dtypes,
-                            save_dtype,
-                            is_1d_diff=merged_direct.ndim == 1,
-                        )
-                        writer.write(canonical_lora_key(core, kind), merged_direct.to(direct_dtype).cpu().contiguous())
-                        tensor_count += 1
-                        written_keys.add(canonical_lora_key(core, kind))
-                        del merged_direct
-                        for tensor, _ in direct_inputs:
-                            del tensor
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                    pbar.update(1)
-                tensor_count += _preserve_low_bit_auxiliaries(
-                    writer, lora_infos, handlers, written_keys
-                )
-                tensor_count += _preserve_primary_passthrough(
-                    writer, lora_infos, handlers, written_keys
-                )
-            if preserved_companion_groups:
-                logging.warning(
-                    "[LoRA Multi-Merge Enhanced DARE] Preserved %d companion-bearing group(s) from the earliest input",
-                    preserved_companion_groups,
-                )
-        finally:
-            writer.__exit__(None, None, None)
-
-        # Final Summary
-        if verbose:
-            matched_stats = {i: 0 for i in range(len(lora_paths))}
-            for indices in layer_map.values():
-                for idx, block_name in indices:
-                    matched_stats[idx] += 1
-
-            print(f"[LoRA Multi-Merge Enhanced DARE] --- Merge Summary ---")
-            for i, info in enumerate(lora_infos):
-                print(f"[LoRA Multi-Merge Enhanced DARE] LoRA {i+1}: {matched_stats[i]}/{len(info['pairs'])} layers used in merge")
-            print(f"[LoRA Multi-Merge Enhanced DARE] Output state dict has {tensor_count} tensors")
-
-        return output_path
-
-    finally:
-        for h in handlers: h.__exit__(None, None, None)
-        cleanup_after_operation()
-
+    return _run_multi_lora_merge(
+        lora_paths,
+        lora_weights,
+        "enhanced_dare",
+        {
+            "mask_power": mask_power,
+            "min_keep_prob": min_keep_prob,
+            "mask_smooth": mask_smooth,
+            "trim_quantile": trim_quantile,
+            "seed": seed,
+        },
+        device,
+        save_dtype,
+        output_filename,
+        base_model_path,
+        verbose,
+        include_1d_diffs,
+    )
