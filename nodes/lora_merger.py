@@ -108,17 +108,20 @@ def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> 
     return layer_map
 
 
-def _logical_layer_dtypes(indices, lora_infos, handlers):
-    source_dtypes = []
+def _logical_output_dtypes(indices, lora_infos, handlers):
+    pair_dtypes = []
+    direct_dtypes = {role: [] for role in _DIRECT_MERGE_ROLES}
     for idx, orig_block in indices:
         block_keys = lora_infos[idx]["pairs"][orig_block]
-        for name in (
-            "down", "up", "alpha", "mid", "reshape", "dora_scale",
-            "diff", "diff_b", "w_norm", "b_norm", "set_weight",
-        ):
+        for name in ("down", "up"):
             if name in block_keys:
-                source_dtypes.append(handlers[idx].get_dtype(block_keys[name]))
-    return source_dtypes
+                pair_dtypes.append(handlers[idx].get_dtype(block_keys[name]))
+        for role in _DIRECT_MERGE_ROLES:
+            if role in block_keys:
+                direct_dtypes[role].append(
+                    handlers[idx].get_dtype(block_keys[role])
+                )
+    return pair_dtypes, direct_dtypes
 
 
 def _merge_direct_weighted(tensors):
@@ -236,14 +239,16 @@ def _build_merge_work_units(
                 units.append(unit)
             continue
 
+        pair_dtypes, direct_dtypes = _logical_output_dtypes(
+            indices, lora_infos, handlers
+        )
         unit = {
             "kind": "merge",
             "core": core,
             "indices": list(indices),
             "entries": [],
-            "source_dtypes": _logical_layer_dtypes(
-                indices, lora_infos, handlers
-            ),
+            "pair_source_dtypes": pair_dtypes,
+            "direct_source_dtypes": direct_dtypes,
         }
         for idx, block_name in indices:
             block_keys = lora_infos[idx]["pairs"][block_name]
@@ -610,7 +615,9 @@ def _process_merge_unit_on_device(
             )
             output_rank = maximum_rank
 
-        layer_dtype = select_output_dtype(unit["source_dtypes"], save_dtype)
+        layer_dtype = select_output_dtype(
+            unit["pair_source_dtypes"], save_dtype
+        )
         outputs.extend([
             (
                 canonical_lora_key(unit["core"], "down"),
@@ -655,7 +662,7 @@ def _process_merge_unit_on_device(
                 generator,
             )
         direct_dtype = select_output_dtype(
-            unit["source_dtypes"],
+            unit["direct_source_dtypes"][role],
             save_dtype,
             is_1d_diff=merged_direct.ndim == 1,
         )
@@ -754,7 +761,8 @@ def _run_multi_lora_merge(
             if verbose:
                 print(
                     f"[{operation}] LoRA {idx + 1} ({info['name']}): "
-                    f"{len(pairs)} layers, ranks={_format_rank_distribution(ranks)}, "
+                    f"{len(pairs)} target groups, "
+                    f"factor-pair ranks={_format_rank_distribution(ranks)}, "
                     f"format={info['format']['format']}"
                 )
 
@@ -764,6 +772,17 @@ def _run_multi_lora_merge(
         units, stream_keys = _build_merge_work_units(
             layer_map, lora_infos, handlers, include_1d_diffs
         )
+        if verbose:
+            coverage = Counter(len(indices) for indices in layer_map.values())
+            coverage_text = ", ".join(
+                f"{contributors}-input={count}"
+                for contributors, count in sorted(coverage.items())
+            )
+            print(
+                f"[{operation}] Merge plan: {len(layer_map)} unique target groups; "
+                f"contributor coverage: {coverage_text or 'none'}; "
+                f"execution work units: {len(units)}"
+            )
         cursors = [
             _AsyncTensorCursor(
                 handler,
@@ -792,7 +811,11 @@ def _run_multi_lora_merge(
         ) as writer:
             with torch.no_grad():
                 for work_index, unit in enumerate(
-                    tqdm(units, desc=f"Merging layers ({strategy})", unit="units")
+                    tqdm(
+                        units,
+                        desc=f"Merging target groups ({strategy})",
+                        unit="units",
+                    )
                 ):
                     if unit["kind"] == "raw_copy":
                         for entry in unit["entries"]:
@@ -856,9 +879,12 @@ def _run_multi_lora_merge(
         for cursor in cursors:
             cursor.finish()
         if verbose:
-            print(f"[{operation}] Output ranks: {_format_rank_distribution(output_ranks)}")
+            print(
+                f"[{operation}] Output factor-pair ranks: "
+                f"{_format_rank_distribution(output_ranks)}"
+            )
             print(f"[{operation}] CUDA OOM CPU fallbacks: {fallback_count}")
-            print(f"[{operation}] Output state dict has {tensor_count} tensors")
+            print(f"[{operation}] Output file contains {tensor_count} tensors")
             print(f"[{operation}] Saved merged LoRA to {output_path}")
         return output_path
     finally:

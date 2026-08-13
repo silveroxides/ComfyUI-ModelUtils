@@ -233,6 +233,67 @@ def test_nonconcatenate_variants_apply_source_alpha_once(
     )
 
 
+@pytest.mark.parametrize(
+    "strategy", ["concatenate", "weighted_sum", "dare", "enhanced_dare"]
+)
+def test_fp32_alpha_does_not_promote_bf16_factors(
+    monkeypatch, tmp_path, merger, strategy
+):
+    _patch_runtime(monkeypatch, tmp_path, merger)
+    first = tmp_path / f"bf16_alpha_first_{strategy}.safetensors"
+    second = tmp_path / f"bf16_alpha_second_{strategy}.safetensors"
+    tensors = {
+        "diffusion_model.layer.lora_A.weight": torch.ones(
+            (1, 2), dtype=torch.bfloat16
+        ),
+        "diffusion_model.layer.lora_B.weight": torch.ones(
+            (2, 1), dtype=torch.bfloat16
+        ),
+        "diffusion_model.layer.alpha": torch.tensor(1.0, dtype=torch.float32),
+    }
+    _write_uel(first, tensors)
+    _write_uel(second, tensors)
+    common = [str(first), str(second)], [1.0, 1.0]
+
+    if strategy in {"concatenate", "weighted_sum"}:
+        output = merger.merge_multi_loras(
+            *common,
+            strategy,
+            "cpu",
+            torch.bfloat16,
+            f"bf16_alpha_{strategy}",
+            verbose=False,
+        )
+    elif strategy == "dare":
+        output = merger.merge_multi_loras_dare(
+            *common,
+            0.0,
+            0.0,
+            17,
+            "cpu",
+            torch.bfloat16,
+            "bf16_alpha_dare",
+            verbose=False,
+        )
+    else:
+        output = merger.merge_multi_loras_dare_enhanced(
+            *common,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            17,
+            "cpu",
+            torch.bfloat16,
+            "bf16_alpha_enhanced",
+            verbose=False,
+        )
+
+    merged = _read_uel(output)
+    assert merged["diffusion_model.layer.lora_A.weight"].dtype == torch.bfloat16
+    assert merged["diffusion_model.layer.lora_B.weight"].dtype == torch.bfloat16
+
+
 def test_all_normal_inputs_use_async_uel_and_release_once(
     monkeypatch, tmp_path, merger
 ):
