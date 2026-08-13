@@ -214,13 +214,34 @@ def _svd_extract_linear_lowrank(
             pass
 
     # Construct LoRA matrices
-    lora_up = U @ torch.diag(S)  # [out_dim, rank]
+    lora_up = U * S.unsqueeze(0)  # [out_dim, rank]
     lora_down = Vh               # [rank, in_dim]
 
-    # Compute reconstruction diff
-    diff = weight - (lora_up @ lora_down)
+    return (lora_down, lora_up, None), "low rank"
 
-    return (lora_down, lora_up, diff), "low rank"
+
+def _svd_extract_knee_lowrank(
+    weight: torch.Tensor,
+    mode: str,
+    max_rank: int,
+    probe_offset: int,
+    niter: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Probe beyond the output rank and retry once when the knee hits the probe tail."""
+    max_possible_rank = min(weight.shape)
+    output_cap = max(1, min(max_rank, max_possible_rank))
+    offset = max(1, probe_offset)
+    probe_rank = min(max_possible_rank, output_cap + offset)
+    probe_limit = min(max_possible_rank, max(probe_rank, output_cap * 2))
+
+    while True:
+        U, S, V = torch.svd_lowrank(weight, q=probe_rank, niter=niter)
+        detected_rank = _compute_rank(S, mode, 0, None)
+        near_probe_tail = detected_rank >= max(1, probe_rank - offset)
+        if not near_probe_tail or probe_rank >= probe_limit:
+            rank = min(detected_rank, output_cap)
+            return U[:, :rank], S[:rank], V[:, :rank].T, rank
+        probe_rank = probe_limit
 
 
 def _svd_extract_linear(
@@ -231,6 +252,7 @@ def _svd_extract_linear(
     max_rank: int = None,
     clamp_quantile: float = 0.99,
     niter: int = 2,
+    knee_probe_offset: int = 32,
 ) -> tuple:
     """
     SVD decomposition for linear layers.
@@ -251,14 +273,18 @@ def _svd_extract_linear(
             target_rank = min(target_rank, max_rank)
         return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile, niter)
 
-    # For adaptive modes, use full SVD to analyze singular values
-    try:
-        U, S, Vh = linalg.svd(weight, full_matrices=False)
-    except Exception as e:
-        raise RuntimeError(f"SVD failed: {e}")
+    if mode in {"sv_knee", "sv_cumulative_knee"} and max_rank is not None:
+        U, S, Vh, rank = _svd_extract_knee_lowrank(
+            weight, mode, max_rank, knee_probe_offset, niter
+        )
+    else:
+        # Other adaptive modes require the full spectrum under their current contract.
+        try:
+            U, S, Vh = linalg.svd(weight, full_matrices=False)
+        except Exception as e:
+            raise RuntimeError(f"SVD failed: {e}")
 
-    # Compute rank based on mode
-    rank = _compute_rank(S, mode, mode_param, max_rank)
+        rank = _compute_rank(S, mode, mode_param, max_rank)
 
     # Check if decomposition is worthwhile
     if rank >= min(out_dim, in_dim):
@@ -279,13 +305,10 @@ def _svd_extract_linear(
 
     # Construct LoRA matrices
     # lora_up = U @ diag(S), lora_down = Vh
-    lora_up = U @ torch.diag(S)  # [out_dim, rank]
+    lora_up = U * S.unsqueeze(0)  # [out_dim, rank]
     lora_down = Vh               # [rank, in_dim]
 
-    # Compute reconstruction diff for optional sparse bias
-    diff = weight - (lora_up @ lora_down)
-
-    return (lora_down, lora_up, diff), "low rank"
+    return (lora_down, lora_up, None), "low rank"
 
 
 def _svd_extract_conv(
@@ -295,6 +318,7 @@ def _svd_extract_conv(
     device: str,
     max_rank: int = None,
     clamp_quantile: float = 0.99,
+    knee_probe_offset: int = 32,
 ) -> tuple:
     """
     SVD decomposition for conv2d layers.
@@ -311,7 +335,10 @@ def _svd_extract_conv(
     else:
         mat = weight.reshape(out_ch, -1)  # [out_ch, in_ch*k*k]
 
-    result, mode_str = _svd_extract_linear(mat, mode, mode_param, device, max_rank, clamp_quantile)
+    result, mode_str = _svd_extract_linear(
+        mat, mode, mode_param, device, max_rank, clamp_quantile,
+        knee_probe_offset=knee_probe_offset,
+    )
 
     if mode_str == "full":
         return weight, "full"
@@ -364,6 +391,7 @@ def _extract_chunked_layer(
     mode_param: float,
     device: str,
     max_rank: int = None,
+    knee_probe_offset: int = 32,
 ) -> tuple:
     """Extract LoRA from fused layer by chunking."""
     out_dim, in_dim = weight_diff.shape
@@ -376,7 +404,10 @@ def _extract_chunked_layer(
         chunk = weight_diff[i * chunk_size:(i + 1) * chunk_size, :]
 
         try:
-            result, mode_str = _svd_extract_linear(chunk, mode, mode_param, device, max_rank)
+            result, mode_str = _svd_extract_linear(
+                chunk, mode, mode_param, device, max_rank,
+                knee_probe_offset=knee_probe_offset,
+            )
             if mode_str == "full":
                 return None, None, 0
             lora_down, lora_up, _ = result
@@ -460,6 +491,7 @@ def extract_lora_from_files(
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
     include_1d_diffs: bool = False,
+    knee_probe_offset: int = 32,
 ) -> None:
     """
     Extract LoRA from difference between two models, writing incrementally to disk.
@@ -606,11 +638,13 @@ def extract_lora_from_files(
             try:
                 if is_conv:
                     result, mode_str = _svd_extract_conv(
-                        weight_diff, mode, conv_param, device, conv_max_rank, clamp_quantile
+                        weight_diff, mode, conv_param, device, conv_max_rank,
+                        clamp_quantile, knee_probe_offset
                     )
                 else:
                     result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile, svd_niter
+                        weight_diff, mode, linear_param, device, linear_max_rank,
+                        clamp_quantile, svd_niter, knee_probe_offset
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -619,7 +653,8 @@ def extract_lora_from_files(
                     if num_chunks > 1:
                         print(f"[LoRA Extract] Chunked: {key} ({num_chunks} chunks)")
                         lora_up, lora_down, rank = _extract_chunked_layer(
-                            weight_diff, num_chunks, mode, linear_param, device, linear_max_rank
+                            weight_diff, num_chunks, mode, linear_param, device,
+                            linear_max_rank, knee_probe_offset
                         )
                         if lora_up is not None:
                             layer_results[f"{lora_name}.lora_B.weight"] = lora_up.to(layer_save_dtype).cpu().contiguous()
@@ -922,6 +957,8 @@ class LoRAExtractKnee(io.ComfyNode):
                 *_get_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"],
                               default="sv_knee", tooltip="Knee detection method"),
+                io.Int.Input("knee_probe_offset", default=32, min=1, max=4096,
+                             tooltip="Extra singular values probed beyond Max Rank to avoid detecting a false knee at the partial-spectrum boundary."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for linear layers"),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
@@ -933,7 +970,8 @@ class LoRAExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
+                linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
                 include_1d_diffs=False) -> io.NodeOutput:
@@ -947,7 +985,8 @@ class LoRAExtractKnee(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs,
+            knee_probe_offset=knee_probe_offset,
         )
 
         return io.NodeOutput(output_path)

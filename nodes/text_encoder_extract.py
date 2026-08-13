@@ -82,6 +82,7 @@ def extract_te_from_files(
     lazy_load: bool = True,
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
+    knee_probe_offset: int = 32,
 ) -> None:
     """
     Extract LoRA/DoRA from difference between two Text Encoder models, writing incrementally to disk.
@@ -207,11 +208,13 @@ def extract_te_from_files(
             try:
                 if is_conv:
                     result, mode_str = _svd_extract_conv(
-                        weight_diff, mode, conv_param, device, conv_max_rank, clamp_quantile
+                        weight_diff, mode, conv_param, device, conv_max_rank,
+                        clamp_quantile, knee_probe_offset
                     )
                 else:
                     result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile, svd_niter
+                        weight_diff, mode, linear_param, device, linear_max_rank,
+                        clamp_quantile, svd_niter, knee_probe_offset
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -220,7 +223,8 @@ def extract_te_from_files(
                     if num_chunks > 1:
                         print(f"[TE Extract] Chunked: {key} ({num_chunks} chunks)")
                         lora_up, lora_down, rank = _extract_chunked_layer(
-                            weight_diff, num_chunks, mode, linear_param, device, linear_max_rank
+                            weight_diff, num_chunks, mode, linear_param, device,
+                            linear_max_rank, knee_probe_offset
                         )
                         if lora_up is not None:
                             # PEFT suffixes
@@ -451,6 +455,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
             inputs=[
                 *_get_te_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"], default="sv_knee", tooltip="Detect the knee from raw singular values or their cumulative distribution."),
+                io.Int.Input("knee_probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values probed beyond Max Rank to avoid detecting a false knee at the partial-spectrum boundary."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -460,7 +465,8 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
+                linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -474,7 +480,8 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -653,6 +660,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
             inputs=[
                 *_get_te_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"], default="sv_knee", tooltip="Detect the knee from raw singular values or their cumulative distribution."),
+                io.Int.Input("knee_probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values probed beyond Max Rank to avoid detecting a false knee at the partial-spectrum boundary."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -662,7 +670,8 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
+                linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -676,7 +685,8 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
         return io.NodeOutput(output_path)
 

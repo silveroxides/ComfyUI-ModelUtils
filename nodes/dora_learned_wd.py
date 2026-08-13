@@ -276,6 +276,7 @@ def _extract_chunked_learned_layer(
     early_stop_stall: int = 2000,
     early_stop_lr: float = 9.01e-9,
     layer_name: str = "Layer",
+    knee_probe_offset: int = 32,
 ) -> tuple:
     """Extract Learned DoRA from fused layer by chunking."""
     out_dim, in_dim = tensor_base.shape
@@ -296,7 +297,10 @@ def _extract_chunked_learned_layer(
         weight_diff = w_dir - chunk_base
 
         try:
-            result, mode_str = _svd_extract_linear(weight_diff, mode, mode_param, device, max_rank)
+            result, mode_str = _svd_extract_linear(
+                weight_diff, mode, mode_param, device, max_rank,
+                knee_probe_offset=knee_probe_offset,
+            )
             if mode_str == "full":
                 return None, None, 0
             lora_down, lora_up, _ = result
@@ -351,6 +355,7 @@ def extract_dora_learned_from_files(
     lazy_load: bool = True,
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
+    knee_probe_offset: int = 32,
 ) -> None:
     """
     Extract Learned DoRA from difference between two models.
@@ -465,11 +470,13 @@ def extract_dora_learned_from_files(
                 # 1. Run Analytical SVD (Initialization)
                 if is_conv:
                     result, mode_str = _svd_extract_conv(
-                        weight_diff, mode, conv_param, device, conv_max_rank, clamp_quantile
+                        weight_diff, mode, conv_param, device, conv_max_rank,
+                        clamp_quantile, knee_probe_offset
                     )
                 else:
                     result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank, clamp_quantile, svd_niter
+                        weight_diff, mode, linear_param, device, linear_max_rank,
+                        clamp_quantile, svd_niter, knee_probe_offset
                     )
 
                 # 2. Run Optimization (Learned Rounding)
@@ -492,7 +499,8 @@ def extract_dora_learned_from_files(
                             tensor_base, tensor_ft, num_chunks, mode, linear_param, device, linear_max_rank, optimize_iters, learning_rate,
                             optimizer_type, lr_schedule, lr_patience, lr_factor, lr_cooldown,
                             early_stop_loss, early_stop_stall, early_stop_lr,
-                            layer_name=lora_name
+                            layer_name=lora_name,
+                            knee_probe_offset=knee_probe_offset,
                         )
                         if lora_up is not None:
                             layer_results[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
@@ -719,6 +727,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
             inputs=[
                 *_get_model_inputs(),
                 io.Combo.Input("knee_method", options=["sv_knee", "sv_cumulative_knee"], default="sv_knee", tooltip="Detect the knee from raw singular values or their cumulative distribution."),
+                io.Int.Input("knee_probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values probed beyond Max Rank to avoid detecting a false knee at the partial-spectrum boundary."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_learned_inputs(),
@@ -729,7 +738,8 @@ class DoRALearnedExtractKnee(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, knee_method, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
+                linear_max_rank, conv_max_rank,
                 optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, chunk_large_layers, clamp_quantile, min_diff, mismatch_mode,
                 output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -741,7 +751,8 @@ class DoRALearnedExtractKnee(io.ComfyNode):
             model_a_path, model_b_path, knee_method, 0, 0,
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache,
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
 
         return io.NodeOutput(output_path)
