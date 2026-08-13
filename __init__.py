@@ -57,6 +57,7 @@ from .nodes.model_info_nodes import (
 
 
 from .nodes.lora_rename import AnimaLoraRename
+from .nodes.dtype_conversion import DiffusionModelDtypeConversion
 
 class ModelUtilsExtension(ComfyExtension):
     @override
@@ -105,6 +106,8 @@ class ModelUtilsExtension(ComfyExtension):
             LoRAMergeToModel,
             # LoRA Utilities
             AnimaLoraRename,
+            # Dtype Conversion
+            DiffusionModelDtypeConversion,
             # Downloaders
             CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
             VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,

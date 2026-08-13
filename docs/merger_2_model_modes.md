@@ -34,7 +34,7 @@
 ---
 
 ## Power-Up (DARE+TIES)
-> Combines DARE (Drop and Rescale) with TIES (Trim, Elect Sign) — the current best-practice algorithm for merging fine-tuned models, particularly LoRA-tuned ones. DARE sparsifies the task vector via random dropout and rescaling; TIES then removes residual low-magnitude noise and enforces sign consistency. The result is a cleaner, more targeted capability transfer from B to A with less interference.
+> Combines DARE (Drop and Rescale) with TIES (Trim, Elect Sign), the current best-practice algorithm for merging fine-tuned models, particularly LoRA-tuned ones. DARE sparsifies the task vector via random dropout and rescaling; TIES then removes residual low-magnitude noise and enforces sign consistency. The result is a cleaner, more targeted capability transfer from B to A with less interference.
 
 **Models Used:** A, B
 **Parameters:**

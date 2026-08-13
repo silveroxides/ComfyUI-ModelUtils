@@ -9,6 +9,7 @@ A collection of ComfyUI custom nodes for inspecting, modifying, merging, and cre
 - **PruneKeys** – Remove unwanted layers/keys from models
 - **Mergers** – Combine 2 or 3 models with configurable blend modes and ratios
 - **LoRA Extraction** – Extract LoRA adapters from model pairs using various SVD rank selection methods (Fixed, Ratio, Quantile, Knee-detection, Frobenius-norm)
+- **Diffusion Model Dtype Conversion** – Stream models to fp32, fp16, or bf16 while preserving excluded tensor dtypes
 
 ## Example Workflows
 

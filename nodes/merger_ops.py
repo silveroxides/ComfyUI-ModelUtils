@@ -322,11 +322,11 @@ class PowerUpOp(Operation):
 class DARETIESOp(Operation):
     """DARE + TIES combined operation on a single task vector (delta = b - a).
 
-    Step 1 — DARE: randomly drop `drop_rate` fraction of delta parameters,
+    Step 1, DARE: randomly drop `drop_rate` fraction of delta parameters,
                    rescale survivors by 1/(1-drop_rate).
-    Step 2 — TIES trim: zero out parameters below the `trim_quantile` magnitude threshold.
-    Step 3 — TIES elect: determine dominant sign per parameter position.
-    Step 4 — TIES merge: zero out parameters that disagree with the dominant sign.
+    Step 2, TIES trim: zero out parameters below the `trim_quantile` magnitude threshold.
+    Step 3, TIES elect: determine dominant sign per parameter position.
+    Step 4, TIES merge: zero out parameters that disagree with the dominant sign.
 
     For a two-model merge the TIES elect/merge step degenerates to a no-op (single vector,
     sign is always self-consistent) but the trim step still reduces interference from
@@ -762,9 +762,9 @@ class DARETIESMode(CalcMode):
     description = 'Adds capabilities of B to A using DARE (Drop and Rescale) followed by TIES (Trim, Elect Sign). Best practice for LoRA-tuned model merging.'
     models_used = ['A', 'B']
     param_docs = {
-        'alpha': 'DARE drop rate — fraction of delta parameters randomly zeroed. Higher = more aggressive sparsification.',
-        'beta':  'TIES trim quantile — fraction of smallest-magnitude delta parameters zeroed after DARE. Removes residual noise.',
-        'gamma': 'Lambda — scale multiplier applied to the final merged delta before adding to Model A.',
+        'alpha': 'DARE drop rate: fraction of delta parameters randomly zeroed. Higher = more aggressive sparsification.',
+        'beta':  'TIES trim quantile: fraction of smallest-magnitude delta parameters zeroed after DARE. Removes residual noise.',
+        'gamma': 'Lambda: scale multiplier applied to the final merged delta before adding to Model A.',
         'seed':  'Random seed for the DARE dropout mask.',
     }
 

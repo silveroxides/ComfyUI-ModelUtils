@@ -54,7 +54,7 @@ def _compile_patterns(pattern_string, glob_mode=False):
 def _matches_any_pattern(key, patterns, glob_mode=False):
     """Returns True if key matches any pattern.
 
-    Glob mode: fnmatch substring match — dots are literal, * matches any sequence.
+    Glob mode: fnmatch substring match; dots are literal, * matches any sequence.
     Regex mode: compiled re.Pattern substring search.
     """
     if glob_mode:
