@@ -43,6 +43,8 @@ def test_five_node_schema_contract(analysis):
     for node in analysis.MODEL_ANALYSIS_NODES:
         schema = node.define_schema()
         assert schema.category == "ModelUtils/Analysis"
+        assert schema.description
+        assert all(item.tooltip for item in schema.inputs)
         assert [item.id for item in schema.inputs[:3]] == [
             "execution_mode", "model_a", "model_b",
         ]

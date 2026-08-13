@@ -332,6 +332,8 @@ def test_all_ten_schemas_and_lora_switch_contract(cwb):
     for node in cwb.CWB_MERGER_NODES:
         schema = node.define_schema()
         ids = [value.id for value in schema.inputs]
+        assert schema.description
+        assert all(value.tooltip for value in schema.inputs)
         assert ids[:3] == ["execution_mode", "model_a", "model_b"]
         if node.INPUT_COUNT == 3:
             assert ids[3] == "model_c"

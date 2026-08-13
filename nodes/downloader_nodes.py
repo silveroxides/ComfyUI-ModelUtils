@@ -89,7 +89,7 @@ class CheckpointInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("checkpoints"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("checkpoints"), default="/", tooltip="Checkpoint subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="Checkpoint Downloader",
@@ -126,7 +126,7 @@ class DiffusionModelInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("diffusion_models"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("diffusion_models"), default="/", tooltip="Diffusion-model subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="Diffusion Model Downloader",
@@ -163,7 +163,7 @@ class LoRAInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("loras"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("loras"), default="/", tooltip="LoRA subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="LoRA Downloader",
@@ -200,7 +200,7 @@ class EmbeddingInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("embeddings"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("embeddings"), default="/", tooltip="Embedding subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="Embedding Downloader",
@@ -237,7 +237,7 @@ class VAEInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("vae"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("vae"), default="/", tooltip="VAE subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="VAE Downloader",
@@ -274,7 +274,7 @@ class ControlNetInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("controlnet"), default="/"))
+        inputs.insert(0, io.Combo.Input("subdirectory", options=get_subdirectories("controlnet"), default="/", tooltip="ControlNet subdirectory to scan; Recursive also includes its descendants."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="ControlNet Downloader",
@@ -311,7 +311,7 @@ class ManualPathInfoMetaDownloader(BaseInfoMetaDownloaderNode):
     @classmethod
     def define_schema(cls):
         inputs = list(cls.get_common_inputs().values())
-        inputs.append(io.String.Input("scan_dir", default=""))
+        inputs.append(io.String.Input("scan_dir", default="", tooltip="Absolute directory to scan for supported model files."))
         return io.Schema(
             node_id=cls.__name__,
             display_name="Manual Path Downloader",

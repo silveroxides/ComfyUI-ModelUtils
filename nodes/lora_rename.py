@@ -104,8 +104,9 @@ class AnimaLoraRename(io.ComfyNode):
                 io.Combo.Input(
                     "lora_name",
                     options=folder_paths.get_filename_list("loras"),
+                    tooltip="Diffusers-format Anima LoRA whose tensor keys will be renamed.",
                 ),
-                io.String.Input("output_filename", default="anima_lora_non_diffusers"),
+                io.String.Input("output_filename", default="anima_lora_non_diffusers", tooltip="Output filename without extension, written under ComfyUI's LoRA directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),

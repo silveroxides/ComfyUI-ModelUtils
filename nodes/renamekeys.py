@@ -78,10 +78,11 @@ class ModelRenameKeys(io.ComfyNode):
                 io.Combo.Input(
                     "diffusionmodel_name",
                     options=folder_paths.get_filename_list("diffusion_models"),
+                    tooltip="Diffusion model whose tensor keys will be renamed.",
                 ),
-                io.String.Input("old_keys", multiline=True, default=""),
-                io.String.Input("new_keys", multiline=True, default=""),
-                io.String.Input("output_filename", default="renamed_model"),
+                io.String.Input("old_keys", multiline=True, default="", tooltip="Existing key text or pattern, one entry per line, paired by line with New Keys."),
+                io.String.Input("new_keys", multiline=True, default="", tooltip="Replacement key text, one entry per line, paired by line with Old Keys."),
+                io.String.Input("output_filename", default="renamed_model", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -108,10 +109,11 @@ class TextEncoderRenameKeys(io.ComfyNode):
                 io.Combo.Input(
                     "textencoder_name",
                     options=folder_paths.get_filename_list("text_encoders"),
+                    tooltip="Text encoder whose tensor keys will be renamed.",
                 ),
-                io.String.Input("old_keys", multiline=True, default=""),
-                io.String.Input("new_keys", multiline=True, default=""),
-                io.String.Input("output_filename", default="renamed_textencoder"),
+                io.String.Input("old_keys", multiline=True, default="", tooltip="Existing key text or pattern, one entry per line, paired by line with New Keys."),
+                io.String.Input("new_keys", multiline=True, default="", tooltip="Replacement key text, one entry per line, paired by line with Old Keys."),
+                io.String.Input("output_filename", default="renamed_textencoder", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -138,10 +140,11 @@ class LoRARenameKeys(io.ComfyNode):
                 io.Combo.Input(
                     "lora_name",
                     options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA whose tensor keys will be renamed.",
                 ),
-                io.String.Input("old_keys", multiline=True, default=""),
-                io.String.Input("new_keys", multiline=True, default=""),
-                io.String.Input("output_filename", default="renamed_lora"),
+                io.String.Input("old_keys", multiline=True, default="", tooltip="Existing key text or pattern, one entry per line, paired by line with New Keys."),
+                io.String.Input("new_keys", multiline=True, default="", tooltip="Replacement key text, one entry per line, paired by line with Old Keys."),
+                io.String.Input("output_filename", default="renamed_lora", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -168,10 +171,11 @@ class CheckpointRenameKeys(io.ComfyNode):
                 io.Combo.Input(
                     "ckpt_name",
                     options=folder_paths.get_filename_list("checkpoints"),
+                    tooltip="Checkpoint whose tensor keys will be renamed.",
                 ),
-                io.String.Input("old_keys", multiline=True, default=""),
-                io.String.Input("new_keys", multiline=True, default=""),
-                io.String.Input("output_filename", default="renamed_checkpoint"),
+                io.String.Input("old_keys", multiline=True, default="", tooltip="Existing key text or pattern, one entry per line, paired by line with New Keys."),
+                io.String.Input("new_keys", multiline=True, default="", tooltip="Replacement key text, one entry per line, paired by line with Old Keys."),
+                io.String.Input("output_filename", default="renamed_checkpoint", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -198,10 +202,11 @@ class EmbeddingRenameKeys(io.ComfyNode):
                 io.Combo.Input(
                     "embedding",
                     options=folder_paths.get_filename_list("embeddings"),
+                    tooltip="Embedding whose tensor keys will be renamed.",
                 ),
-                io.String.Input("old_keys", multiline=True, default=""),
-                io.String.Input("new_keys", multiline=True, default=""),
-                io.String.Input("output_filename", default="renamed_embedding"),
+                io.String.Input("old_keys", multiline=True, default="", tooltip="Existing key text or pattern, one entry per line, paired by line with New Keys."),
+                io.String.Input("new_keys", multiline=True, default="", tooltip="Replacement key text, one entry per line, paired by line with Old Keys."),
+                io.String.Input("output_filename", default="renamed_embedding", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),

@@ -83,10 +83,11 @@ class ModelPruneKeys(io.ComfyNode):
                 io.Combo.Input(
                     "diffusionmodel_name",
                     options=folder_paths.get_filename_list("diffusion_models"),
+                    tooltip="Diffusion model from which matching tensor keys will be removed.",
                 ),
-                io.String.Input("keys_to_prune", multiline=True, default=""),
-                io.Boolean.Input("use_regex", default=False),
-                io.String.Input("output_filename", default="pruned_model"),
+                io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
+                io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
+                io.String.Input("output_filename", default="pruned_model", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -113,10 +114,11 @@ class TextEncoderPruneKeys(io.ComfyNode):
                 io.Combo.Input(
                     "textencoder_name",
                     options=folder_paths.get_filename_list("text_encoders"),
+                    tooltip="Text encoder from which matching tensor keys will be removed.",
                 ),
-                io.String.Input("keys_to_prune", multiline=True, default=""),
-                io.Boolean.Input("use_regex", default=False),
-                io.String.Input("output_filename", default="pruned_textencoder"),
+                io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
+                io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
+                io.String.Input("output_filename", default="pruned_textencoder", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -143,10 +145,11 @@ class LoRAPruneKeys(io.ComfyNode):
                 io.Combo.Input(
                     "lora_name",
                     options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA from which matching tensor keys will be removed.",
                 ),
-                io.String.Input("keys_to_prune", multiline=True, default=""),
-                io.Boolean.Input("use_regex", default=False),
-                io.String.Input("output_filename", default="pruned_lora"),
+                io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
+                io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
+                io.String.Input("output_filename", default="pruned_lora", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -173,10 +176,11 @@ class CheckpointPruneKeys(io.ComfyNode):
                 io.Combo.Input(
                     "ckpt_name",
                     options=folder_paths.get_filename_list("checkpoints"),
+                    tooltip="Checkpoint from which matching tensor keys will be removed.",
                 ),
-                io.String.Input("keys_to_prune", multiline=True, default=""),
-                io.Boolean.Input("use_regex", default=False),
-                io.String.Input("output_filename", default="pruned_checkpoint"),
+                io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
+                io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
+                io.String.Input("output_filename", default="pruned_checkpoint", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),
@@ -203,10 +207,11 @@ class EmbeddingPruneKeys(io.ComfyNode):
                 io.Combo.Input(
                     "embedding",
                     options=folder_paths.get_filename_list("embeddings"),
+                    tooltip="Embedding from which matching tensor keys will be removed.",
                 ),
-                io.String.Input("keys_to_prune", multiline=True, default=""),
-                io.Boolean.Input("use_regex", default=False),
-                io.String.Input("output_filename", default="pruned_embedding"),
+                io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
+                io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
+                io.String.Input("output_filename", default="pruned_embedding", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
                 io.String.Output(display_name="output_path"),

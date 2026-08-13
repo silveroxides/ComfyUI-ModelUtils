@@ -1025,9 +1025,21 @@ class ModelAnalysisLogic:
 
 def _common_inputs(model_type: str, *, alignment_control: bool):
     inputs = [
-        io.Combo.Input("execution_mode", options=["ANALYZE", "DOCUMENTATION ONLY"]),
-        io.Combo.Input("model_a", options=folder_paths.get_filename_list(model_type)),
-        io.Combo.Input("model_b", options=folder_paths.get_filename_list(model_type)),
+        io.Combo.Input(
+            "execution_mode",
+            options=["ANALYZE", "DOCUMENTATION ONLY"],
+            tooltip="ANALYZE streams both files and produces standard and CWB diagnostic reports. DOCUMENTATION ONLY performs no model loading.",
+        ),
+        io.Combo.Input(
+            "model_a",
+            options=folder_paths.get_filename_list(model_type),
+            tooltip="First file in the comparison. Reports identify values and keys unique to this input separately from Model B.",
+        ),
+        io.Combo.Input(
+            "model_b",
+            options=folder_paths.get_filename_list(model_type),
+            tooltip="Second file in the comparison. Inputs are analyzed only; neither file is modified or merged.",
+        ),
     ]
     if alignment_control:
         inputs.append(io.Boolean.Input(
@@ -1039,9 +1051,23 @@ def _common_inputs(model_type: str, *, alignment_control: bool):
             ),
         ))
     inputs.extend([
-        io.Int.Input("top_weight_differences", default=20, min=0, max=1000),
-        io.Combo.Input("process_device", options=["cuda", "cpu"]),
-        io.Boolean.Input("force_clear_cache", default=True),
+        io.Int.Input(
+            "top_weight_differences",
+            default=20,
+            min=0,
+            max=1000,
+            tooltip="Number of largest individual absolute parameter differences retained for the detailed report. Zero disables this list.",
+        ),
+        io.Combo.Input(
+            "process_device",
+            options=["cuda", "cpu"],
+            tooltip="Device for per-work-unit floating-point analysis. A CUDA OOM retries only the affected unit on CPU.",
+        ),
+        io.Boolean.Input(
+            "force_clear_cache",
+            default=True,
+            tooltip="Run garbage collection and clear the CUDA allocator cache after every analyzed work unit. Saves retained memory but slows analysis.",
+        ),
     ])
     return inputs
 
@@ -1059,6 +1085,7 @@ class _ModelAnalysisNode(io.ComfyNode):
             node_id=cls.NODE_ID,
             display_name=cls.DISPLAY_NAME,
             category="ModelUtils/Analysis",
+            description="Compare two model files without merging them and return separate standard-metric and CWB-diagnostic reports.",
             inputs=_common_inputs(
                 cls.MODEL_TYPE,
                 alignment_control=cls.EMBEDDING_ALIGNMENT or cls.LORA_MODE,

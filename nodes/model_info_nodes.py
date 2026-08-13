@@ -53,8 +53,8 @@ class CheckpointInfoLoader(BaseModelInfoLoader):
             display_name="Checkpoint Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("checkpoint", options=folder_paths.get_filename_list("checkpoints")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("checkpoint", options=folder_paths.get_filename_list("checkpoints"), tooltip="Checkpoint whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),
@@ -76,8 +76,8 @@ class LoRAInfoLoader(BaseModelInfoLoader):
             display_name="LoRA Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("lora", options=folder_paths.get_filename_list("loras")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("lora", options=folder_paths.get_filename_list("loras"), tooltip="LoRA whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),
@@ -99,8 +99,8 @@ class EmbeddingInfoLoader(BaseModelInfoLoader):
             display_name="Embedding Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("embedding", options=folder_paths.get_filename_list("embeddings")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("embedding", options=folder_paths.get_filename_list("embeddings"), tooltip="Embedding whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),
@@ -122,8 +122,8 @@ class VAEInfoLoader(BaseModelInfoLoader):
             display_name="VAE Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("vae", options=folder_paths.get_filename_list("vae")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("vae", options=folder_paths.get_filename_list("vae"), tooltip="VAE whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),
@@ -145,8 +145,8 @@ class ControlNetInfoLoader(BaseModelInfoLoader):
             display_name="ControlNet Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("controlnet", options=folder_paths.get_filename_list("controlnet")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("controlnet", options=folder_paths.get_filename_list("controlnet"), tooltip="ControlNet whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),
@@ -168,8 +168,8 @@ class DiffusionModelInfoLoader(BaseModelInfoLoader):
             display_name="Diffusion Model Info Loader",
             category=cls.CATEGORY,
             inputs=[
-                io.Combo.Input("diffusion_model", options=folder_paths.get_filename_list("diffusion_models")),
-                io.Int.Input("workflow_index", default=0, min=0, max=100)
+                io.Combo.Input("diffusion_model", options=folder_paths.get_filename_list("diffusion_models"), tooltip="Diffusion model whose downloaded information and example workflow will be returned."),
+                io.Int.Input("workflow_index", default=0, min=0, max=100, tooltip="Zero-based index of the saved example workflow to return when multiple workflows are available.")
             ],
             outputs=[
                 io.Image.Output(display_name="preview"),

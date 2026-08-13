@@ -56,6 +56,7 @@ class ModelMetaKeys(io.ComfyNode):
                 io.Combo.Input(
                     "diffusionmodel_name",
                     options=folder_paths.get_filename_list("diffusion_models"),
+                    tooltip="Diffusion model whose safetensors metadata and tensor keys will be listed.",
                 ),
             ],
             outputs=[
@@ -82,6 +83,7 @@ class TextEncoderMetaKeys(io.ComfyNode):
                 io.Combo.Input(
                     "textencoder_name",
                     options=folder_paths.get_filename_list("text_encoders"),
+                    tooltip="Text encoder whose safetensors metadata and tensor keys will be listed.",
                 ),
             ],
             outputs=[
@@ -108,6 +110,7 @@ class LoRAMetaKeys(io.ComfyNode):
                 io.Combo.Input(
                     "lora_name",
                     options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA whose safetensors metadata and tensor keys will be listed.",
                 ),
             ],
             outputs=[
@@ -134,6 +137,7 @@ class CheckpointMetaKeys(io.ComfyNode):
                 io.Combo.Input(
                     "ckpt_name",
                     options=folder_paths.get_filename_list("checkpoints"),
+                    tooltip="Checkpoint whose safetensors metadata and tensor keys will be listed.",
                 ),
             ],
             outputs=[
@@ -160,6 +164,7 @@ class EmbeddingMetaKeys(io.ComfyNode):
                 io.Combo.Input(
                     "embedding",
                     options=folder_paths.get_filename_list("embeddings"),
+                    tooltip="Embedding whose safetensors metadata and tensor keys will be listed.",
                 ),
             ],
             outputs=[
