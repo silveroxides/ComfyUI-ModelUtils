@@ -25,7 +25,7 @@ from .device_utils import (
     estimate_model_size,
     prepare_for_large_operation,
 )
-from .merger import load_documentation_from_file
+from .merger import _compile_patterns, _matches_any_pattern, load_documentation_from_file
 from .lora_resize import layer_tensor_keys, parse_lora_layers, validate_canonical_blocks
 from .quantization_guard import inspect_low_bit_input
 
@@ -618,6 +618,8 @@ def _render_comparison(
         f"Shape mismatches: {len(inventory['shape'])}",
         f"Non-floating shared tensors: {len(inventory['nonfloat'])}",
         f"Unsupported low-bit tensors: {len(inventory['low_bit'])}",
+        f"Excluded A tensors: {len(inventory['excluded_a'])}",
+        f"Excluded B tensors: {len(inventory['excluded_b'])}",
         f"CUDA OOM CPU fallbacks: {len(fallback_keys)}",
         "",
         "PARAMETER-WEIGHTED GLOBAL METRICS",
@@ -671,6 +673,7 @@ def _render_comparison(
     for label, name in (
         ("A ONLY", "a_only"), ("B ONLY", "b_only"), ("SHAPE MISMATCH", "shape"),
         ("NON-FLOATING", "nonfloat"), ("LOW-BIT UNSUPPORTED", "low_bit"),
+        ("EXCLUDED A", "excluded_a"), ("EXCLUDED B", "excluded_b"),
     ):
         lines.append(f"[{label}] ({len(inventory[name])})")
         lines.extend(f"- {value}" for value in inventory[name])
@@ -773,9 +776,26 @@ class ModelAnalysisLogic:
             similarity_alignment = bool(params.get("cwb_similarity_alignment", False))
             keys_a = set(handlers[0].keys())
             keys_b = set(handlers[1].keys())
+            glob_mode = bool(params.get("glob_patterns", False))
+            excluded_patterns = _compile_patterns(
+                params.get("exclude_patterns", ""),
+                glob_mode=glob_mode,
+            )
+            excluded_a = {
+                key for key in keys_a
+                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode)
+            }
+            excluded_b = {
+                key for key in keys_b
+                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode)
+            }
+            keys_a.difference_update(excluded_a)
+            keys_b.difference_update(excluded_b)
             inventory = {
                 "a_only": [], "b_only": [],
                 "shape": [], "nonfloat": [], "low_bit": [],
+                "excluded_a": sorted(excluded_a),
+                "excluded_b": sorted(excluded_b),
             }
             units: list[tuple[str, str, str]] = []
             lora_pairs: list[tuple[str, dict[str, str], dict[str, str]]] = []
@@ -1067,6 +1087,17 @@ def _common_inputs(model_type: str, *, alignment_control: bool):
             "force_clear_cache",
             default=True,
             tooltip="Run garbage collection and clear the CUDA allocator cache after every analyzed work unit. Saves retained memory but slows analysis.",
+        ),
+        io.String.Input(
+            "exclude_patterns",
+            default="",
+            multiline=True,
+            tooltip="One pattern per line. Matching tensors are excluded from all comparison metrics and topology counts. Uses regex unless Glob Patterns is enabled.",
+        ),
+        io.Boolean.Input(
+            "glob_patterns",
+            default=False,
+            tooltip="Interpret exclusion entries as shell-style glob patterns instead of regular expressions.",
         ),
     ])
     return inputs

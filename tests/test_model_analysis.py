@@ -32,6 +32,8 @@ def _params(**overrides):
         "top_weight_differences": 3,
         "process_device": "cpu",
         "force_clear_cache": False,
+        "exclude_patterns": "",
+        "glob_patterns": False,
     }
     params.update(overrides)
     return params
@@ -223,6 +225,41 @@ def test_lora_cross_format_keys_compare_as_one_logical_pair(monkeypatch, tmp_pat
     assert len({entry for entry in processed}) == 4
     assert len(async_calls) == 2
     assert all(len(call[1]) == 2 for call in async_calls)
+
+
+def test_excluded_lora_blocks_do_not_enter_metrics(monkeypatch, tmp_path, analysis):
+    path_a = tmp_path / "lora_a.safetensors"
+    path_b = tmp_path / "lora_b.safetensors"
+    tensors_a = {}
+    tensors_b = {}
+    for block, value_a, value_b in ((3, 1.0, 2.0), (4, 10.0, 20.0)):
+        prefix = f"diffusion_model.blocks.{block}.attn"
+        tensors_a[f"{prefix}.lora_A.weight"] = torch.full((1, 2), value_a)
+        tensors_a[f"{prefix}.lora_B.weight"] = torch.full((2, 1), value_a)
+        tensors_b[f"{prefix}.lora_A.weight"] = torch.full((1, 2), value_b)
+        tensors_b[f"{prefix}.lora_B.weight"] = torch.full((2, 1), value_b)
+    save_file(tensors_a, str(path_a))
+    save_file(tensors_b, str(path_b))
+    paths = {"a": str(path_a), "b": str(path_b)}
+    monkeypatch.setattr(analysis.folder_paths, "get_full_path", lambda _, name: paths[name])
+    monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
+
+    comparison, cwb_report = analysis.ModelAnalysisLogic.execute(
+        "a", "b", "loras",
+        _params(exclude_patterns=r"^diffusion_model\.blocks\.4\."),
+        lora_mode=True,
+    )
+
+    assert "Comparable floating tensors: 2" in comparison
+    assert "Excluded A tensors: 2" in comparison
+    assert "Excluded B tensors: 2" in comparison
+    layerwise = comparison.split("LAYERWISE TENSOR METRICS", 1)[1].split(
+        "TOP SCALAR WEIGHT DIFFERENCES", 1
+    )[0]
+    assert "blocks_3_" in layerwise
+    assert "blocks_4_" not in layerwise
+    assert "blocks_4_" not in cwb_report
 
 
 def test_embedding_similarity_alignment_is_explicit_opt_in(analysis):
