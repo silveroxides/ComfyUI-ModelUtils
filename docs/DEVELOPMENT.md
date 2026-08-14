@@ -1,5 +1,7 @@
 # ComfyUI-ModelUtils - Complete Project History
 
+> [Implementation Invariants](IMPLEMENTATION_INVARIANTS.md) is the authoritative contract for UEL tensor I/O, lifecycle management, atomic saving, and LoRA alpha normalization. All new node implementations and changes must follow it. This document is historical and does not override that contract.
+
 ## Version Timeline
 
 | Version | Commits | Key Features |
