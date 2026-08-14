@@ -18,6 +18,7 @@ from .device_utils import estimate_model_size, prepare_for_large_operation, clea
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .uel_io import atomic_uel_writer, stream_work_units
+from .artifact_paths import canonical_model_artifact_path
 from .lora_alpha import normalize_lora_pair
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
@@ -689,9 +690,7 @@ def resize_lora_file(
         metadata["ss_network_dim"] = "Dynamic"
         metadata["ss_network_alpha"] = "Dynamic"
 
-        output_dir = os.path.join(folder_paths.models_dir, "loras")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+        output_path, _ = canonical_model_artifact_path("loras", output_filename)
 
         fro_list = []
         cpu_fallbacks = 0
@@ -918,7 +917,7 @@ class LoRAResizeFixed(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -927,11 +926,12 @@ class LoRAResizeFixed(io.ComfyNode):
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(
+        resize_lora_file(
             lora_path, new_rank, None, None, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
         )
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 class LoRAResizeRatio(io.ComfyNode):
@@ -956,7 +956,7 @@ class LoRAResizeRatio(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -965,11 +965,12 @@ class LoRAResizeRatio(io.ComfyNode):
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(
+        resize_lora_file(
             lora_path, max_rank, "sv_ratio", ratio, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
         )
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 class LoRAResizeFrobenius(io.ComfyNode):
@@ -996,7 +997,7 @@ class LoRAResizeFrobenius(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -1005,12 +1006,13 @@ class LoRAResizeFrobenius(io.ComfyNode):
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(
+        resize_lora_file(
             lora_path, max_rank, "sv_fro", target, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
             min_rank=min_rank,
         )
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 class LoRAResizeCumulative(io.ComfyNode):
@@ -1035,7 +1037,7 @@ class LoRAResizeCumulative(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -1044,11 +1046,12 @@ class LoRAResizeCumulative(io.ComfyNode):
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
-        path = resize_lora_file(
+        resize_lora_file(
             lora_path, max_rank, "sv_cumulative", target, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
         )
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 
@@ -1254,9 +1257,9 @@ def merge_loras_to_model(
         base_metadata["merge_comment"] = f"Merged {len(lora_paths)} LoRAs with weights: {lora_weights}"
 
         # Build output path before loop
-        base_dir = os.path.dirname(base_model_path)
-        os.makedirs(base_dir, exist_ok=True)
-        output_path = os.path.join(base_dir, f"{output_filename.strip()}.safetensors")
+        output_path, _ = canonical_model_artifact_path(
+            "diffusion_models", output_filename
+        )
 
         base_outcomes = {
             "PATCHED": [],
@@ -1903,7 +1906,10 @@ class LoRAMergeToModel(io.ComfyNode):
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Apply 1D direct-diff tensors as FP32. Disabled preserves prior behavior."),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[
+                io.AnyType.Output(display_name="output_path"),
+                io.String.Output(display_name="merge_report"),
+            ],
             is_output_node=True,
         )
 
@@ -1942,4 +1948,5 @@ class LoRAMergeToModel(io.ComfyNode):
             include_1d_diffs=include_1d_diffs,
             return_report=True,
         )
-        return io.NodeOutput(f"{path}\n\n{report}")
+        _, output_name = canonical_model_artifact_path("diffusion_models", output_filename)
+        return io.NodeOutput(output_name, report)

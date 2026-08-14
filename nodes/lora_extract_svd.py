@@ -5,7 +5,6 @@ Native implementation of Low-Rank Adapter extraction with multiple rank selectio
 No external dependencies required.
 """
 import fnmatch
-import os
 import re
 import torch
 import torch.linalg as linalg
@@ -20,6 +19,7 @@ from .device_utils import (
 
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
+from .artifact_paths import canonical_model_artifact_path
 from .quantization_guard import inspect_low_bit_input
 from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
 from .extraction_stream import lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
@@ -715,11 +715,9 @@ def extract_lora_from_files(
         cleanup_after_operation()
 
 
-def _build_lora_output_path(output_filename: str) -> str:
+def _build_lora_output_path(output_filename: str) -> tuple[str, str]:
     """Build output path for LoRA file."""
-    output_dir = folder_paths.get_folder_paths("loras")[0]
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+    return canonical_model_artifact_path("loras", output_filename)
 
 
 # =============================================================================
@@ -833,7 +831,7 @@ class LoRAExtractFixed(io.ComfyNode):
                             tooltip="SVD power iterations (higher = more accurate but slower)"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -845,7 +843,7 @@ class LoRAExtractFixed(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_lora_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
@@ -854,7 +852,7 @@ class LoRAExtractFixed(io.ComfyNode):
             lazy_load, force_clear_cache, glob_skip_patterns, include_1d_diffs
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class LoRAExtractRatio(io.ComfyNode):
@@ -881,7 +879,7 @@ class LoRAExtractRatio(io.ComfyNode):
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -893,7 +891,7 @@ class LoRAExtractRatio(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_lora_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
@@ -904,7 +902,7 @@ class LoRAExtractRatio(io.ComfyNode):
             knee_probe_offset=probe_offset,
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class LoRAExtractQuantile(io.ComfyNode):
@@ -931,7 +929,7 @@ class LoRAExtractQuantile(io.ComfyNode):
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -943,7 +941,7 @@ class LoRAExtractQuantile(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_lora_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
@@ -954,7 +952,7 @@ class LoRAExtractQuantile(io.ComfyNode):
             knee_probe_offset=probe_offset,
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class LoRAExtractKnee(io.ComfyNode):
@@ -979,7 +977,7 @@ class LoRAExtractKnee(io.ComfyNode):
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -992,7 +990,7 @@ class LoRAExtractKnee(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_lora_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
@@ -1003,7 +1001,7 @@ class LoRAExtractKnee(io.ComfyNode):
             knee_probe_offset=knee_probe_offset,
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class LoRAExtractFrobenius(io.ComfyNode):
@@ -1030,7 +1028,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -1042,7 +1040,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_lora_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
@@ -1053,4 +1051,4 @@ class LoRAExtractFrobenius(io.ComfyNode):
             knee_probe_offset=probe_offset,
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)

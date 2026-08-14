@@ -15,6 +15,7 @@ from unifiedefficientloader import MemoryEfficientSafeOpen
 
 from .device_utils import cleanup_after_operation
 from .uel_io import atomic_uel_writer
+from .artifact_paths import canonical_model_artifact_path
 
 
 TARGET_DTYPES = {
@@ -43,15 +44,8 @@ def _is_excluded(key: str, patterns: list[re.Pattern]) -> bool:
     return any(pattern.search(key) for pattern in patterns)
 
 
-def _output_path(output_filename: str) -> str:
-    name = output_filename.strip()
-    if not name:
-        raise ValueError("Output filename must not be empty.")
-    if name.lower().endswith(".safetensors"):
-        name = name[:-12]
-    output_dir = os.path.join(folder_paths.models_dir, "diffusion_models")
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, f"{name}.safetensors")
+def _output_path(output_filename: str) -> tuple[str, str]:
+    return canonical_model_artifact_path("diffusion_models", output_filename)
 
 
 def convert_diffusion_model_dtype(
@@ -68,7 +62,7 @@ def convert_diffusion_model_dtype(
     source_path = folder_paths.get_full_path_or_raise(
         "diffusion_models", model_name
     )
-    output_path = _output_path(output_filename)
+    output_path, output_name = _output_path(output_filename)
     if os.path.normcase(os.path.abspath(source_path)) == os.path.normcase(
         os.path.abspath(output_path)
     ):
@@ -127,7 +121,7 @@ def convert_diffusion_model_dtype(
         (
             "DIFFUSION MODEL DTYPE CONVERSION",
             f"Input: {model_name}",
-            f"Output: {output_path}",
+            f"Output: {output_name}",
             f"Target dtype: {target_dtype}",
             f"Total tensors: {total}",
             f"Converted floating tensors: {counts['converted']}",
@@ -137,7 +131,7 @@ def convert_diffusion_model_dtype(
             f"Original dtype counts: {dtype_summary or 'None'}",
         )
     )
-    return output_path, report
+    return output_name, report
 
 
 class DiffusionModelDtypeConversion(io.ComfyNode):
@@ -177,7 +171,7 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
                 ),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
                 io.String.Output(display_name="conversion_report"),
             ],
             is_output_node=True,

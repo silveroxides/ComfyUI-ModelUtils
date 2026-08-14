@@ -438,7 +438,7 @@ def test_merge_to_model_node_returns_path_blank_line_report(
         "", "merged", "fp32", "cpu", True, False, False,
     )
 
-    assert result.result == ("saved/model.safetensors\n\nSUCCESS\nDETAILS",)
+    assert result.result == ("merged.safetensors", "SUCCESS\nDETAILS")
 
 
 def test_mixed_parser_scans_every_key_and_retains_unpaired(modules):
@@ -489,7 +489,11 @@ def test_include_1d_switches_are_appended_and_default_off(modules, generic_modul
         assert final_input.id == "include_1d_diffs"
         assert final_input.default is False
 
-    assert len(resize.LoRAMergeToModel.define_schema().outputs) == 1
+    outputs = resize.LoRAMergeToModel.define_schema().outputs
+    assert [output.display_name for output in outputs] == [
+        "output_path",
+        "merge_report",
+    ]
 
 
 def test_resize_preserves_mixed_direct_auxiliary_and_fp32(monkeypatch, tmp_path, modules):

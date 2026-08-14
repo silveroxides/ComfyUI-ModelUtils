@@ -590,7 +590,7 @@ class DoRALearnedExtractFixed(io.ComfyNode):
                 io.Int.Input("svd_niter", default=2, min=0, max=10, tooltip="SVD iterations for initialization"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -601,7 +601,7 @@ class DoRALearnedExtractFixed(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_dora_learned_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
@@ -610,7 +610,7 @@ class DoRALearnedExtractFixed(io.ComfyNode):
             lazy_load, force_clear_cache, glob_skip_patterns
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class DoRALearnedExtractRatio(io.ComfyNode):
@@ -634,7 +634,7 @@ class DoRALearnedExtractRatio(io.ComfyNode):
                 *_get_learned_inputs(),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -645,7 +645,7 @@ class DoRALearnedExtractRatio(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_dora_learned_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
@@ -655,7 +655,7 @@ class DoRALearnedExtractRatio(io.ComfyNode):
             knee_probe_offset=probe_offset
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class DoRALearnedExtractQuantile(io.ComfyNode):
@@ -679,7 +679,7 @@ class DoRALearnedExtractQuantile(io.ComfyNode):
                 *_get_learned_inputs(),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -690,7 +690,7 @@ class DoRALearnedExtractQuantile(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_dora_learned_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
@@ -700,7 +700,7 @@ class DoRALearnedExtractQuantile(io.ComfyNode):
             knee_probe_offset=probe_offset
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class DoRALearnedExtractKnee(io.ComfyNode):
@@ -723,7 +723,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
                 *_get_learned_inputs(),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -735,7 +735,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_dora_learned_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
@@ -745,7 +745,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
             glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class DoRALearnedExtractFrobenius(io.ComfyNode):
@@ -769,7 +769,7 @@ class DoRALearnedExtractFrobenius(io.ComfyNode):
                 *_get_learned_inputs(),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -780,7 +780,7 @@ class DoRALearnedExtractFrobenius(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_dora_learned_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
@@ -790,4 +790,4 @@ class DoRALearnedExtractFrobenius(io.ComfyNode):
             knee_probe_offset=probe_offset
         )
 
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)

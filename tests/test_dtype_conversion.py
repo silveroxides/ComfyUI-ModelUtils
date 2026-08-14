@@ -97,7 +97,10 @@ def test_converts_floating_and_preserves_excluded_and_nonfloating(
         r"\.norm\.weight$",
         f"converted_{target_name}",
     )
-    result, metadata = _read_uel(output_path)
+    assert output_path == f"converted_{target_name}.safetensors"
+    result, metadata = _read_uel(
+        tmp_path / "diffusion_models" / output_path
+    )
 
     assert result["blocks.0.weight"].dtype == expected_dtype
     assert result["blocks.0.norm.weight"].dtype == torch.float32

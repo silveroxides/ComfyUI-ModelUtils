@@ -24,6 +24,7 @@ from .lora_resize import (
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from .uel_io import AsyncTensorCursor as _AsyncTensorCursor, atomic_uel_writer
 from .lora_alpha import normalize_lora_pair
+from .artifact_paths import canonical_model_artifact_path
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
@@ -752,11 +753,7 @@ def _run_multi_lora_merge(
             for handler, keys in zip(handlers, stream_keys)
         ]
 
-        output_dir = os.path.join(folder_paths.models_dir, "loras")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(
-            output_dir, f"{output_filename.strip()}.safetensors"
-        )
+        output_path, _ = canonical_model_artifact_path("loras", output_filename)
         metadata = {
             "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via {strategy}",
             "ss_network_module": "networks.lora",
@@ -947,7 +944,7 @@ class LoRAMultiMerge(io.ComfyNode):
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Include and merge 1D direct-diff tensors as FP32."),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -989,7 +986,8 @@ class LoRAMultiMerge(io.ComfyNode):
             include_1d_diffs=include_1d_diffs,
         )
 
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 class LoRAMultiMergeDARE(io.ComfyNode):
@@ -1036,7 +1034,7 @@ class LoRAMultiMergeDARE(io.ComfyNode):
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Include and merge 1D direct-diff tensors as FP32."),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -1081,7 +1079,8 @@ class LoRAMultiMergeDARE(io.ComfyNode):
             include_1d_diffs=include_1d_diffs,
         )
 
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 def merge_multi_loras_dare(
     lora_paths: List[str],
@@ -1156,7 +1155,7 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Include and merge 1D direct-diff tensors as FP32."),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -1203,7 +1202,8 @@ class LoRAMultiMergeDAREEnhanced(io.ComfyNode):
             include_1d_diffs=include_1d_diffs,
         )
 
-        return io.NodeOutput(path)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 
 def merge_multi_loras_dare_enhanced(

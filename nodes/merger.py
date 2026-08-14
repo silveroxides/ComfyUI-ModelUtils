@@ -17,6 +17,7 @@ from .quantization_guard import inspect_low_bit_input, write_preserved_tensor
 from .lora_resize import is_direct_diff_key, parse_lora_layers
 from .uel_io import atomic_uel_writer, stream_work_units
 from .lora_alpha import lora_alpha_scale
+from .artifact_paths import canonical_model_artifact_path
 
 
 def load_documentation_from_file(filename):
@@ -175,10 +176,8 @@ class MergerLogic:
         error_keys = []
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        output_dir = os.path.join(folder_paths.models_dir, output_folder)
-        os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
-        output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
+        output_path, output_name = canonical_model_artifact_path(output_folder, output_filename)
 
         alpha_normalization = {}
         alpha_keys = set()
@@ -373,16 +372,14 @@ class MergerLogic:
             handler.__exit__(None, None, None)
 
         output_folder = "loras" if calc_mode == "SVD LoRA Extraction" else model_type
-        output_dir = os.path.join(folder_paths.models_dir, output_folder)
-        os.makedirs(output_dir, exist_ok=True)
         output_filename = recipe_params.get("output_filename")
-        output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
+        output_path, output_name = canonical_model_artifact_path(output_folder, output_filename)
         if os.path.exists(output_path):
             print(f"[Merger] Output saved to {output_path}")
         # Cleanup after heavy operation
         cleanup_after_operation()
 
-        return f"{output_filename}.safetensors"
+        return output_name
 
 
 # --- Two-Model Merger Nodes ---
@@ -423,7 +420,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -489,7 +486,7 @@ class ModelTwoMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -555,7 +552,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -623,7 +620,7 @@ class LoRATwoMerger(io.ComfyNode):
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -691,7 +688,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -760,7 +757,7 @@ class CheckpointThreeMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -827,7 +824,7 @@ class ModelThreeMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -894,7 +891,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -963,7 +960,7 @@ class LoRAThreeMerger(io.ComfyNode):
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )
@@ -1032,7 +1029,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
             ],
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
             ],
         )

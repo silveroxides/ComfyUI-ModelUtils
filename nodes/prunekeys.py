@@ -9,6 +9,7 @@ from .device_utils import estimate_model_size, prepare_for_large_operation, clea
 
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
+from .artifact_paths import canonical_model_artifact_path
 
 
 def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
@@ -36,8 +37,7 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
         raise ValueError("No keys/patterns provided to prune.")
 
     # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-    model_dir = folder_paths.get_folder_paths(model_type)[-1]
-    output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
+    output_path, output_name = canonical_model_artifact_path(model_type, output_filename)
 
     # Stream tensors, filter on the fly, write immediately
     with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
@@ -65,7 +65,7 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     # Cleanup after operation
     cleanup_after_operation()
 
-    return output_path
+    return output_name
 
 
 class ModelPruneKeys(io.ComfyNode):
@@ -87,7 +87,7 @@ class ModelPruneKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="pruned_model", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -118,7 +118,7 @@ class TextEncoderPruneKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="pruned_textencoder", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -149,7 +149,7 @@ class LoRAPruneKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="pruned_lora", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -180,7 +180,7 @@ class CheckpointPruneKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="pruned_checkpoint", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -211,7 +211,7 @@ class EmbeddingPruneKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="pruned_embedding", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 

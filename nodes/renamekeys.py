@@ -8,6 +8,7 @@ from .device_utils import estimate_model_size, prepare_for_large_operation, clea
 
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
+from .artifact_paths import canonical_model_artifact_path
 
 
 
@@ -38,9 +39,7 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
 
     key_map = dict(zip(old_keys, new_keys))
 
-    # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
-    model_dir = folder_paths.get_folder_paths(model_type)[-1]
-    output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
+    output_path, output_name = canonical_model_artifact_path(model_type, output_filename)
 
     # Stream tensors, rename on the fly, write immediately
     with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
@@ -61,7 +60,7 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
     # Cleanup after operation
     cleanup_after_operation()
 
-    return output_path
+    return output_name
 
 
 class ModelRenameKeys(io.ComfyNode):
@@ -83,7 +82,7 @@ class ModelRenameKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="renamed_model", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -114,7 +113,7 @@ class TextEncoderRenameKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="renamed_textencoder", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -145,7 +144,7 @@ class LoRARenameKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="renamed_lora", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -176,7 +175,7 @@ class CheckpointRenameKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="renamed_checkpoint", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 
@@ -207,7 +206,7 @@ class EmbeddingRenameKeys(io.ComfyNode):
                 io.String.Input("output_filename", default="renamed_embedding", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
             ],
             outputs=[
-                io.String.Output(display_name="output_path"),
+                io.AnyType.Output(display_name="output_path"),
             ],
         )
 

@@ -4,7 +4,6 @@ Text Encoder LoRA and DoRA Extraction.
 Specifically targets extracting text encoder deltas as LoRA/DoRA with custom mapping rules
 for layer name prefixes and PEFT weight formatting.
 """
-import os
 import torch
 import folder_paths
 import comfy.utils
@@ -17,6 +16,7 @@ from .device_utils import (
 
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
+from .artifact_paths import canonical_model_artifact_path
 from .extraction_stream import dora_difference, lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 
 # Import SVD rank utilities from standard lora extract file to avoid duplication
@@ -267,11 +267,9 @@ def extract_te_from_files(
         cleanup_after_operation()
 
 
-def _build_lora_output_path(output_filename: str) -> str:
+def _build_lora_output_path(output_filename: str) -> tuple[str, str]:
     """Build output path for LoRA file."""
-    output_dir = folder_paths.get_folder_paths("loras")[0]
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+    return canonical_model_artifact_path("loras", output_filename)
 
 
 def _get_te_model_inputs():
@@ -324,7 +322,7 @@ class TextEncoderLoRAExtractFixed(io.ComfyNode):
                 io.Int.Input("svd_niter", default=2, min=0, max=10, tooltip="SVD power iterations"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -335,7 +333,7 @@ class TextEncoderLoRAExtractFixed(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
@@ -345,7 +343,7 @@ class TextEncoderLoRAExtractFixed(io.ComfyNode):
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers, svd_niter=svd_niter,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderLoRAExtractRatio(io.ComfyNode):
@@ -365,7 +363,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -376,7 +374,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
@@ -387,7 +385,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderLoRAExtractQuantile(io.ComfyNode):
@@ -407,7 +405,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -418,7 +416,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
@@ -429,7 +427,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderLoRAExtractKnee(io.ComfyNode):
@@ -448,7 +446,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -460,7 +458,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
@@ -471,7 +469,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
@@ -491,7 +489,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -502,7 +500,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
@@ -513,7 +511,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 # =============================================================================
@@ -535,7 +533,7 @@ class TextEncoderDoRAExtractFixed(io.ComfyNode):
                 io.Int.Input("svd_niter", default=2, min=0, max=10, tooltip="SVD power iterations"),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -546,7 +544,7 @@ class TextEncoderDoRAExtractFixed(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
@@ -556,7 +554,7 @@ class TextEncoderDoRAExtractFixed(io.ComfyNode):
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers, svd_niter=svd_niter,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderDoRAExtractRatio(io.ComfyNode):
@@ -576,7 +574,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -587,7 +585,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
@@ -598,7 +596,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderDoRAExtractQuantile(io.ComfyNode):
@@ -618,7 +616,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -629,7 +627,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
@@ -640,7 +638,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderDoRAExtractKnee(io.ComfyNode):
@@ -659,7 +657,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -671,7 +669,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, knee_method, 0, 0,
@@ -682,7 +680,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
 
 
 class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
@@ -702,7 +700,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
             ],
-            outputs=[io.String.Output(display_name="output_path")],
+            outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
@@ -713,7 +711,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
-        output_path = _build_lora_output_path(output_filename)
+        output_path, output_name = _build_lora_output_path(output_filename)
 
         extract_te_from_files(
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
@@ -724,4 +722,4 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
             knee_probe_offset=probe_offset
         )
-        return io.NodeOutput(output_path)
+        return io.NodeOutput(output_name)
