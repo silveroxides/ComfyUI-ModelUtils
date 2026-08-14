@@ -15,11 +15,13 @@ from tqdm import tqdm
 from comfy_api.latest import io
 from .device_utils import (
     estimate_model_size, prepare_for_large_operation,
-    cleanup_after_operation, get_device_capabilities
+    cleanup_after_operation
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
 from .quantization_guard import inspect_low_bit_input
+from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
+from .extraction_stream import lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 
 
 
@@ -273,12 +275,16 @@ def _svd_extract_linear(
             target_rank = min(target_rank, max_rank)
         return _svd_extract_linear_lowrank(weight, target_rank, device, clamp_quantile, niter)
 
-    if mode in {"sv_knee", "sv_cumulative_knee"} and max_rank is not None:
+    if mode in ADAPTIVE_PARTIAL_MODES and max_rank is not None:
+        U, S, Vh, rank = adaptive_partial_svd(
+            weight, mode, mode_param, max_rank, knee_probe_offset, niter
+        )
+    elif mode in {"sv_knee", "sv_cumulative_knee"} and max_rank is not None:
         U, S, Vh, rank = _svd_extract_knee_lowrank(
             weight, mode, max_rank, knee_probe_offset, niter
         )
     else:
-        # Other adaptive modes require the full spectrum under their current contract.
+        # Uncapped modes require the full spectrum.
         try:
             U, S, Vh = linalg.svd(weight, full_matrices=False)
         except Exception as e:
@@ -549,11 +555,20 @@ def extract_lora_from_files(
                 and (len(handler_a.get_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
             ))
         ]
-        pbar = comfy.utils.ProgressBar(len(extraction_keys))
+        extraction_keys.sort()
+        work_units = [
+            (key, key, key if key in keys_b else None)
+            for key in extraction_keys
+            if not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)
+            and not (key not in keys_b and mismatch_mode == "skip")
+        ]
+        pbar = comfy.utils.ProgressBar(len(work_units))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
-        def _process_layer(key):
+        def _process_layer(key, cpu_a, cpu_b):
             lora_name = _format_lora_key(key)
+            weight_diff = None
+            layer_device = device
 
             if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
                 return "skipped", None
@@ -566,50 +581,32 @@ def extract_lora_from_files(
             )
 
             # Load tensors with pinned memory for CUDA
-            use_pinned = device == 'cuda'
-
             if key not in keys_b:
                 if mismatch_mode == "skip":
                     return "skipped", None
                 if mismatch_mode == "error":
                     raise ValueError(f"Key {key} not found in model B")
 
-                cpu_a = handler_a.get_tensor(key)
-                if use_pinned:
-                    weight_diff = transfer_to_gpu_pinned(cpu_a, device, torch.float32)
-                else:
-                    weight_diff = cpu_a.to(device=device, dtype=torch.float32)
-                del cpu_a
+                weight_diff, layer_device = lora_difference(cpu_a, None, device)
 
                 if mismatch_mode == "zeros":
                     # For zeros mode, we treat the missing base as a zeroed tensor of same shape
                     # which is already captured by weight_diff = tensor_a
                     pass
             else:
-                cpu_a = handler_a.get_tensor(key)
-                cpu_b = handler_b.get_tensor(key)
-
-                if use_pinned:
-                    tensor_a = transfer_to_gpu_pinned(cpu_a, device, torch.float32)
-                    tensor_b = transfer_to_gpu_pinned(cpu_b, device, torch.float32)
-                else:
-                    tensor_a = cpu_a.to(device=device, dtype=torch.float32)
-                    tensor_b = cpu_b.to(device=device, dtype=torch.float32)
-                del cpu_a, cpu_b
-
-                if tensor_a.shape != tensor_b.shape:
+                if cpu_a.shape != cpu_b.shape:
                     if mismatch_mode == "skip":
-                        del tensor_a, tensor_b
                         return "skipped", None
                     if mismatch_mode == "error":
-                        raise ValueError(f"Shape mismatch for {key}: {tensor_a.shape} vs {tensor_b.shape}")
+                        raise ValueError(f"Shape mismatch for {key}: {cpu_a.shape} vs {cpu_b.shape}")
 
                     # For zeros/fallback, use tensor_a as the difference
-                    weight_diff = tensor_a
-                    del tensor_b
+                    weight_diff, layer_device = lora_difference(cpu_a, None, device)
                 else:
-                    weight_diff = tensor_a - tensor_b
-                    del tensor_a, tensor_b
+                    weight_diff, layer_device = lora_difference(cpu_a, cpu_b, device)
+
+            if weight_diff is None:
+                raise RuntimeError(f"No extraction tensor was produced for {key}")
 
             # Skip small differences
             if min_diff > 0 and weight_diff.abs().max() < min_diff:
@@ -634,17 +631,20 @@ def extract_lora_from_files(
 
             is_conv = weight_diff.ndim == 4
             layer_results = {}
+            svd_weight = weight_diff
 
             try:
                 if is_conv:
-                    result, mode_str = _svd_extract_conv(
-                        weight_diff, mode, conv_param, device, conv_max_rank,
-                        clamp_quantile, knee_probe_offset
+                    result, mode_str = retry_cuda_oom_on_cpu(
+                        lambda: _svd_extract_conv(svd_weight, mode, conv_param, layer_device, conv_max_rank, clamp_quantile, knee_probe_offset),
+                        lambda: _svd_extract_conv(svd_weight.cpu(), mode, conv_param, "cpu", conv_max_rank, clamp_quantile, knee_probe_offset),
+                        layer_device,
                     )
                 else:
-                    result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank,
-                        clamp_quantile, svd_niter, knee_probe_offset
+                    result, mode_str = retry_cuda_oom_on_cpu(
+                        lambda: _svd_extract_linear(svd_weight, mode, linear_param, layer_device, linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
+                        lambda: _svd_extract_linear(svd_weight.cpu(), mode, linear_param, "cpu", linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
+                        layer_device,
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -653,7 +653,7 @@ def extract_lora_from_files(
                     if num_chunks > 1:
                         print(f"[LoRA Extract] Chunked: {key} ({num_chunks} chunks)")
                         lora_up, lora_down, rank = _extract_chunked_layer(
-                            weight_diff, num_chunks, mode, linear_param, device,
+                            weight_diff, num_chunks, mode, linear_param, layer_device,
                             linear_max_rank, knee_probe_offset
                         )
                         if lora_up is not None:
@@ -682,8 +682,11 @@ def extract_lora_from_files(
         writer = IncrementalSafetensorsWriter(output_path)
         writer.__enter__()
         try:
-            for key in tqdm(extraction_keys, desc="Extracting LoRA", unit="layers"):
-                status, layer_sd = _process_layer(key)
+            stream = paired_async_tensors(
+                handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda")
+            )
+            for key, cpu_a, cpu_b in tqdm(stream, total=len(work_units), desc="Extracting LoRA", unit="layers"):
+                status, layer_sd = _process_layer(key, cpu_a, cpu_b)
                 stats[status] += 1
                 if layer_sd:
                     writer.write_dict(layer_sd)
@@ -695,6 +698,7 @@ def extract_lora_from_files(
                         torch.cuda.empty_cache()
 
                 pbar.update(1)
+            stats["skipped"] += len(extraction_keys) - len(work_units)
         finally:
             writer.__exit__(None, None, None)
 
@@ -783,7 +787,7 @@ def _format_direct_diff_key(source_key: str, lora_name: str) -> str:
 def _get_common_inputs():
     return [
         io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-        io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+        io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer; slower but useful under severe VRAM pressure."),
         io.Boolean.Input("chunk_large_layers", default=False,
                         tooltip="Split large fused layers (QKV, MLP) into chunks"),
         io.Float.Input("clamp_quantile", default=0.99, min=0.5, max=1.0, step=0.01,
@@ -865,6 +869,8 @@ class LoRAExtractRatio(io.ComfyNode):
                               tooltip="Ratio threshold for linear layers (higher = more SVs kept)"),
                 io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1,
                               tooltip="Ratio threshold for conv layers (higher = more SVs kept)"),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096,
+                             tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for linear layers"),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
@@ -876,7 +882,7 @@ class LoRAExtractRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
                 include_1d_diffs=False) -> io.NodeOutput:
@@ -890,7 +896,8 @@ class LoRAExtractRatio(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs,
+            knee_probe_offset=probe_offset,
         )
 
         return io.NodeOutput(output_path)
@@ -912,6 +919,8 @@ class LoRAExtractQuantile(io.ComfyNode):
                               tooltip="Target cumulative % for linear layers"),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target cumulative % for conv layers"),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096,
+                             tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for linear layers"),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
@@ -923,7 +932,7 @@ class LoRAExtractQuantile(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
                 include_1d_diffs=False) -> io.NodeOutput:
@@ -937,7 +946,8 @@ class LoRAExtractQuantile(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs,
+            knee_probe_offset=probe_offset,
         )
 
         return io.NodeOutput(output_path)
@@ -1008,6 +1018,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
                               tooltip="Target Frobenius norm fraction for linear"),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01,
                               tooltip="Target Frobenius norm fraction for conv"),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096,
+                             tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for linear layers"),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
@@ -1019,7 +1031,7 @@ class LoRAExtractFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache,
                 include_1d_diffs=False) -> io.NodeOutput:
@@ -1033,7 +1045,8 @@ class LoRAExtractFrobenius(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs
+            glob_skip_patterns=glob_skip_patterns, include_1d_diffs=include_1d_diffs,
+            knee_probe_offset=probe_offset,
         )
 
         return io.NodeOutput(output_path)

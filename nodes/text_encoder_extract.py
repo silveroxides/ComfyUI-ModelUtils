@@ -4,11 +4,8 @@ Text Encoder LoRA and DoRA Extraction.
 Specifically targets extracting text encoder deltas as LoRA/DoRA with custom mapping rules
 for layer name prefixes and PEFT weight formatting.
 """
-import fnmatch
 import os
-import re
 import torch
-import torch.linalg as linalg
 import folder_paths
 import comfy.utils
 from tqdm import tqdm
@@ -18,11 +15,11 @@ from .device_utils import (
     cleanup_after_operation
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
+from .extraction_stream import dora_difference, lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 
 # Import SVD rank utilities from standard lora extract file to avoid duplication
 from .lora_extract_svd import (
-    _compute_rank,
     _svd_extract_linear,
     _svd_extract_conv,
     _extract_chunked_layer,
@@ -106,91 +103,67 @@ def extract_te_from_files(
     try:
         keys_a = set(handler_a.keys())
         keys_b = set(handler_b.keys())
-        weight_keys = [k for k in keys_a if k.endswith(".weight")]
-        pbar = comfy.utils.ProgressBar(len(weight_keys))
+        weight_keys = sorted(k for k in keys_a if k.endswith(".weight"))
+        work_units = [
+            (key, key, key if key in keys_b else None)
+            for key in weight_keys
+            if not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)
+            and not (key not in keys_b and mismatch_mode == "skip")
+        ]
+        pbar = comfy.utils.ProgressBar(len(work_units))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
-        def _process_layer(key):
+        def _process_layer(key, cpu_a, cpu_b):
             lora_name = _format_te_lora_key(key)
+            weight_diff = None
+            layer_device = device
 
             if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
                 return "skipped", None
 
             # Load tensors with pinned memory for CUDA
-            use_pinned = device == 'cuda'
-
             if key not in keys_b:
                 if mismatch_mode == "skip":
                     return "skipped", None
                 if mismatch_mode == "error":
                     raise ValueError(f"Key {key} not found in model B")
 
-                cpu_a = handler_a.get_tensor(key)
-                if use_pinned:
-                    weight_diff = transfer_to_gpu_pinned(cpu_a, device, torch.float32)
+                if is_dora:
+                    weight_diff, dora_scale, layer_device = dora_difference(
+                        cpu_a, None, device
+                    )
                 else:
-                    weight_diff = cpu_a.to(device=device, dtype=torch.float32)
-                del cpu_a
-
-                dora_scale = None
+                    weight_diff, layer_device = lora_difference(cpu_a, None, device)
+                    dora_scale = None
             else:
-                cpu_a = handler_a.get_tensor(key)
-                cpu_b = handler_b.get_tensor(key)
-
-                if use_pinned:
-                    tensor_a = transfer_to_gpu_pinned(cpu_a, device, torch.float32)
-                    tensor_b = transfer_to_gpu_pinned(cpu_b, device, torch.float32)
-                else:
-                    tensor_a = cpu_a.to(device=device, dtype=torch.float32)
-                    tensor_b = cpu_b.to(device=device, dtype=torch.float32)
-                del cpu_a, cpu_b
-
-                if tensor_a.shape != tensor_b.shape:
+                if cpu_a.shape != cpu_b.shape:
                     if mismatch_mode == "skip":
-                        del tensor_a, tensor_b
                         return "skipped", None
                     if mismatch_mode == "error":
-                        raise ValueError(f"Shape mismatch for {key}: {tensor_a.shape} vs {tensor_b.shape}")
-
-                    weight_diff = tensor_a
-                    dora_scale = None
-                    del tensor_b
-                else:
-                    # Skip 1D weights
-                    if tensor_a.ndim < 2:
-                        del tensor_a, tensor_b
-                        return "skipped", None
+                        raise ValueError(f"Shape mismatch for {key}: {cpu_a.shape} vs {cpu_b.shape}")
 
                     if is_dora:
-                        # Weight Decomposition calculation
-                        is_conv_dim = tensor_a.ndim == 4
-
-                        if is_conv_dim:
-                            out_ch = tensor_a.shape[0]
-                            flat_a = tensor_a.reshape(out_ch, -1)
-                            flat_b = tensor_b.reshape(out_ch, -1)
-                            norm_a = torch.linalg.norm(flat_a, dim=1, keepdim=True)
-                            norm_b = torch.linalg.norm(flat_b, dim=1, keepdim=True)
-                        else:
-                            norm_a = torch.linalg.norm(tensor_a, dim=1, keepdim=True)
-                            norm_b = torch.linalg.norm(tensor_b, dim=1, keepdim=True)
-
-                        # Compute directional diff
-                        eps = 1e-8
-                        norm_ratio = norm_b / (norm_a + eps)
-                        if is_conv_dim:
-                            norm_ratio = norm_ratio.view(-1, 1, 1, 1)
-                            dora_scale = norm_a.view(-1, 1, 1, 1)
-                        else:
-                            dora_scale = norm_a
-
-                        w_dir = tensor_a * norm_ratio
-                        weight_diff = w_dir - tensor_b
-                        del tensor_a, tensor_b, w_dir
+                        weight_diff, dora_scale, layer_device = dora_difference(
+                            cpu_a, None, device
+                        )
                     else:
-                        weight_diff = tensor_a - tensor_b
+                        weight_diff, layer_device = lora_difference(cpu_a, None, device)
                         dora_scale = None
-                        del tensor_a, tensor_b
+                else:
+                    if cpu_a.ndim < 2:
+                        return "skipped", None
+                    if is_dora:
+                        weight_diff, dora_scale, layer_device = dora_difference(
+                            cpu_a, cpu_b, device
+                        )
+                    else:
+                        weight_diff, layer_device = lora_difference(
+                            cpu_a, cpu_b, device
+                        )
+                        dora_scale = None
+
+            if weight_diff is None:
+                raise RuntimeError(f"No extraction tensor was produced for {key}")
 
             # Skip small differences
             if min_diff > 0 and weight_diff.abs().max() < min_diff:
@@ -204,17 +177,20 @@ def extract_te_from_files(
 
             is_conv = weight_diff.ndim == 4
             layer_results = {}
+            svd_weight = weight_diff
 
             try:
                 if is_conv:
-                    result, mode_str = _svd_extract_conv(
-                        weight_diff, mode, conv_param, device, conv_max_rank,
-                        clamp_quantile, knee_probe_offset
+                    result, mode_str = retry_cuda_oom_on_cpu(
+                        lambda: _svd_extract_conv(svd_weight, mode, conv_param, layer_device, conv_max_rank, clamp_quantile, knee_probe_offset),
+                        lambda: _svd_extract_conv(svd_weight.cpu(), mode, conv_param, "cpu", conv_max_rank, clamp_quantile, knee_probe_offset),
+                        layer_device,
                     )
                 else:
-                    result, mode_str = _svd_extract_linear(
-                        weight_diff, mode, linear_param, device, linear_max_rank,
-                        clamp_quantile, svd_niter, knee_probe_offset
+                    result, mode_str = retry_cuda_oom_on_cpu(
+                        lambda: _svd_extract_linear(svd_weight, mode, linear_param, layer_device, linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
+                        lambda: _svd_extract_linear(svd_weight.cpu(), mode, linear_param, "cpu", linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
+                        layer_device,
                     )
             except Exception as e:
                 # Try chunked extraction for large tensors
@@ -223,7 +199,7 @@ def extract_te_from_files(
                     if num_chunks > 1:
                         print(f"[TE Extract] Chunked: {key} ({num_chunks} chunks)")
                         lora_up, lora_down, rank = _extract_chunked_layer(
-                            weight_diff, num_chunks, mode, linear_param, device,
+                            weight_diff, num_chunks, mode, linear_param, layer_device,
                             linear_max_rank, knee_probe_offset
                         )
                         if lora_up is not None:
@@ -258,8 +234,11 @@ def extract_te_from_files(
         writer = IncrementalSafetensorsWriter(output_path)
         writer.__enter__()
         try:
-            for key in tqdm(weight_keys, desc="Extracting TE Layers", unit="layers"):
-                status, layer_sd = _process_layer(key)
+            stream = paired_async_tensors(
+                handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda")
+            )
+            for key, cpu_a, cpu_b in tqdm(stream, total=len(work_units), desc="Extracting TE Layers", unit="layers"):
+                status, layer_sd = _process_layer(key, cpu_a, cpu_b)
                 stats[status] += 1
                 if layer_sd:
                     writer.write_dict(layer_sd)
@@ -271,6 +250,7 @@ def extract_te_from_files(
                         torch.cuda.empty_cache()
 
                 pbar.update(1)
+            stats["skipped"] += len(weight_keys) - len(work_units)
         finally:
             writer.__exit__(None, None, None)
 
@@ -302,7 +282,7 @@ def _get_te_model_inputs():
 def _get_common_inputs():
     return [
         io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-        io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+        io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer; slower but useful under severe VRAM pressure."),
         io.Boolean.Input("chunk_large_layers", default=False,
                         tooltip="Split large fused layers (QKV, MLP) into chunks"),
         io.Float.Input("clamp_quantile", default=0.99, min=0.5, max=1.0, step=0.01,
@@ -376,6 +356,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_ratio", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Ratio threshold for linear layers; higher values retain more singular values."),
                 io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Ratio threshold for convolution layers; higher values retain more singular values."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -385,7 +366,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -399,7 +380,8 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -416,6 +398,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_quantile", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target cumulative singular-value fraction for linear layers."),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target cumulative singular-value fraction for convolution layers."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -425,7 +408,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -439,7 +422,8 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -498,6 +482,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_target", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target Frobenius-norm fraction retained for linear layers."),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target Frobenius-norm fraction retained for convolution layers."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -507,7 +492,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -521,7 +506,8 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -581,6 +567,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_ratio", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Ratio threshold for linear layers; higher values retain more singular values."),
                 io.Float.Input("conv_ratio", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Ratio threshold for convolution layers; higher values retain more singular values."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -590,7 +577,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -604,7 +591,8 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -621,6 +609,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_quantile", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target cumulative singular-value fraction for linear layers."),
                 io.Float.Input("conv_quantile", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target cumulative singular-value fraction for convolution layers."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -630,7 +619,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -644,7 +633,8 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
 
@@ -703,6 +693,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
                 *_get_te_model_inputs(),
                 io.Float.Input("linear_target", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target Frobenius-norm fraction retained for linear layers."),
                 io.Float.Input("conv_target", default=0.9, min=0.0, max=1.0, step=0.01, tooltip="Target Frobenius-norm fraction retained for convolution layers."),
+                io.Int.Input("probe_offset", default=32, min=1, max=4096, tooltip="Extra singular values sampled beyond Max Rank for a reliable bounded rank decision."),
                 io.Int.Input("linear_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for linear layers."),
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384, tooltip="Maximum extracted rank for convolution layers."),
                 *_get_common_inputs(),
@@ -712,7 +703,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_a, model_b, linear_target, conv_target, linear_max_rank, conv_max_rank,
+    def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
                 save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
 
@@ -726,6 +717,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_path)
