@@ -16,7 +16,9 @@ from tqdm import tqdm
 from comfy_api.latest import io
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
+from .uel_io import atomic_uel_writer, stream_work_units
+from .lora_alpha import normalize_lora_pair
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
 
@@ -24,14 +26,9 @@ from typing import Optional, Dict, Tuple, List
 
 # Reuse rank functions from extraction module
 from .lora_extract_svd import (
-    _index_sv_ratio,
     _index_sv_cumulative,
     _index_sv_fro,
-    _svd_extract_linear,
-    _svd_extract_conv,
     _compile_patterns,
-    _matches_any_pattern,
-    _format_lora_key,
 )
 
 
@@ -333,16 +330,7 @@ def detect_lora_rank(
             # Linear: [rank, in_features] or Conv: [rank, in_ch, k, k]
             network_dim = shape[0]
 
-        # Get alpha if present
-        if (
-            network_alpha is None
-            and "alpha" in block_keys
-            and block_keys["alpha"] not in (low_bit_keys or set())
-        ):
-            alpha_tensor = handler.get_tensor(block_keys["alpha"])
-            network_alpha = float(alpha_tensor.item())
-
-        if network_dim is not None and network_alpha is not None:
+        if network_dim is not None:
             break
 
     # Default alpha to dim if not found
@@ -710,10 +698,8 @@ def resize_lora_file(
         total_units = len(raw_units) + len(stream_units)
         pbar = comfy.utils.ProgressBar(total_units)
 
-        writer = IncrementalSafetensorsWriter(
-            output_path, metadata=metadata, max_workers=1
-        )
-        writer.__enter__()
+        writer_context = atomic_uel_writer(output_path, metadata)
+        writer = writer_context.__enter__()
         stream = None
         try:
             with torch.no_grad():
@@ -873,12 +859,19 @@ def resize_lora_file(
                         pass
                     else:
                         raise RuntimeError("UEL resize stream returned extra tensors")
-        finally:
+        except BaseException as exc:
             if stream is not None:
                 close_stream = getattr(stream, "close", None)
                 if close_stream is not None:
                     close_stream()
-            writer.__exit__(None, None, None)
+            writer_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            if stream is not None:
+                close_stream = getattr(stream, "close", None)
+                if close_stream is not None:
+                    close_stream()
+            writer_context.__exit__(None, None, None)
 
         if verbose and fro_list:
             avg_fro = sum(fro_list) / len(fro_list)
@@ -1329,11 +1322,55 @@ def merge_loras_to_model(
         if verbose:
             print(f"[LoRA Merge To Model] Processing {len(base_keys)} base model keys...")
 
-        writer = IncrementalSafetensorsWriter(output_path, metadata=base_metadata)
-        writer.__enter__()
+        handler_map = {-1: base_handler}
+        handler_map.update({info["index"]: info["handler"] for info in lora_infos})
+        work_units = []
+        for planned_base_key in base_keys:
+            planned_core = planned_base_key
+            for prefix in BASE_PREFIXES:
+                if planned_core.startswith(prefix):
+                    planned_core = planned_core[len(prefix):]
+                    break
+            planned_direct = direct_lookup.get(planned_core, [])
+            if not planned_direct:
+                planned_direct = direct_lookup.get(planned_core.replace(".", "_"), [])
+            planned_low_rank = []
+            if planned_base_key.endswith(".weight"):
+                core = extract_core_layer_base(planned_base_key)
+                planned_low_rank = lora_lookup.get(core.replace(".", "_"), [])
+            skipped = any(pattern.search(planned_base_key) for pattern in skip_patterns)
+            entries = {}
+            if planned_base_key not in base_low_bit_keys and not skipped:
+                entries[-1] = [planned_base_key]
+                for info, _, _, direct_key, block_keys in planned_direct:
+                    if not layer_has_low_bit(block_keys, info["low_bit_keys"]):
+                        entries.setdefault(info["index"], []).append(direct_key)
+                for info, _, block_keys in planned_low_rank:
+                    if not layer_has_low_bit(block_keys, info["low_bit_keys"]):
+                        entries.setdefault(info["index"], []).extend(
+                            layer_tensor_keys(block_keys).values()
+                        )
+                entries = {
+                    source: list(dict.fromkeys(keys)) for source, keys in entries.items()
+                }
+            work_units.append((planned_base_key, entries))
+
+        streamed_units = stream_work_units(
+            handler_map,
+            work_units,
+            pin_memory=str(device).startswith("cuda"),
+        )
+
+        writer_context = atomic_uel_writer(output_path, base_metadata)
+        writer = writer_context.__enter__()
         try:
             with torch.no_grad():
-                for base_key in tqdm(base_keys, desc="Merging to model", unit="keys"):
+                for base_key, loaded in tqdm(
+                    streamed_units,
+                    total=len(work_units),
+                    desc="Merging to model",
+                    unit="keys",
+                ):
                     core_with_suffix = base_key
                     for prefix in BASE_PREFIXES:
                         if core_with_suffix.startswith(prefix):
@@ -1402,7 +1439,7 @@ def merge_loras_to_model(
                         continue
 
                     # Load base weight only after guarded and skipped keys are classified.
-                    cpu_base = base_handler.get_tensor(base_key)
+                    cpu_base = loaded[(-1, base_key)]
 
                     if direct_contributions or low_rank_contributions:
                         if device == 'cuda':
@@ -1423,7 +1460,7 @@ def merge_loras_to_model(
                                     + low_bit_description(info, block_keys),
                                 )
                                 continue
-                            cpu_patch = info["handler"].get_tensor(direct_key)
+                            cpu_patch = loaded[(info["index"], direct_key)]
                             is_additive = direct_role != "set_weight"
                             if is_additive and cpu_patch.ndim == 1 and not include_1d_diffs:
                                 stats["disabled_1d"] += 1
@@ -1493,12 +1530,23 @@ def merge_loras_to_model(
                                 info["handler"].get_dtype(key) for key in tensor_keys.values()
                             ]
                             tensors = {
-                                key: info["handler"].get_tensor(key)
+                                key: loaded[(info["index"], key)]
                                 for key in tensor_keys.values()
                             }
-                            alpha = None
+                            down_key = block_keys["down"]
+                            up_key = block_keys["up"]
+                            alpha_tensor = tensors.get(block_keys.get("alpha"))
+                            tensors[down_key], tensors[up_key] = normalize_lora_pair(
+                                tensors[down_key],
+                                tensors[up_key],
+                                alpha_tensor,
+                                layer=block_name,
+                            )
+                            loaded[(info["index"], down_key)] = tensors[down_key]
+                            loaded[(info["index"], up_key)] = tensors[up_key]
                             if "alpha" in block_keys:
-                                alpha = float(tensors[block_keys["alpha"]].item())
+                                tensors.pop(block_keys["alpha"], None)
+                            alpha = None
                             dora_scale = tensors.get(block_keys.get("dora_scale"))
                             try:
                                 adapter = LoRAAdapter.load(
@@ -1634,8 +1682,13 @@ def merge_loras_to_model(
                             torch.cuda.empty_cache()
 
                     pbar.update(1)
-        finally:
-            writer.__exit__(None, None, None)
+        except BaseException as exc:
+            streamed_units.close()
+            writer_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            streamed_units.close()
+            writer_context.__exit__(None, None, None)
 
         adapter_outcomes = {
             "APPLIED": [],

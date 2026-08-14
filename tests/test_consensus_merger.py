@@ -584,7 +584,7 @@ def test_lora_cross_format_companion_group_preserves_model_a_canonically(
     )
 
 
-def test_lora_secondary_only_pair_is_preserved_without_scaling(
+def test_lora_secondary_only_pair_is_alpha_normalized(
     monkeypatch, tmp_path, cwb
 ):
     a = tmp_path / "lora_secondary_a.safetensors"
@@ -595,7 +595,7 @@ def test_lora_secondary_only_pair_is_preserved_without_scaling(
     save_file({
         "transformer.extra.lora_down.weight": torch.tensor([[2.0, 3.0]]),
         "transformer.extra.lora_up.weight": torch.tensor([[4.0], [5.0]]),
-        "transformer.extra.alpha": torch.tensor(1.0),
+        "transformer.extra.alpha": torch.tensor(0.5),
     }, str(b))
     _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
 
@@ -617,10 +617,10 @@ def test_lora_secondary_only_pair_is_preserved_without_scaling(
     )
     torch.testing.assert_close(
         tensors["diffusion_model.extra.lora_B.weight"],
-        torch.tensor([[4.0], [5.0]]),
+        torch.tensor([[2.0], [2.5]]),
     )
     assert tensors["diffusion_model.extra.lora_A.weight"].dtype == torch.float32
-    assert tensors["diffusion_model.extra.alpha"].item() == pytest.approx(1.0)
+    assert "diffusion_model.extra.alpha" not in tensors
 
 
 def test_lora_three_input_merges_b_and_c_group_without_a(monkeypatch, tmp_path, cwb):
@@ -720,9 +720,8 @@ def test_lora_peft_prefix_matching_and_existing_alpha(monkeypatch, tmp_path, cwb
     assert set(tensors) == {
         "diffusion_model.foo.lora_A.weight",
         "diffusion_model.foo.lora_B.weight",
-        "diffusion_model.foo.alpha",
     }
-    assert tensors["diffusion_model.foo.alpha"].item() == pytest.approx(2.0)
+    assert "diffusion_model.foo.alpha" not in tensors
 
 
 def test_lora_mochi_inputs_emit_preferred_canonical_output(
@@ -747,7 +746,6 @@ def test_lora_mochi_inputs_emit_preferred_canonical_output(
     assert set(tensors) == {
         "diffusion_model.foo.lora_A.weight",
         "diffusion_model.foo.lora_B.weight",
-        "diffusion_model.foo.alpha",
     }
 
 
@@ -841,7 +839,28 @@ def test_isolated_low_bit_preserves_complete_lora_layer(monkeypatch, tmp_path, c
     torch.testing.assert_close(
         tensors["diffusion_model.foo.lora_B.weight"], torch.tensor([[3.0], [4.0]])
     )
-    assert tensors["diffusion_model.foo.alpha"].item() == pytest.approx(1.0)
+    assert "diffusion_model.foo.alpha" not in tensors
     torch.testing.assert_close(
         tensors["diffusion_model.foo.dora_scale"], torch.tensor([5.0, 6.0])
     )
+
+
+def test_alpha_bearing_low_bit_lora_factors_are_rejected(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "alpha_low_bit_a.safetensors"
+    b = tmp_path / "alpha_low_bit_b.safetensors"
+    save_file({
+        "diffusion_model.foo.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        "diffusion_model.foo.lora_B.weight": torch.tensor([[3.0], [4.0]]),
+        "diffusion_model.foo.alpha": torch.tensor(1.0),
+    }, str(a))
+    save_file({
+        "diffusion_model.foo.lora_A.weight": torch.tensor([[1, 2]], dtype=torch.uint8),
+        "diffusion_model.foo.lora_B.weight": torch.tensor([[3.0], [4.0]]),
+        "diffusion_model.foo.alpha": torch.tensor(1.0),
+    }, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    with pytest.raises(ValueError, match="Cannot alpha-normalize low-bit LoRA factors"):
+        cwb.ConsensusMergerLogic.execute(
+            ["a", "b"], "loras", _params("alpha_low_bit"), lora_mode=True
+        )

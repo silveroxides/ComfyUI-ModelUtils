@@ -1,6 +1,7 @@
 import fnmatch
 import os
 import re
+from contextlib import closing
 import torch
 import folder_paths
 import comfy.utils
@@ -11,9 +12,11 @@ from .device_utils import (
     estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .quantization_guard import inspect_low_bit_input, write_preserved_tensor
-from .lora_resize import is_direct_diff_key
+from .lora_resize import is_direct_diff_key, parse_lora_layers
+from .uel_io import atomic_uel_writer, stream_work_units
+from .lora_alpha import lora_alpha_scale
 
 
 def load_documentation_from_file(filename):
@@ -91,9 +94,6 @@ class MergerLogic:
             process_device = recipe_params.get('device', 'cpu')
             print(f"[Merger] Preparing memory for {total_size_gb:.2f}GB merge operation...")
             prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
-            flush_threshold_bytes = int(total_size_gb * 1024**3 / 16)
-        else:
-            flush_threshold_bytes = 256 * 1024 * 1024  # 256MB fallback (min 8GB RAM assumed)
 
         handlers = {}
         for name in model_names.values():
@@ -142,7 +142,6 @@ class MergerLogic:
                 if extra:
                     print(f"[Merger] {name} has {len(extra)} extra keys not in Model A (ignored)")
 
-        merged_state_dict = {}
         pbar = comfy.utils.ProgressBar(len(all_keys))
         save_dtype = recipe_params.pop('save_dtype')
         save_torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(save_dtype)
@@ -181,47 +180,101 @@ class MergerLogic:
         output_filename = recipe_params.get("output_filename")
         output_path = os.path.join(output_dir, f"{output_filename}.safetensors")
 
-        writer = None
+        alpha_normalization = {}
+        alpha_keys = set()
+        if model_type == "loras":
+            for name, handler in handlers.items():
+                pairs, _ = parse_lora_layers(handler.keys())
+                mapping = {}
+                for block_keys in pairs.values():
+                    if all(role in block_keys for role in ("down", "up", "alpha")):
+                        up_key = block_keys["up"]
+                        alpha_key = block_keys["alpha"]
+                        mapping[up_key] = (
+                            alpha_key,
+                            int(handler.get_shape(block_keys["down"])[0]),
+                            block_keys["down"],
+                        )
+                        alpha_keys.add(alpha_key)
+                alpha_normalization[name] = mapping
+                for up_key, (_, _, down_key) in mapping.items():
+                    if up_key in low_bit_keys_by_name[name] or down_key in low_bit_keys_by_name[name]:
+                        raise ValueError(
+                            f"Cannot alpha-normalize low-bit LoRA factors for '{up_key}'."
+                        )
 
-        writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-        writer.__enter__()
+        work_units = []
+        for key in all_keys:
+            preserve_low_bit = model_type == "loras" and any(
+                key in low_bit_keys for low_bit_keys in low_bit_keys_by_name.values()
+            )
+            discarded = _matches_any_pattern(key, discard_patterns, glob_mode=glob_mode)
+            entries = {}
+            if key in alpha_keys:
+                discarded = True
+            if not preserve_low_bit and not discarded:
+                preserve_a = (
+                    model_type == "loras"
+                    and len(primary_handler.get_shape(key)) == 1
+                    and not include_1d_diffs
+                ) or _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                requested_names = [primary_model_name]
+                if not preserve_a:
+                    requested_names.extend(
+                        model_names.get(f"model_{label.lower()}")
+                        for label in calc_mode_class.models_used
+                        if label != "A"
+                    )
+                for name in dict.fromkeys(requested_names):
+                    if name in handlers and key in handlers[name].keys():
+                        entries[name] = [key]
+                        alpha_info = alpha_normalization.get(name, {}).get(key)
+                        if alpha_info is not None:
+                            entries[name].append(alpha_info[0])
+            work_units.append((key, entries))
 
-        batch_buffer = {}
-        batch_bytes = 0
-        batch_key_count = 0
-
-        def _flush_batch():
-            nonlocal batch_buffer, batch_bytes, batch_key_count
-            if not batch_buffer:
-                return
-            writer.write_dict(batch_buffer)
-            pbar.update(batch_key_count)
-            batch_buffer = {}
-            batch_bytes = 0
-            batch_key_count = 0
-            if recipe_params.get('force_clear_cache', True):
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        with torch.no_grad():
-            for key in tqdm(all_keys, desc="Merging layers", unit="layers"):
+        output_metadata = (metadata or {}).copy()
+        if model_type == "loras":
+            output_metadata["alpha_normalized"] = "true"
+            output_metadata["alpha_normalization"] = (
+                "lora_up := lora_up * (alpha / rank); alpha tensors removed"
+            )
+        with atomic_uel_writer(output_path, output_metadata) as writer, torch.no_grad(), closing(
+            stream_work_units(
+                handlers, work_units,
+                pin_memory=str(process_device).startswith("cuda"),
+            )
+        ) as streamed:
+            for key, loaded in tqdm(streamed, total=len(work_units), desc="Merging layers", unit="layers"):
                 preserve_low_bit = model_type == "loras" and any(
                     key in low_bit_keys for low_bit_keys in low_bit_keys_by_name.values()
                 )
+                if key in alpha_keys:
+                    discarded_keys += 1
+                    pbar.update(1)
+                    continue
                 if preserve_low_bit:
-                    _flush_batch()
-                    write_preserved_tensor(writer, key, primary_handler)
+                    write_preserved_tensor(writer, key, primary_handler, force_raw=True)
                     pbar.update(1)
                     continue
                 # Check discard patterns first - skip entirely
                 if _matches_any_pattern(key, discard_patterns, glob_mode=glob_mode):
                     discarded_keys += 1
+                    pbar.update(1)
                     continue
 
+                for name, mapping in alpha_normalization.items():
+                    alpha_info = mapping.get(key)
+                    if alpha_info is None or (name, key) not in loaded:
+                        continue
+                    alpha_key, source_rank, _ = alpha_info
+                    alpha = loaded[(name, alpha_key)]
+                    scale = lora_alpha_scale(alpha, source_rank, layer=key)
+                    if scale != 1.0:
+                        loaded[(name, key)] = loaded[(name, key)] * scale
+
                 # Pre-load Model A's tensor with pinned memory for CUDA
-                cpu_tensor = primary_handler.get_tensor(key)
+                cpu_tensor = loaded[(primary_model_name, key)]
 
                 # Determine original dtypes across all active models for this key
                 original_dtypes = [primary_handler.get_dtype(key)]
@@ -248,29 +301,24 @@ class MergerLogic:
                 if preserve_model_a_1d or _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode):
                     t = tensor_a.detach().to(target_dtype).cpu()
 
-                    batch_buffer[key] = t
-                    batch_bytes += t.numel() * t.element_size()
-                    batch_key_count += 1
+                    writer.write_batch([(key, t)])
+                    pbar.update(1)
                     if not preserve_model_a_1d:
                         excluded_keys += 1
                     del tensor_a
-                    if (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
-                        _flush_batch()
                     continue
 
                 # Pass tensor_a metadata to recipes for zeros mode and fallback
                 recipe_params['_tensor_a'] = tensor_a
                 recipe_params['_tensor_a_shape'] = tensor_a.shape
                 recipe_params['_tensor_a_dtype'] = tensor_a.dtype
+                recipe_params['preloaded_tensors'] = loaded
 
                 try:
                     recipe = calc_mode_class.create_recipe(key=key, **recipe_params)
                     result = recipe.merge()
                 except MissingTensorError as e:
                     if mismatch_mode == MissingTensorBehavior.ERROR:
-
-                        _flush_batch()
-                        writer.__exit__(None, None, None)
                         raise ValueError(f"Layer mismatch error (mismatch_mode='error'): {e}")
                     result = None
                     error_keys.append(key)
@@ -281,11 +329,10 @@ class MergerLogic:
                     skipped_keys += 1
 
                 if isinstance(result, dict):
+                    outputs = []
                     for r_key, r_tensor in result.items():
                         t = r_tensor.detach().to(target_dtype).cpu()
-
-                        batch_buffer[r_key] = t
-                        batch_bytes += t.numel() * t.element_size()
+                        outputs.append((r_key, t))
                 else:
                     # Ensure compatibility with Model A's architecture.
                     # If alignment_mode is 'pad/crop', we crop results that were padded.
@@ -298,26 +345,19 @@ class MergerLogic:
 
                     t = result.detach().to(target_dtype).cpu()
 
-                    batch_buffer[key] = t
-                    batch_bytes += t.numel() * t.element_size()
+                    outputs = [(key, t)]
 
-
-                batch_key_count += 1
+                writer.write_batch(outputs)
+                pbar.update(1)
 
                 # Clean up references to allow GC immediately.
                 # Local loop variables must be explicitly deleted to prevent PyTorch from keeping tensors in VRAM.
                 recipe.clean()
                 del recipe_params['_tensor_a']
+                del recipe_params['preloaded_tensors']
                 del tensor_a
                 del recipe
                 del result
-
-                if (batch_bytes >= flush_threshold_bytes or batch_key_count >= 32):
-                    _flush_batch()
-
-
-        _flush_batch()
-        writer.__exit__(None, None, None)
 
         # Log summary
         if excluded_keys > 0:

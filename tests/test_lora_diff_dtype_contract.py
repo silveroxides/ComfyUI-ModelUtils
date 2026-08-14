@@ -646,6 +646,27 @@ def test_standard_multi_merge_emits_weighted_direct_union(monkeypatch, tmp_path,
     assert "diffusion_model.lowrank.lora_A.weight" in default_tensors
 
 
+def test_multi_merge_rejects_alpha_bearing_low_bit_factors(
+    monkeypatch, tmp_path, modules
+):
+    _, merger = modules
+    _patch_output(monkeypatch, merger, tmp_path)
+    source = tmp_path / "alpha_low_bit.safetensors"
+    save_file({
+        "diffusion_model.foo.lora_down.weight": torch.tensor(
+            [[1, 2]], dtype=torch.uint8
+        ),
+        "diffusion_model.foo.lora_up.weight": torch.tensor([[3.0], [4.0]]),
+        "diffusion_model.foo.alpha": torch.tensor(1.0),
+    }, str(source))
+
+    with pytest.raises(ValueError, match="Cannot alpha-normalize low-bit LoRA factors"):
+        merger.merge_multi_loras(
+            [str(source)], [1.0], "concatenate", "cpu", torch.float16,
+            "alpha_low_bit", verbose=False,
+        )
+
+
 def test_multi_merge_rejects_direct_shape_mismatch(monkeypatch, tmp_path, modules):
     _, merger = modules
     _patch_output(monkeypatch, merger, tmp_path)
@@ -896,3 +917,46 @@ def test_generic_two_and_three_mergers_enforce_direct_dtype_contract(
         three_enabled["diffusion_model.norm.diff"], torch.tensor([2.25, 3.5])
     )
     assert three_enabled["diffusion_model.norm.diff"].dtype == torch.float32
+
+
+def test_generic_lora_merge_normalizes_alpha_before_factor_merge(
+    monkeypatch, tmp_path, generic_modules
+):
+    generic, operations = generic_modules
+    paths = {}
+    for name, tensors in {
+        "a": {
+            "diffusion_model.layer.lora_A.weight": torch.ones((1, 2)),
+            "diffusion_model.layer.lora_B.weight": torch.full((2, 1), 2.0),
+            "diffusion_model.layer.alpha": torch.tensor(0.5),
+        },
+        "b": {
+            "diffusion_model.layer.lora_A.weight": torch.ones((1, 2)),
+            "diffusion_model.layer.lora_B.weight": torch.full((2, 1), 3.0),
+        },
+    }.items():
+        path = tmp_path / f"alpha_{name}.safetensors"
+        save_file(tensors, str(path))
+        paths[name] = str(path)
+
+    monkeypatch.setattr(generic.folder_paths, "get_full_path", lambda _, name: paths.get(name))
+    monkeypatch.setattr(generic.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(generic, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generic, "cleanup_after_operation", lambda: None)
+
+    params = _generic_params("alpha_normalized", override_dtype=False)
+    params.update({"model_a": "a", "model_b": "b"})
+    generic.MergerLogic.execute_merge(
+        {"model_a": "a", "model_b": "b"},
+        "Weight-Sum",
+        operations.TWO_MODEL_MODES,
+        params,
+        "loras",
+    )
+
+    tensors = load_file(str(tmp_path / "loras" / "alpha_normalized.safetensors"))
+    torch.testing.assert_close(
+        tensors["diffusion_model.layer.lora_B.weight"],
+        torch.full((2, 1), 2.0),
+    )
+    assert not any(key.endswith(".alpha") for key in tensors)

@@ -1,11 +1,9 @@
 import os
-import json
-import struct
 import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors import safe_open
+from unifiedefficientloader import MemoryEfficientSafeOpen
 from .utils import convert_pt_to_safetensors
 
 
@@ -21,25 +19,15 @@ def _get_metakeys(model_name: str, model_type: str) -> tuple[str, str]:
                 return f"Conversion failed: {error_message}", ""
         model_path = temp_safe_path
 
-    # Read header only - no tensor loading needed
-    with open(model_path, "rb") as f:
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        header_json = f.read(header_size).decode("utf-8")
-    header = json.loads(header_json)
-
-    # Extract metadata and layer shapes from header
-    metadata = header.pop("__metadata__", {})
-    metadata_str = str(metadata)
-
-    layer_shapes = ""
-    keys = [k for k in header.keys()]
-    pbar = comfy.utils.ProgressBar(len(keys))
-    for layer_name in tqdm(keys, desc="Reading layer shapes", unit="layers"):
-        info = header[layer_name]
-        shape = str(info.get("shape", []))
-        name_shape = f"{layer_name}, {shape}\n"
-        layer_shapes += name_shape
-        pbar.update(1)
+    with MemoryEfficientSafeOpen(model_path, low_memory=True) as handler:
+        metadata_str = str(handler.metadata() or {})
+        keys = handler.keys()
+        pbar = comfy.utils.ProgressBar(len(keys))
+        lines = []
+        for layer_name in tqdm(keys, desc="Reading layer shapes", unit="layers"):
+            lines.append(f"{layer_name}, {list(handler.get_shape(layer_name))}\n")
+            pbar.update(1)
+        layer_shapes = "".join(lines)
 
     return metadata_str, layer_shapes
 

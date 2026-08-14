@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from unifiedefficientloader import IncrementalSafetensorsWriter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +54,7 @@ def _inspect_file(path, modules, label="input"):
 def _round_trip_preserved(path, output, modules):
     handler = modules["resize"].MemoryEfficientSafeOpen(str(path), low_memory=True)
     try:
-        with modules["resize"].IncrementalSafetensorsWriter(str(output)) as writer:
+        with IncrementalSafetensorsWriter(str(output)) as writer:
             modules["guard"].write_preserved_tensor(writer, "low", handler)
     finally:
         handler.__exit__(None, None, None)

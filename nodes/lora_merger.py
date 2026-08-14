@@ -4,7 +4,7 @@ Resolves different naming conventions and ranks via concatenation.
 """
 import os
 import gc
-from collections import Counter, deque
+from collections import Counter
 import torch
 import folder_paths
 import comfy.utils
@@ -22,8 +22,10 @@ from .lora_resize import (
     validate_canonical_blocks,
 )
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
+from .uel_io import AsyncTensorCursor as _AsyncTensorCursor, atomic_uel_writer
+from .lora_alpha import normalize_lora_pair
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 
 BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
@@ -217,6 +219,13 @@ def _build_merge_work_units(
         if guarded or raw:
             idx, block_name = min(indices, key=lambda item: item[0])
             block_keys = lora_infos[idx]["pairs"][block_name]
+            if raw and "alpha" in block_keys and any(
+                block_keys.get(role) in lora_infos[idx]["low_bit_keys"]
+                for role in ("down", "up")
+            ):
+                raise ValueError(
+                    f"Cannot alpha-normalize low-bit LoRA factors for '{block_name}'."
+                )
             unit = {
                 "kind": "raw_copy" if raw else "copy",
                 "core": core,
@@ -319,58 +328,6 @@ def _build_merge_work_units(
         for entry in unit["entries"]:
             stream_keys[entry["idx"]].append(entry["key"])
     return units, stream_keys
-
-
-class _AsyncTensorCursor:
-    def __init__(self, handler, keys, pin_memory):
-        self.handler = handler
-        self.expected = tuple(keys)
-        self.position = 0
-        self.pending = deque()
-        self.stream = None
-        if self.expected:
-            self.stream = handler.async_stream(
-                list(self.expected),
-                batch_size=1,
-                prefetch_batches=1,
-                pin_memory=pin_memory,
-            )
-
-    def take(self, expected_key):
-        if self.position >= len(self.expected):
-            raise RuntimeError(f"Unexpected tensor request: {expected_key}")
-        planned_key = self.expected[self.position]
-        if planned_key != expected_key:
-            raise RuntimeError(
-                f"UEL stream order mismatch: expected {planned_key}, requested {expected_key}"
-            )
-        if not self.pending:
-            self.pending.extend(next(self.stream))
-        key, tensor = self.pending.popleft()
-        if key != expected_key:
-            raise RuntimeError(
-                f"UEL yielded {key} while {expected_key} was expected"
-            )
-        self.position += 1
-        return tensor
-
-    def release(self, key):
-        self.handler.mark_processed(key)
-
-    def finish(self):
-        if self.position != len(self.expected) or self.pending:
-            raise RuntimeError("UEL stream ended before all planned tensors were consumed")
-        if self.stream is not None:
-            try:
-                next(self.stream)
-            except StopIteration:
-                pass
-            else:
-                raise RuntimeError("UEL stream yielded unplanned tensors")
-
-    def close(self):
-        if self.stream is not None:
-            self.stream.close()
 
 
 def _is_cuda_oom_error(error):
@@ -481,12 +438,6 @@ def _enhanced_dare_ties_merge(
     return _ties_result(values)
 
 
-def _source_pair_scale(block_keys, loaded, idx, source_rank):
-    if "alpha" not in block_keys:
-        return 1.0
-    return float(loaded[(idx, block_keys["alpha"])].item()) / source_rank
-
-
 def _process_merge_unit_on_device(
     unit,
     loaded,
@@ -513,13 +464,22 @@ def _process_merge_unit_on_device(
                     f"LoRA rank mismatch for {block_keys['down']} and {block_keys['up']}"
                 )
             maximum_rank = max(maximum_rank, source_rank)
-            scale = _source_pair_scale(
-                block_keys, loaded, idx, source_rank
+            alpha = (
+                loaded[(idx, block_keys["alpha"])]
+                if "alpha" in block_keys else None
             )
+            down_cpu, up_cpu = normalize_lora_pair(
+                down_cpu,
+                up_cpu,
+                alpha,
+                layer=block_name,
+            )
+            loaded[(idx, block_keys["down"])] = down_cpu
+            loaded[(idx, block_keys["up"])] = up_cpu
             pair_contributions.append(
                 (
                     _to_processing_device(down_cpu, process_device),
-                    _to_processing_device(up_cpu, process_device) * scale,
+                    _to_processing_device(up_cpu, process_device),
                     float(info["weight"]),
                 )
             )
@@ -800,15 +760,17 @@ def _run_multi_lora_merge(
         metadata = {
             "ss_training_comment": f"Merged {len(lora_paths)} LoRAs via {strategy}",
             "ss_network_module": "networks.lora",
+            "alpha_normalized": "true",
+            "alpha_normalization": (
+                "lora_up := lora_up * (alpha / rank); alpha tensors removed"
+            ),
         }
         output_ranks = Counter()
         fallback_count = 0
         tensor_count = 0
         pbar = comfy.utils.ProgressBar(len(units))
 
-        with IncrementalSafetensorsWriter(
-            output_path, metadata=metadata, max_workers=1
-        ) as writer:
+        with atomic_uel_writer(output_path, metadata) as writer:
             with torch.no_grad():
                 for work_index, unit in enumerate(
                     tqdm(

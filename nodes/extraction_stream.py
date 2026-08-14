@@ -1,8 +1,8 @@
 """Bounded paired UEL streaming helpers for model extraction nodes."""
 
-from collections import deque
-
 import torch
+
+from .uel_io import AsyncTensorCursor
 
 def is_cuda_oom(error):
     return isinstance(error, torch.cuda.OutOfMemoryError) or (
@@ -107,57 +107,6 @@ def dora_difference(cpu_a, cpu_b, device, *, keep_sources=False):
         release_cuda_oom()
         cpu_b_float = cpu_b.float() if cpu_b is not None else None
         return (*compute(cpu_a.float(), cpu_b_float), "cpu")
-
-
-class AsyncTensorCursor:
-    """Consume one ordered, bounded UEL stream and release each consumed key."""
-
-    def __init__(self, handler, keys, *, pin_memory: bool):
-        self.handler = handler
-        self.expected = tuple(keys)
-        self.position = 0
-        self.pending = deque()
-        self.stream = None
-        if self.expected:
-            self.stream = handler.async_stream(
-                list(self.expected),
-                batch_size=1,
-                prefetch_batches=1,
-                pin_memory=pin_memory,
-            )
-
-    def take(self, expected_key):
-        if self.position >= len(self.expected):
-            raise RuntimeError(f"Unexpected tensor request: {expected_key}")
-        planned_key = self.expected[self.position]
-        if planned_key != expected_key:
-            raise RuntimeError(
-                f"UEL stream order mismatch: expected {planned_key}, requested {expected_key}"
-            )
-        if not self.pending:
-            self.pending.extend(next(self.stream))
-        key, tensor = self.pending.popleft()
-        if key != expected_key:
-            raise RuntimeError(f"UEL yielded {key} while {expected_key} was expected")
-        self.position += 1
-        return tensor
-
-    def release(self, key):
-        self.handler.mark_processed(key)
-
-    def finish(self):
-        if self.position != len(self.expected) or self.pending:
-            raise RuntimeError("UEL stream ended before all planned tensors were consumed")
-        if self.stream is not None:
-            try:
-                next(self.stream)
-            except StopIteration:
-                return
-            raise RuntimeError("UEL stream yielded unplanned tensors")
-
-    def close(self):
-        if self.stream is not None:
-            self.stream.close()
 
 
 def paired_async_tensors(handler_a, handler_b, work_units, *, pin_memory: bool):

@@ -3,11 +3,11 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen
+from .uel_io import atomic_uel_writer
 
 REVERSE_RENAME_DICT = {
     "transformer_blocks.": "blocks.",
@@ -56,21 +56,20 @@ def _convert_diffusers_to_non_diffusers_anima_lora(lora_name: str, output_filena
     model_size_gb = estimate_model_size(model_path_to_load)
     prepare_for_large_operation(model_size_gb * 1.2)
 
-    # Get metadata from safe_open (header only, no tensor loading)
-    with safe_open(model_path_to_load, framework="pt", device="cpu") as f:
-        metadata = f.metadata() or {}
-
     model_dir = folder_paths.get_folder_paths(model_type)[-1]
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     # Stream tensors, rename on the fly, write immediately
-    writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-    writer.__enter__()
-    try:
-        with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+    with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
+        metadata = handler.metadata() or {}
+        with atomic_uel_writer(output_path, metadata) as writer:
             original_keys = handler.keys()
             pbar = comfy.utils.ProgressBar(len(original_keys))
-            for key in tqdm(original_keys, desc="Renaming Anima LoRA keys", unit="keys"):
+            stream = handler.async_stream(
+                original_keys, batch_size=1, prefetch_batches=1, pin_memory=False
+            )
+            for batch in tqdm(stream, total=len(original_keys), desc="Renaming Anima LoRA keys", unit="keys"):
+                key, tensor = batch[0]
                 new_key = key
 
                 if key.startswith("text_conditioner."):
@@ -81,10 +80,9 @@ def _convert_diffusers_to_non_diffusers_anima_lora(lora_name: str, output_filena
                         new_key = new_key.replace(old_part, new_part)
                     new_key = f"diffusion_model.{new_key}"
 
-                writer.write(new_key, handler.get_tensor(key).contiguous())
+                writer.write_batch([(new_key, tensor.contiguous())])
+                handler.mark_processed(key)
                 pbar.update(1)
-    finally:
-        writer.__exit__(None, None, None)
 
     # Cleanup after operation
     cleanup_after_operation()

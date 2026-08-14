@@ -88,7 +88,7 @@ def layer_has_low_bit(block_keys: dict, low_bit_keys: set[str]) -> bool:
     return any(
         block_keys.get(name) in low_bit_keys
         for name in (
-            "down", "up", "alpha", "mid", "reshape", "dora_scale",
+            "down", "up", "mid", "reshape", "dora_scale",
             "diff", "diff_b", "w_norm", "b_norm", "set_weight",
         )
     )
@@ -101,13 +101,30 @@ def write_preserved_tensor(
     output_key: str | None = None,
     *,
     force_raw: bool = False,
+    tensor=None,
 ) -> None:
     """Copy one tensor's original safetensors bytes and dtype into an active writer."""
     destination = output_key or key
     header = _header(handler)
     entry = header[key]
     if not force_raw and entry["dtype"] in UPSTREAM_WRITER_STORAGE_CODES:
-        writer.write(destination, handler.get_tensor(key).cpu().contiguous())
+        if tensor is not None:
+            writer.write(destination, tensor.cpu().contiguous())
+            return
+        stream = handler.async_stream(
+            [key], batch_size=1, prefetch_batches=1, pin_memory=False
+        )
+        yielded = False
+        try:
+            batch = next(stream)
+            if len(batch) != 1 or batch[0][0] != key:
+                raise RuntimeError(f"UEL yielded an unexpected preserved tensor for {key}")
+            yielded = True
+            writer.write(destination, batch[0][1].cpu().contiguous())
+        finally:
+            if yielded:
+                handler.mark_processed(key)
+            stream.close()
         return
 
     source_start, source_end = entry["data_offsets"]

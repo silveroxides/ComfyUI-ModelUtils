@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-import uuid
-from contextlib import contextmanager
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -15,17 +14,15 @@ import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
 from tqdm import tqdm
-from unifiedefficientloader import (
-    IncrementalSafetensorsWriter,
-    MemoryEfficientSafeOpen,
-    transfer_to_gpu_pinned,
-)
+from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
 from .device_utils import (
     cleanup_after_operation,
     estimate_model_size,
     prepare_for_large_operation,
 )
+from .uel_io import atomic_uel_writer, stream_work_units
+from .lora_alpha import normalize_lora_pair
 from .lora_resize import (
     canonical_lora_key,
     layer_has_companions,
@@ -41,7 +38,6 @@ from .merger import (
 )
 from .quantization_guard import (
     inspect_low_bit_input,
-    layer_has_low_bit,
     write_preserved_tensor,
 )
 
@@ -593,25 +589,6 @@ def _merge_lora_pair_to_cpu(
         return execute("cpu")
 
 
-@contextmanager
-def _atomic_output_writer(output_path: str, metadata: dict):
-    """Publish a completed safetensors file atomically and remove failed partials."""
-    directory = os.path.dirname(output_path) or "."
-    basename = os.path.basename(output_path)
-    temporary_path = os.path.join(directory, f".{basename}.{uuid.uuid4().hex}.tmp")
-    try:
-        with IncrementalSafetensorsWriter(temporary_path, metadata=metadata) as writer:
-            yield writer
-        os.replace(temporary_path, output_path)
-        logging.info("[CWB Merge] Published '%s'.", output_path)
-    except BaseException:
-        try:
-            os.remove(temporary_path)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def _clear_previous_layer(params: dict) -> None:
     if not params["force_clear_cache"]:
         return
@@ -762,11 +739,24 @@ class ConsensusMergerLogic:
         secondary_only_copied = 0
         secondary_only_merged = 0
 
-        writer_context = _atomic_output_writer(output_path, primary.metadata())
-        writer = writer_context.__enter__()
-        try:
-            with torch.no_grad():
-                for key in tqdm(keys, desc="CWB merging tensors", unit="tensors"):
+        handler_map = dict(enumerate(handlers))
+        work_units = []
+        for key in keys:
+            source_indices = [i for i, handler in enumerate(handlers) if key in handler.keys()]
+            discarded = _matches_any_pattern(key, discard, glob_mode=glob_mode)
+            guarded = any(key in low_bit_sets[i] for i in source_indices)
+            entries = {} if discarded or guarded else {
+                i: [key] for i in source_indices
+            }
+            work_units.append((key, entries))
+
+        with atomic_uel_writer(output_path, primary.metadata()) as writer, torch.no_grad(), closing(
+            stream_work_units(
+                handler_map, work_units,
+                pin_memory=str(params["process_device"]).startswith("cuda"),
+            )
+        ) as streamed:
+            for key, loaded in tqdm(streamed, total=len(work_units), desc="CWB merging tensors", unit="tensors"):
                     _clear_previous_layer(params)
                     if _matches_any_pattern(key, discard, glob_mode=glob_mode):
                         pbar.update(1)
@@ -778,14 +768,23 @@ class ConsensusMergerLogic:
                     guarded = any(key in low_bit_sets[i] for i in source_indices)
                     excluded = _matches_any_pattern(key, exclude, glob_mode=glob_mode)
                     if guarded or excluded:
-                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        write_preserved_tensor(
+                            writer,
+                            key,
+                            handlers[preserve_index],
+                            force_raw=guarded,
+                            tensor=loaded.get((preserve_index, key)),
+                        )
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
                     if secondary_only and len(source_indices) == 1:
-                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        write_preserved_tensor(
+                            writer, key, handlers[preserve_index],
+                            tensor=loaded[(preserve_index, key)],
+                        )
                         secondary_only_copied += 1
                         pbar.update(1)
                         continue
@@ -797,7 +796,10 @@ class ConsensusMergerLogic:
                             key,
                             preserve_index + 1,
                         )
-                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        write_preserved_tensor(
+                            writer, key, handlers[preserve_index],
+                            tensor=loaded[(preserve_index, key)],
+                        )
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)
@@ -807,11 +809,13 @@ class ConsensusMergerLogic:
                         if mismatch_mode == "error":
                             raise ValueError(f"Tensor '{key}' is missing from a CWB input.")
                         if mismatch_mode == "skip":
-                            write_preserved_tensor(writer, key, primary)
+                            write_preserved_tensor(
+                                writer, key, primary, tensor=loaded[(0, key)]
+                            )
                             pbar.update(1)
                             continue
 
-                    raw = {i: handlers[i].get_tensor(key) for i in source_indices}
+                    raw = {i: loaded[(i, key)] for i in source_indices}
                     reference_index = 0
                     if embedding_union:
                         reference_source = max(
@@ -864,7 +868,10 @@ class ConsensusMergerLogic:
                         actual_dtypes.append(handler.get_dtype(key))
 
                     if preserve_for_mismatch:
-                        write_preserved_tensor(writer, key, handlers[preserve_index])
+                        write_preserved_tensor(
+                            writer, key, handlers[preserve_index],
+                            tensor=loaded[(preserve_index, key)],
+                        )
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)
@@ -886,16 +893,11 @@ class ConsensusMergerLogic:
                         allow_similarity_alignment=embedding_union,
                         operation_label=key,
                     )
-                    writer.write(key, merged)
+                    writer.write_batch([(key, merged)])
                     del merged
                     if secondary_only:
                         secondary_only_merged += 1
                     pbar.update(1)
-        except BaseException as exc:
-            writer_context.__exit__(type(exc), exc, exc.__traceback__)
-            raise
-        else:
-            writer_context.__exit__(None, None, None)
         if secondary_only_copied or secondary_only_merged:
             logging.info(
                 "[CWB Merge] Secondary-only tensors: %d copied, %d merged.",
@@ -932,11 +934,19 @@ class ConsensusMergerLogic:
         secondary_only_copied = 0
         secondary_only_merged = 0
         pbar = comfy.utils.ProgressBar(len(logical_cores) + len(passthrough_keys))
+        current_loaded = {}
 
         def preserve_keys(writer, keys: Iterable[str], source_index: int = 0):
             for key in keys:
                 if key not in written:
-                    write_preserved_tensor(writer, key, handlers[source_index])
+                    guarded = key in low_bit_sets[source_index]
+                    write_preserved_tensor(
+                        writer,
+                        key,
+                        handlers[source_index],
+                        force_raw=guarded,
+                        tensor=current_loaded.get((source_index, key)),
+                    )
                     written.add(key)
 
         def preserve_roles(
@@ -952,12 +962,30 @@ class ConsensusMergerLogic:
                     continue
                 output_key = canonical_lora_key(block_name, role)
                 recognized_sources.add(source_key)
+                if role == "alpha":
+                    written.add(output_key)
+                    continue
                 if output_key not in written:
+                    tensor = current_loaded.get((source_index, source_key))
+                    if role == "up" and "alpha" in keys:
+                        alpha_key = keys["alpha"]
+                        alpha = current_loaded.get((source_index, alpha_key))
+                        down = current_loaded.get((source_index, keys.get("down")))
+                        if tensor is None or alpha is None or down is None:
+                            raise ValueError(
+                                f"Cannot normalize alpha for preserved LoRA layer '{block_name}'."
+                            )
+                        _, tensor = normalize_lora_pair(
+                            down, tensor, alpha, layer=block_name
+                        )
+                        current_loaded[(source_index, source_key)] = tensor
                     write_preserved_tensor(
                         writer,
                         source_key,
                         handlers[source_index],
                         output_key,
+                        force_raw=source_key in low_bit_sets[source_index],
+                        tensor=tensor,
                     )
                     written.add(output_key)
             return recognized_sources
@@ -984,18 +1012,105 @@ class ConsensusMergerLogic:
                 source_index,
             )
 
-        writer_context = _atomic_output_writer(output_path, handlers[0].metadata())
-        writer = writer_context.__enter__()
-        try:
-            with torch.no_grad():
-                for core in tqdm(
-                    logical_cores, desc="CWB merging LoRA layers", unit="layers"
+        def core_matches(core):
+            result = []
+            for index, ((pairs, _), logical_map) in enumerate(zip(parsed, logical_maps)):
+                block = logical_map.get(core)
+                result.append((index, block, pairs.get(block) if block else None))
+            return result
+
+        def has_non_alpha_low_bit(keys, low_bit_keys):
+            return any(
+                key in low_bit_keys
+                for role, key in layer_tensor_keys(keys).items()
+                if role != "alpha"
+            )
+
+        def reject_unnormalizable_alpha(matches):
+            for index, block, keys in matches:
+                if (
+                    keys is not None
+                    and "alpha" in keys
+                    and has_non_alpha_low_bit(keys, low_bit_sets[index])
                 ):
+                    raise ValueError(
+                        f"Cannot alpha-normalize low-bit LoRA factors for '{block}'."
+                    )
+
+        work_units = []
+        for core in logical_cores:
+            matches = core_matches(core)
+            reject_unnormalizable_alpha(matches)
+            layer_keys = {
+                index: [
+                    key for key in handlers[index].keys()
+                    if key in keys.values() or key.startswith(f"{block}.")
+                ]
+                for index, block, keys in matches
+                if block is not None and keys is not None
+            }
+            flat_keys = [key for keys in layer_keys.values() for key in keys]
+            discarded = any(
+                _matches_any_pattern(key, discard, glob_mode=glob_mode)
+                for key in flat_keys
+            )
+            guarded = any(
+                keys is not None and has_non_alpha_low_bit(keys, low_bit_sets[index])
+                for index, _, keys in matches
+            )
+            work_units.append((("core", core), {} if discarded or guarded else layer_keys))
+        for key in sorted(passthrough_keys):
+            source_index = next(
+                index for index, (_, passthrough) in enumerate(parsed) if key in passthrough
+            )
+            entries = {} if key in low_bit_sets[source_index] else {source_index: [key]}
+            work_units.append((("passthrough", key), entries))
+
+        output_metadata = (handlers[0].metadata() or {}).copy()
+        output_metadata["alpha_normalized"] = "true"
+        output_metadata["alpha_normalization"] = (
+            "lora_up := lora_up * (alpha / rank); alpha tensors removed"
+        )
+        with atomic_uel_writer(output_path, output_metadata) as writer, torch.no_grad(), closing(
+            stream_work_units(
+                dict(enumerate(handlers)), work_units,
+                pin_memory=str(params["process_device"]).startswith("cuda"),
+            )
+        ) as streamed:
+            progress = tqdm(
+                streamed,
+                total=len(work_units),
+                desc="CWB merging LoRA layers",
+                unit="layers",
+            )
+            for (unit_kind, unit_value), current_loaded in progress:
+                if unit_kind == "passthrough":
+                    key = unit_value
                     _clear_previous_layer(params)
-                    matches = []
-                    for index, ((pairs, _), logical_map) in enumerate(zip(parsed, logical_maps)):
-                        block = logical_map.get(core)
-                        matches.append((index, block, pairs.get(block) if block else None))
+                    if key in written:
+                        continue
+                    if _matches_any_pattern(key, discard, glob_mode=glob_mode):
+                        pbar.update(1)
+                        continue
+                    source_index = next(
+                        index for index, (_, passthrough) in enumerate(parsed)
+                        if key in passthrough
+                    )
+                    preserve_keys(writer, [key], source_index)
+                    if source_index > 0:
+                        secondary_only_copied += 1
+                    pbar.update(1)
+                    continue
+
+                core = unit_value
+                if unit_kind == "core":
+                    _clear_previous_layer(params)
+                    pair_sources = []
+                    compatible = []
+                    direct = []
+                    down = up = alpha = tensor = anchor_tensor = None
+                    anchor_down_template = anchor_up_template = None
+                    matches = core_matches(core)
                     anchor_index, anchor_block, anchor_keys = next(
                         (index, block, keys)
                         for index, block, keys in matches
@@ -1015,7 +1130,7 @@ class ConsensusMergerLogic:
                         pbar.update(1)
                         continue
                     guarded = any(
-                        keys is not None and layer_has_low_bit(keys, low_bit_sets[index])
+                        keys is not None and has_non_alpha_low_bit(keys, low_bit_sets[index])
                         for index, _, keys in matches
                     )
                     excluded = any(
@@ -1060,8 +1175,8 @@ class ConsensusMergerLogic:
                     if "down" in anchor_keys and "up" in anchor_keys:
                         pair_sources = []
                         pair_failed = False
-                        anchor_down_template = handlers[anchor_index].get_tensor(anchor_keys["down"])
-                        anchor_up_template = handlers[anchor_index].get_tensor(anchor_keys["up"])
+                        anchor_down_template = current_loaded[(anchor_index, anchor_keys["down"])]
+                        anchor_up_template = current_loaded[(anchor_index, anchor_keys["up"])]
                         for index, _, keys in matches:
                             if not keys:
                                 if secondary_only:
@@ -1091,8 +1206,8 @@ class ConsensusMergerLogic:
                                     1.0,
                                 ))
                                 continue
-                            down = handlers[index].get_tensor(keys["down"])
-                            up = handlers[index].get_tensor(keys["up"])
+                            down = current_loaded[(index, keys["down"])]
+                            up = current_loaded[(index, keys["up"])]
                             if down.ndim < 2 or up.ndim < 2 or down.shape[0] != up.shape[1]:
                                 if mismatch_mode == "error" or index == anchor_index:
                                     raise ValueError(f"Invalid LoRA rank dimensions for '{anchor_block}'.")
@@ -1106,15 +1221,16 @@ class ConsensusMergerLogic:
                                     1.0,
                                 ))
                                 continue
-                            scale = 1.0
-                            if "alpha" in keys:
-                                alpha = handlers[index].get_tensor(keys["alpha"])
-                                if alpha.numel() != 1:
-                                    raise ValueError(
-                                        f"LoRA alpha for '{anchor_block}' must be scalar."
-                                    )
-                                scale = float(alpha.reshape(-1)[0].item()) / down.shape[0]
-                            pair_sources.append((index, down, up, scale))
+                            alpha = (
+                                current_loaded[(index, keys["alpha"])]
+                                if "alpha" in keys else None
+                            )
+                            down, up = normalize_lora_pair(
+                                down, up, alpha, layer=anchor_block
+                            )
+                            current_loaded[(index, keys["down"])] = down
+                            current_loaded[(index, keys["up"])] = up
+                            pair_sources.append((index, down, up, 1.0))
                         if pair_failed:
                             preserve_roles(
                                 writer,
@@ -1182,10 +1298,6 @@ class ConsensusMergerLogic:
                                     canonical_lora_key(anchor_block, "up"),
                                 })
                                 if "alpha" in anchor_keys:
-                                    writer.write(
-                                        canonical_lora_key(anchor_block, "alpha"),
-                                        torch.tensor(float(max_rank), dtype=target_dtype),
-                                    )
                                     written.add(canonical_lora_key(anchor_block, "alpha"))
                                 group_merged = True
 
@@ -1194,7 +1306,7 @@ class ConsensusMergerLogic:
                             continue
                         anchor_key = anchor_keys[kind]
                         output_key = canonical_lora_key(anchor_block, kind)
-                        anchor_tensor = handlers[anchor_index].get_tensor(anchor_key)
+                        anchor_tensor = current_loaded[(anchor_index, anchor_key)]
                         if anchor_tensor.ndim == 1 and not include_1d:
                             if output_key not in written:
                                 write_preserved_tensor(
@@ -1229,7 +1341,7 @@ class ConsensusMergerLogic:
                                     break
                                 direct.append(torch.zeros_like(anchor_tensor, dtype=torch.float32))
                                 continue
-                            tensor = handlers[index].get_tensor(keys[kind])
+                            tensor = current_loaded[(index, keys[kind])]
                             if tensor.shape != anchor_tensor.shape:
                                 if mismatch_mode == "error":
                                     raise ValueError(f"Direct LoRA shape mismatch for '{anchor_block}.{kind}'.")
@@ -1285,28 +1397,14 @@ class ConsensusMergerLogic:
                             secondary_only_merged += 1
                         else:
                             secondary_only_copied += 1
+                    pair_sources.clear()
+                    compatible.clear()
+                    direct.clear()
+                    current_loaded.clear()
+                    down = up = alpha = tensor = anchor_tensor = None
+                    anchor_down_template = anchor_up_template = None
                     pbar.update(1)
 
-                for key in sorted(passthrough_keys):
-                    _clear_previous_layer(params)
-                    if key in written:
-                        continue
-                    if _matches_any_pattern(key, discard, glob_mode=glob_mode):
-                        pbar.update(1)
-                        continue
-                    source_index = next(
-                        index for index, (_, passthrough) in enumerate(parsed)
-                        if key in passthrough
-                    )
-                    preserve_keys(writer, [key], source_index)
-                    if source_index > 0:
-                        secondary_only_copied += 1
-                    pbar.update(1)
-        except BaseException as exc:
-            writer_context.__exit__(type(exc), exc, exc.__traceback__)
-            raise
-        else:
-            writer_context.__exit__(None, None, None)
         if preserved_companion_groups:
             logging.warning(
                 "[CWB LoRA Merge] Preserved %d companion-bearing group(s)",

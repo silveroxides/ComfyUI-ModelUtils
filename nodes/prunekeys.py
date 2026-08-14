@@ -4,11 +4,11 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen
+from .uel_io import atomic_uel_writer
 
 
 def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
@@ -30,10 +30,6 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     model_size_gb = estimate_model_size(model_path_to_load)
     prepare_for_large_operation(model_size_gb * 1.2)
 
-    # Get metadata from safe_open (header only, no tensor loading)
-    with safe_open(model_path_to_load, framework="pt", device="cpu") as f:
-        metadata = f.metadata() or {}
-
     patterns = [p.strip() for p in keys_to_prune_str.strip().split('\n') if p.strip()]
 
     if not patterns:
@@ -44,26 +40,27 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     # Stream tensors, filter on the fly, write immediately
-    writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-    writer.__enter__()
-    try:
-        with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+    with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
+        metadata = handler.metadata() or {}
+        with atomic_uel_writer(output_path, metadata) as writer:
             all_keys = handler.keys()
             pbar = comfy.utils.ProgressBar(len(all_keys))
-            for key in tqdm(all_keys, desc="Pruning keys", unit="keys"):
-                is_match = False
-                if use_regex:
-                    if any(re.search(pattern, key) for pattern in patterns):
-                        is_match = True
-                else:
-                    if any(pattern in key for pattern in patterns):
-                        is_match = True
-
-                if not is_match:
-                    writer.write(key, handler.get_tensor(key).contiguous())
+            kept_keys = [
+                key for key in all_keys
+                if not (
+                    any(re.search(pattern, key) for pattern in patterns)
+                    if use_regex else any(pattern in key for pattern in patterns)
+                )
+            ]
+            stream = handler.async_stream(
+                kept_keys, batch_size=1, prefetch_batches=1, pin_memory=False
+            )
+            for batch in tqdm(stream, total=len(kept_keys), desc="Pruning keys", unit="keys"):
+                key, tensor = batch[0]
+                writer.write_batch([(key, tensor.contiguous())])
+                handler.mark_processed(key)
                 pbar.update(1)
-    finally:
-        writer.__exit__(None, None, None)
+            pbar.update(len(all_keys) - len(kept_keys))
 
     # Cleanup after operation
     cleanup_after_operation()

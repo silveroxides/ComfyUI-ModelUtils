@@ -4,21 +4,17 @@ from __future__ import annotations
 
 import os
 import re
-import uuid
 from collections import Counter
-from contextlib import contextmanager
 
 import comfy.utils
 import folder_paths
 import torch
 from comfy_api.latest import io
 from tqdm import tqdm
-from unifiedefficientloader import (
-    IncrementalSafetensorsWriter,
-    MemoryEfficientSafeOpen,
-)
+from unifiedefficientloader import MemoryEfficientSafeOpen
 
 from .device_utils import cleanup_after_operation
+from .uel_io import atomic_uel_writer
 
 
 TARGET_DTYPES = {
@@ -58,27 +54,6 @@ def _output_path(output_filename: str) -> str:
     return os.path.join(output_dir, f"{name}.safetensors")
 
 
-@contextmanager
-def _atomic_writer(output_path: str, metadata: dict):
-    directory = os.path.dirname(output_path) or "."
-    basename = os.path.basename(output_path)
-    temporary_path = os.path.join(
-        directory, f".{basename}.{uuid.uuid4().hex}.tmp"
-    )
-    try:
-        with IncrementalSafetensorsWriter(
-            temporary_path, metadata=metadata, max_workers=1
-        ) as writer:
-            yield writer
-        os.replace(temporary_path, output_path)
-    except BaseException:
-        try:
-            os.remove(temporary_path)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def convert_diffusion_model_dtype(
     model_name: str,
     target_dtype: str,
@@ -106,7 +81,7 @@ def convert_diffusion_model_dtype(
     try:
         with MemoryEfficientSafeOpen(source_path, low_memory=True) as loader:
             metadata = (loader.metadata() or {}).copy()
-            with _atomic_writer(output_path, metadata) as writer:
+            with atomic_uel_writer(output_path, metadata) as writer:
                 keys = list(loader.keys())
                 progress = comfy.utils.ProgressBar(len(keys))
                 stream = loader.async_stream(

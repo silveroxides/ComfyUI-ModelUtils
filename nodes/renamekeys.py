@@ -3,11 +3,11 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from safetensors import safe_open
 from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen
+from .uel_io import atomic_uel_writer
 
 
 
@@ -30,10 +30,6 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
     model_size_gb = estimate_model_size(model_path_to_load)
     prepare_for_large_operation(model_size_gb * 1.2)
 
-    # Get metadata from safe_open (header only, no tensor loading)
-    with safe_open(model_path_to_load, framework="pt", device="cpu") as f:
-        metadata = f.metadata() or {}
-
     old_keys = [key.strip() for key in old_keys_str.strip().split('\n') if key.strip()]
     new_keys = [key.strip() for key in new_keys_str.strip().split('\n') if key.strip()]
 
@@ -47,18 +43,20 @@ def _rename_keys(model_name: str, model_type: str, old_keys_str: str,
     output_path = os.path.join(model_dir, f"{output_filename.strip()}.safetensors")
 
     # Stream tensors, rename on the fly, write immediately
-    writer = IncrementalSafetensorsWriter(output_path, metadata=metadata)
-    writer.__enter__()
-    try:
-        with MemoryEfficientSafeOpen(model_path_to_load) as handler:
+    with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
+        metadata = handler.metadata() or {}
+        with atomic_uel_writer(output_path, metadata) as writer:
             original_keys = handler.keys()
             pbar = comfy.utils.ProgressBar(len(original_keys))
-            for key in tqdm(original_keys, desc="Renaming keys", unit="keys"):
+            stream = handler.async_stream(
+                original_keys, batch_size=1, prefetch_batches=1, pin_memory=False
+            )
+            for batch in tqdm(stream, total=len(original_keys), desc="Renaming keys", unit="keys"):
+                key, tensor = batch[0]
                 new_key = key_map.get(key, key)
-                writer.write(new_key, handler.get_tensor(key).contiguous())
+                writer.write_batch([(new_key, tensor.contiguous())])
+                handler.mark_processed(key)
                 pbar.update(1)
-    finally:
-        writer.__exit__(None, None, None)
 
     # Cleanup after operation
     cleanup_after_operation()

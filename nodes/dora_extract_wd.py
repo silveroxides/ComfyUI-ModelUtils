@@ -18,7 +18,8 @@ from .device_utils import (
     cleanup_after_operation
 )
 
-from unifiedefficientloader import MemoryEfficientSafeOpen, IncrementalSafetensorsWriter
+from unifiedefficientloader import MemoryEfficientSafeOpen
+from .uel_io import atomic_uel_writer
 from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
 from .extraction_stream import dora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 
@@ -654,8 +655,8 @@ def extract_dora_from_files(
             del weight_diff
             return status, layer_results
 
-        writer = IncrementalSafetensorsWriter(output_path)
-        writer.__enter__()
+        writer_context = atomic_uel_writer(output_path)
+        writer = writer_context.__enter__()
         try:
             stream = paired_async_tensors(
                 handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda")
@@ -674,8 +675,11 @@ def extract_dora_from_files(
 
                 pbar.update(1)
             stats["skipped"] += len(weight_keys) - len(work_units)
-        finally:
-            writer.__exit__(None, None, None)
+        except BaseException as exc:
+            writer_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            writer_context.__exit__(None, None, None)
 
         print(f"[DoRA Extract] Done: {stats['extracted']} extracted, {stats['chunked']} chunked, "
               f"{stats['full']} full, {stats['skipped']} skipped")

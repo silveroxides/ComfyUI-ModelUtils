@@ -146,12 +146,14 @@ class Operation:
 
 class LoadTensor(Operation):
     def __init__(self, key, model_name, handlers, device, dtype,
+                 preloaded_tensors=None,
                  on_missing=MissingTensorBehavior.ERROR, fallback_shape=None, fallback_dtype=None):
         super().__init__(key)
         self.model_name = model_name
         self.handlers = handlers
         self.device = device
         self.dtype = dtype
+        self.preloaded_tensors = preloaded_tensors or {}
         self.on_missing = on_missing
         self.fallback_shape = fallback_shape
         self.fallback_dtype = fallback_dtype
@@ -160,8 +162,8 @@ class LoadTensor(Operation):
         if self.model_name not in self.handlers:
             raise ValueError(f"Model '{self.model_name}' is required for this mode but was not provided.")
 
-        handler = self.handlers[self.model_name]
-        if self.key not in handler.keys():
+        source = (self.model_name, self.key)
+        if source not in self.preloaded_tensors:
             if self.on_missing == MissingTensorBehavior.ERROR:
                 raise MissingTensorError(
                     f"Key '{self.key}' not found in model '{self.model_name}'"
@@ -176,7 +178,7 @@ class LoadTensor(Operation):
                 dtype = self.fallback_dtype if self.fallback_dtype else self.dtype
                 return torch.zeros(self.fallback_shape, device=self.device, dtype=dtype)
 
-        cpu_tensor = handler.get_tensor(self.key)
+        cpu_tensor = self.preloaded_tensors[source]
         if self.device == 'cuda':
             self._tensor = transfer_to_gpu_pinned(cpu_tensor, self.device, self.dtype)
         else:
@@ -239,7 +241,7 @@ class SVD(Operation):
                 a = a[slices]
                 b = b[slices]
 
-        diff, weights, conv2d = a - b, {}, len(a.size()) == 4
+        diff, conv2d = a - b, len(a.size()) == 4
         kernel_size = None if not conv2d else a.size()[2:4]
         conv2d_3x3 = conv2d and kernel_size != (1, 1)
         rank = self.alpha if not conv2d_3x3 or self.beta is None else self.beta
@@ -454,6 +456,7 @@ class CalcMode:
         """Helper to build loader args for secondary models (B, C) with fallback support."""
         base_args = {
             "handlers": kwargs['handlers'],
+            "preloaded_tensors": kwargs.get('preloaded_tensors', {}),
             "device": kwargs['device'],
             "dtype": kwargs['dtype'],
             "on_missing": mismatch_mode,
