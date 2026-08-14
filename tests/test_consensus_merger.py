@@ -38,8 +38,7 @@ def _result_path(tmp_path, category, result):
 
 
 def _params(output_filename, **overrides):
-    params = {
-        "cwb_preset": "custom",
+    settings = {
         "consensus_type": "mean",
         "alignment_method": "index",
         "alignment_threshold": 0.4,
@@ -52,6 +51,15 @@ def _params(output_filename, **overrides):
         "soft_comfort_bandpass": False,
         "position_weight": 0.0,
         "preserve_common_prefix": False,
+    }
+    for key in list(settings):
+        if key in overrides:
+            settings[key] = overrides.pop(key)
+    params = {
+        "cwb_preset": "broad_sim_medn_rn_softcb",
+        "cwb_config": _load_module("nodes.consensus_merger").build_custom_cwb_settings(
+            **settings
+        ),
         "mismatch_mode": "skip",
         "output_filename": output_filename,
         "save_dtype": "fp16",
@@ -68,43 +76,68 @@ def _params(output_filename, **overrides):
     return params
 
 
+def _settings(cwb, **overrides):
+    values = {
+        "consensus_type": "mean",
+        "alignment_method": "index",
+        "alignment_threshold": 0.4,
+        "similarity_threshold": 0.0,
+        "power_alpha": 2.0,
+        "diversity_beta": 0.0,
+        "rescale_norm": False,
+        "global_scale": 1.0,
+        "dynamic_similarity_contrast": False,
+        "soft_comfort_bandpass": False,
+        "position_weight": 0.0,
+        "preserve_common_prefix": False,
+    }
+    values.update(overrides)
+    return cwb.build_custom_cwb_settings(**values)
+
+
 def test_preset_resolution_matches_extended_contract(cwb):
-    assert all(
-        preset["global_scale"] == pytest.approx(1.0)
-        for preset in cwb.CWB_PRESETS.values()
+    default = cwb.resolve_cwb_settings(
+        "broad_sim_medn_rn_softcb", cwb.LORA_CWB_PRESETS
     )
+    assert default.consensus_type == "median"
+    assert default.alignment_method == "similarity"
+    assert default.alignment_threshold == pytest.approx(0.0)
+    assert default.similarity_threshold == pytest.approx(0.0)
+    assert default.power_alpha == pytest.approx(2.0)
+    assert default.diversity_beta == pytest.approx(4.0)
+    assert default.rescale_norm is True
+    assert default.dynamic_similarity_contrast is False
+    assert default.soft_comfort_bandpass is True
+    assert default.position_weight == pytest.approx(0.05)
 
-    power = cwb.resolve_cwb_settings(cwb_preset="power_blend")
-    assert power.consensus_type == "median"
-    assert power.alignment_threshold == pytest.approx(0.9)
-    assert power.power_alpha == pytest.approx(8.0)
-    assert power.dynamic_similarity_contrast is True
-    assert power.soft_comfort_bandpass is False
+    with pytest.raises(ValueError, match="Unsupported CWB preset"):
+        cwb.resolve_cwb_settings("baseline", cwb.LORA_CWB_PRESETS)
 
-    baseline = cwb.resolve_cwb_settings(
-        cwb_preset="baseline",
-        alignment_method="index",
-        dynamic_similarity_contrast=True,
-        soft_comfort_bandpass=True,
-    )
-    assert baseline.alignment_method == "similarity"
-    assert baseline.dynamic_similarity_contrast is False
-    assert baseline.soft_comfort_bandpass is False
 
-    varied = cwb.resolve_cwb_settings(
-        cwb_preset="varied_merge",
-        global_scale=1.25,
-        position_weight=0.2,
-        preserve_common_prefix=True,
-    )
-    assert varied.global_scale == pytest.approx(1.25)
-    assert varied.position_weight == pytest.approx(0.2)
-    assert varied.preserve_common_prefix is True
+def test_preset_construction_rejects_omitted_fields(cwb):
+    with pytest.raises(TypeError):
+        cwb._preset(
+            consensus_type="median",
+            alignment_method="similarity",
+            alignment_threshold=0.0,
+        )
+
+
+def test_lora_alignment_presets_use_sweep_verified_thresholds(cwb):
+    assert cwb.LORA_CWB_PRESETS["broad_sim_medn_rn_softcb"][
+        "alignment_threshold"
+    ] == pytest.approx(0.0)
+    assert cwb.LORA_CWB_PRESETS["moderate_sim_medn_rn_softcb"][
+        "alignment_threshold"
+    ] == pytest.approx(0.0005)
+    assert cwb.LORA_CWB_PRESETS["conservative_sim_medn_rn_softcb"][
+        "alignment_threshold"
+    ] == pytest.approx(0.0025)
 
 
 def test_cwb_math_index_prefix_and_scale(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="index",
         global_scale=1.0,
@@ -116,8 +149,8 @@ def test_cwb_math_index_prefix_and_scale(cwb):
         torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
     )
 
-    prefix_settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    prefix_settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="index",
         global_scale=2.0,
@@ -133,8 +166,8 @@ def test_cwb_math_index_prefix_and_scale(cwb):
 
 
 def test_similarity_alignment_reorders_matching_rows(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="similarity",
         alignment_threshold=0.5,
@@ -152,8 +185,8 @@ def test_similarity_alignment_reorders_matching_rows(cwb):
 
 
 def test_fixed_coordinate_merge_never_reorders_model_rows(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="similarity",
         alignment_threshold=0.5,
@@ -177,8 +210,8 @@ def test_fixed_coordinate_merge_never_reorders_model_rows(cwb):
 
 
 def test_lora_similarity_alignment_pairs_a_rows_with_b_columns(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="similarity",
         alignment_threshold=0.5,
@@ -215,8 +248,8 @@ def test_lora_krea_shape_scores_only_rank_components(monkeypatch, cwb):
         "merge_consensus_group",
         lambda stacked, settings, **kwargs: stacked[0].clone(),
     )
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         alignment_method="similarity",
         alignment_threshold=0.5,
     )
@@ -230,9 +263,199 @@ def test_lora_krea_shape_scores_only_rank_components(monkeypatch, cwb):
     assert all(left[0] == rank and right[1] == rank for left, right in matrix_shapes)
 
 
+def test_mixed_rank_similarity_searches_full_reference_without_padding(
+    monkeypatch, cwb
+):
+    reference_down = torch.eye(3)
+    reference_up = torch.eye(3)
+    source_down = torch.tensor([[0.0, 0.0, 2.0]])
+    source_up = torch.tensor([[0.0], [0.0], [4.0]])
+    settings = _settings(
+        cwb,
+        consensus_type="mean",
+        alignment_method="similarity",
+        alignment_threshold=0.5,
+        rescale_norm=True,
+    )
+    diagnostics = cwb.CWBDiagnostics()
+    matrix_shapes = []
+    original_mm = cwb.torch.mm
+
+    def record_mm(left, right):
+        matrix_shapes.append((tuple(left.shape), tuple(right.shape)))
+        return original_mm(left, right)
+
+    monkeypatch.setattr(cwb.torch, "mm", record_mm)
+    merged_down, merged_up = cwb.merge_cwb_lora_pairs(
+        [reference_down, source_down],
+        [reference_up, source_up],
+        settings,
+        reference_index=0,
+        diagnostics=diagnostics,
+    )
+
+    assert matrix_shapes == [((3, 3), (3, 1)), ((3, 3), (3, 1))]
+    assert diagnostics.alignment_matches == 1
+    assert diagnostics.anchor_only_groups == 2
+    torch.testing.assert_close(merged_down[:2], reference_down[:2])
+    torch.testing.assert_close(merged_up[:, :2], reference_up[:, :2])
+    torch.testing.assert_close(merged_down[2], torch.tensor([0.0, 0.0, 1.5]))
+    torch.testing.assert_close(merged_up[:, 2], torch.tensor([0.0, 0.0, 2.5]))
+
+
+def test_mixed_rank_index_does_not_rescale_absent_components(cwb):
+    reference_down = torch.eye(3)
+    reference_up = torch.eye(3)
+    source_down = torch.tensor([[2.0, 0.0, 0.0]])
+    source_up = torch.tensor([[2.0], [0.0], [0.0]])
+    settings = _settings(
+        cwb,
+        consensus_type="mean",
+        alignment_method="index",
+        rescale_norm=True,
+    )
+
+    merged_down, merged_up = cwb.merge_cwb_lora_pairs(
+        [reference_down, source_down],
+        [reference_up, source_up],
+        settings,
+        reference_index=0,
+    )
+
+    torch.testing.assert_close(merged_down[1:], reference_down[1:])
+    torch.testing.assert_close(merged_up[:, 1:], reference_up[:, 1:])
+    assert torch.linalg.vector_norm(merged_down[0]).item() == pytest.approx(1.5)
+    assert torch.linalg.vector_norm(merged_up[:, 0]).item() == pytest.approx(1.5)
+
+
+def test_genuine_zero_component_is_not_treated_as_structural_padding(cwb):
+    reference_down = torch.eye(2)
+    reference_up = torch.eye(2)
+    source_down = torch.zeros((1, 2))
+    source_up = torch.zeros((2, 1))
+    settings = _settings(
+        cwb,
+        alignment_method="similarity",
+        alignment_threshold=0.0,
+    )
+    diagnostics = cwb.CWBDiagnostics()
+
+    cwb.merge_cwb_lora_pairs(
+        [reference_down, source_down],
+        [reference_up, source_up],
+        settings,
+        reference_index=0,
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics.alignment_matches == 1
+    assert diagnostics.anchor_only_groups == 1
+
+
+def test_explicit_mismatch_zero_applies_to_every_reference_component(cwb):
+    down = torch.eye(2)
+    up = torch.eye(2)
+    settings = _settings(
+        cwb,
+        consensus_type="mean",
+        alignment_method="index",
+        rescale_norm=True,
+    )
+    diagnostics = cwb.CWBDiagnostics()
+
+    merged_down, merged_up, rank = cwb._merge_lora_pair_to_cpu(
+        [cwb.LoRAPairSource(0, down, up), cwb.LoRAPairSource.zero(1)],
+        settings,
+        "cpu",
+        torch.float32,
+        diagnostics=diagnostics,
+    )
+
+    assert rank == 2
+    torch.testing.assert_close(merged_down, down * 0.5)
+    torch.testing.assert_close(merged_up, up * 0.5)
+    assert diagnostics.explicit_zero_contributors == 1
+    assert diagnostics.structural_rank_slots_excluded == 0
+
+
+def test_mixed_rank_diagnostics_count_only_genuine_components(cwb):
+    settings = _settings(cwb, alignment_method="index")
+    diagnostics = cwb.CWBDiagnostics()
+    sources = [
+        cwb.LoRAPairSource(0, torch.ones((4, 2)), torch.ones((2, 4))),
+        cwb.LoRAPairSource(1, torch.ones((2, 2)), torch.ones((2, 2))),
+        cwb.LoRAPairSource(2, torch.ones((3, 2)), torch.ones((2, 3))),
+    ]
+
+    _, _, rank = cwb._merge_lora_pair_to_cpu(
+        sources,
+        settings,
+        "cpu",
+        torch.float32,
+        diagnostics=diagnostics,
+    )
+
+    assert rank == 4
+    assert diagnostics.lora_groups == 1
+    assert diagnostics.mixed_rank_lora_groups == 1
+    assert diagnostics.genuine_lora_components == 9
+    assert diagnostics.structural_rank_slots_excluded == 3
+    report = diagnostics.render("custom", 3, True)
+    assert "Mixed-rank LoRA groups: 1" in report
+    assert "Genuine LoRA components: 9" in report
+    assert "Structural rank slots excluded: 3" in report
+    assert "CWB LORA DIMENSION GROUPS" in report
+    assert "Input ranks: (4, 2, 3)" in report
+    assert "Matched source components: 5/5 (100.00%)" in report
+
+
+def test_lora_report_groups_dimensions_and_summarizes_rectangular_similarity(cwb):
+    settings = _settings(
+        cwb,
+        consensus_type="mean",
+        alignment_method="similarity",
+        alignment_threshold=0.5,
+    )
+    diagnostics = cwb.CWBDiagnostics()
+    sources = [
+        cwb.LoRAPairSource(0, torch.eye(3), torch.eye(3)),
+        cwb.LoRAPairSource(
+            1,
+            torch.tensor([[0.0, 0.0, 2.0]]),
+            torch.tensor([[0.0], [0.0], [2.0]]),
+        ),
+    ]
+
+    for layer in ("blocks.1.attn", "blocks.2.attn"):
+        cwb._merge_lora_pair_to_cpu(
+            sources,
+            settings,
+            "cpu",
+            torch.float32,
+            operation_label=layer,
+            diagnostics=diagnostics,
+        )
+
+    report = diagnostics.render("custom", 2, True)
+    assert "Group 1: 2 layer(s)" in report
+    assert "Alignment: similarity; matrices: 3x1" in report
+    assert "Matched source components: 2/2 (100.00%)" in report
+    assert "Reference-only components: 4/6" in report
+    assert "Structural rank slots excluded: 4" in report
+    assert "Candidate similarity count: 6" in report
+    assert "Matched similarity p05/median/p95: 1 / 1 / 1" in report
+    assert "blocks.1.attn" in report
+    assert "blocks.2.attn" in report
+    assert all(
+        not isinstance(value, torch.Tensor)
+        for layer_report in diagnostics.lora_layer_reports
+        for value in vars(layer_report).values()
+    )
+
+
 def test_lora_alpha_and_global_scale_apply_once_to_pair(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="index",
         global_scale=3.0,
@@ -240,7 +463,10 @@ def test_lora_alpha_and_global_scale_apply_once_to_pair(cwb):
     down = torch.ones((1, 1))
     up = torch.ones((1, 1))
     merged_down, merged_up, rank = cwb._merge_lora_pair_to_cpu(
-        [(0, down, up, 2.0), (1, down, up, 2.0)],
+        [
+            cwb.LoRAPairSource(0, down, up, 2.0),
+            cwb.LoRAPairSource(1, down, up, 2.0),
+        ],
         settings,
         "cpu",
         torch.float32,
@@ -251,8 +477,8 @@ def test_lora_alpha_and_global_scale_apply_once_to_pair(cwb):
 
 
 def test_lora_pair_alignment_supports_convolution_factors(cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="index",
     )
@@ -266,8 +492,8 @@ def test_lora_pair_alignment_supports_convolution_factors(cwb):
 
 
 def test_lora_cuda_oom_retries_current_pair_on_cpu(monkeypatch, caplog, cwb):
-    settings = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    settings = _settings(
+        cwb,
         consensus_type="mean",
         alignment_method="index",
     )
@@ -282,29 +508,64 @@ def test_lora_cuda_oom_retries_current_pair_on_cpu(monkeypatch, caplog, cwb):
 
     monkeypatch.setattr(cwb, "_to_compute", fail_cuda)
     monkeypatch.setattr(cwb, "_release_failed_cuda_operation", lambda: None)
-    down = torch.ones((1, 2))
-    up = torch.ones((2, 1))
+    reference_down = torch.eye(2)
+    reference_up = torch.eye(2)
+    source_down = torch.ones((1, 2))
+    source_up = torch.ones((2, 1))
+    diagnostics = cwb.CWBDiagnostics()
     with caplog.at_level("WARNING"):
         merged_down, merged_up, rank = cwb._merge_lora_pair_to_cpu(
-            [(0, down, up, 1.0), (1, down, up, 1.0)],
+            [
+                cwb.LoRAPairSource(0, reference_down, reference_up),
+                cwb.LoRAPairSource(1, source_down, source_up),
+            ],
             settings,
             "cuda",
             torch.float32,
             operation_label="diffusion_model.foo",
+            diagnostics=diagnostics,
         )
 
-    assert rank == 1
-    torch.testing.assert_close(merged_down, down)
-    torch.testing.assert_close(merged_up, up)
+    assert rank == 2
+    assert merged_down.shape == reference_down.shape
+    assert merged_up.shape == reference_up.shape
     assert attempted_devices[0] == "cuda"
     assert "cpu" in attempted_devices
     assert "retrying this layer on CPU" in caplog.text
     assert "diffusion_model.foo" in caplog.text
+    assert diagnostics.cpu_fallbacks == 1
+    assert diagnostics.lora_groups == 1
+    assert diagnostics.structural_rank_slots_excluded == 1
+
+
+def test_mixed_rank_common_prefix_is_limited_to_smallest_rank(cwb):
+    reference_down = torch.eye(3)
+    reference_up = torch.eye(3)
+    source_down = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    source_up = torch.tensor([[1.0, 0.0], [0.0, 2.0], [0.0, 0.0]])
+    settings = _settings(
+        cwb,
+        consensus_type="mean",
+        alignment_method="index",
+        preserve_common_prefix=True,
+    )
+
+    merged_down, merged_up = cwb.merge_cwb_lora_pairs(
+        [reference_down, source_down],
+        [reference_up, source_up],
+        settings,
+        reference_index=0,
+    )
+
+    torch.testing.assert_close(merged_down[0], reference_down[0])
+    torch.testing.assert_close(merged_up[:, 0], reference_up[:, 0])
+    torch.testing.assert_close(merged_down[2], reference_down[2])
+    torch.testing.assert_close(merged_up[:, 2], reference_up[:, 2])
 
 
 def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
-    rescale = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    rescale = _settings(
+        cwb,
         consensus_type="mean",
         rescale_norm=True,
     )
@@ -313,8 +574,8 @@ def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
     )
     assert torch.linalg.vector_norm(merged).item() == pytest.approx(2.0)
 
-    dsc = cwb.resolve_cwb_settings(
-        cwb_preset="custom",
+    dsc = _settings(
+        cwb,
         consensus_type="median",
         diversity_beta=1.5,
         dynamic_similarity_contrast=True,
@@ -326,14 +587,42 @@ def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
     assert torch.isfinite(result).all()
 
 
-def test_all_ten_schemas_and_lora_switch_contract(cwb):
-    assert len(cwb.CWB_MERGER_NODES) == 10
-    assert len({node.NODE_ID for node in cwb.CWB_MERGER_NODES}) == 10
+def test_all_cwb_schemas_and_compact_control_contract(cwb):
+    assert len(cwb.CWB_MERGER_NODES) == 12
+    schemas = [node.define_schema() for node in cwb.CWB_MERGER_NODES]
+    assert len({schema.node_id for schema in schemas}) == 12
+    advanced = {
+        "consensus_type", "alignment_method", "alignment_threshold",
+        "similarity_threshold", "power_alpha", "diversity_beta",
+        "rescale_norm", "global_scale", "dynamic_similarity_contrast",
+        "soft_comfort_bandpass", "position_weight", "preserve_common_prefix",
+    }
+    config_schema = cwb.CWBCustomConfiguration.define_schema()
+    assert {value.id for value in config_schema.inputs} == advanced
+
     for node in cwb.CWB_MERGER_NODES:
         schema = node.define_schema()
         ids = [value.id for value in schema.inputs]
         assert schema.description
         assert all(value.tooltip for value in schema.inputs)
+        if node is cwb.CWBCustomConfiguration:
+            continue
+        assert [output.display_name for output in schema.outputs] == [
+            "output_filename", "documentation", "cwb_report"
+        ]
+        assert schema.outputs[0].get_io_type() == "*"
+        assert schema.outputs[1].get_io_type() == "STRING"
+        assert schema.outputs[2].get_io_type() == "STRING"
+        assert advanced.isdisjoint(ids)
+        assert "cwb_config" in ids
+        if node is cwb.CWBLoRAMultiMerger:
+            assert ids[:4] == ["execution_mode", "lora_count", "lora_1", "lora_2"]
+            assert schema.inputs[1].default == "2"
+            assert ids[-2:] == [
+                "include_1d_diffs",
+                "counterfactual_weight_sweep",
+            ]
+            continue
         assert ids[:3] == ["execution_mode", "model_a", "model_b"]
         if node.INPUT_COUNT == 3:
             assert ids[3] == "model_c"
@@ -342,6 +631,276 @@ def test_all_ten_schemas_and_lora_switch_contract(cwb):
             assert schema.inputs[-1].default is False
         else:
             assert "include_1d_diffs" not in ids
+
+
+def test_use_case_preset_names_match_complete_settings(cwb):
+    fields = set(cwb.CWBSettings.__dataclass_fields__)
+    for registry in (
+        cwb.DENSE_CWB_PRESETS,
+        cwb.EMBEDDING_CWB_PRESETS,
+        cwb.LORA_CWB_PRESETS,
+    ):
+        assert 6 <= len(registry) <= 8
+        for name, values in registry.items():
+            assert set(values) == fields
+            assert ("_rn" in name) is values["rescale_norm"]
+            assert ("_dsc" in name) is values["dynamic_similarity_contrast"]
+            assert ("_softcb" in name) is values["soft_comfort_bandpass"]
+            assert ("_pcp" in name) is values["preserve_common_prefix"]
+            if registry is not cwb.DENSE_CWB_PRESETS:
+                expected_alignment = "similarity" if "_sim_" in name else "index"
+                assert values["alignment_method"] == expected_alignment
+                expected_consensus = "median" if "_medn" in name else "mean"
+                assert values["consensus_type"] == expected_consensus
+
+
+def test_connected_custom_config_completely_overrides_preset(cwb):
+    custom = _settings(
+        cwb,
+        consensus_type="median",
+        alignment_method="similarity",
+        alignment_threshold=0.17,
+        similarity_threshold=-0.25,
+        diversity_beta=7.0,
+        dynamic_similarity_contrast=True,
+    )
+    resolved = cwb.resolve_cwb_settings(
+        "direct_idx_medn_rn_softcb", cwb.LORA_CWB_PRESETS, custom
+    )
+    assert resolved is custom
+
+
+def test_diagnostics_distinguish_alignment_and_weight_fallbacks(cwb):
+    alignment_diagnostics = cwb.CWBDiagnostics()
+    settings = _settings(
+        cwb, alignment_method="similarity", alignment_threshold=0.9
+    )
+    cwb.merge_cwb_tensors(
+        [torch.eye(2), -torch.eye(2)],
+        settings,
+        diagnostics=alignment_diagnostics,
+    )
+    assert alignment_diagnostics.alignment_matches == 0
+    assert alignment_diagnostics.anchor_only_groups == 2
+
+    weighting_diagnostics = cwb.CWBDiagnostics()
+    cwb.merge_consensus_group(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        _settings(cwb, similarity_threshold=0.9),
+        diagnostics=weighting_diagnostics,
+    )
+    assert weighting_diagnostics.all_rejected_fallbacks == 1
+    assert weighting_diagnostics.weighting_contributors == 2
+    assert weighting_diagnostics.accepted_weighting_contributors == 0
+    assert weighting_diagnostics.dominant_weight_min == pytest.approx(0.5)
+    assert weighting_diagnostics.dominant_weight_max == pytest.approx(0.5)
+    assert weighting_diagnostics.effective_contributor_min == pytest.approx(2.0)
+    assert weighting_diagnostics.effective_contributor_max == pytest.approx(2.0)
+
+
+def test_weight_diagnostics_measure_parameter_influence(cwb):
+    diagnostics = cwb.CWBDiagnostics()
+    cwb.merge_consensus_group(
+        torch.tensor([[1.0, 0.0], [0.8, 0.2], [-1.0, 0.0]]),
+        _settings(
+            cwb,
+            similarity_threshold=0.0,
+            power_alpha=2.0,
+            diversity_beta=0.0,
+        ),
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics.weighting_groups == 1
+    assert diagnostics.weighting_contributors == 3
+    assert diagnostics.accepted_weighting_contributors == 2
+    assert diagnostics.dominant_weight_max > 0.5
+    assert 1.0 < diagnostics.effective_contributor_min < 2.0
+    report = diagnostics.render("test", 3, custom=False)
+    assert "Accepted weighting contributors: 2/3" in report
+    assert "Dominant normalized weight min/mean/max:" in report
+    assert "Effective contributors min/mean/max:" in report
+
+
+def test_counterfactual_weight_sweep_reuses_similarity_vectors(cwb):
+    sweep = cwb.CWBWeightSweepDiagnostics()
+    similarities = torch.tensor([0.25, 0.5, 0.75])
+    sweep._record_similarities("median", similarities)
+
+    baseline = sweep.stats[("median", 0.0, 2.0, 0.0, False, False)]
+    expected = similarities.square()
+    expected /= expected.sum()
+    assert baseline.groups == 1
+    assert baseline.accepted == 3
+    assert baseline.dominant_sum == pytest.approx(float(expected.max()))
+    assert baseline.effective_sum == pytest.approx(
+        float(1.0 / expected.square().sum())
+    )
+    assert len(sweep.stats) == 180
+    assert all(not isinstance(value, torch.Tensor) for value in sweep.__dict__.values())
+
+
+def test_default_lora_preset_changes_perturbed_factors(cwb):
+    settings = cwb.resolve_cwb_settings(
+        "broad_sim_medn_rn_softcb", cwb.LORA_CWB_PRESETS
+    )
+    reference_down = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    reference_up = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    source_down = torch.tensor([[1.0, 0.1], [0.1, 1.0]])
+    source_up = torch.tensor([[1.1, 0.1], [0.1, 0.9]])
+    diagnostics = cwb.CWBDiagnostics()
+    merged_down, merged_up = cwb.merge_cwb_lora_pairs(
+        [reference_down, source_down],
+        [reference_up, source_up],
+        settings,
+        reference_index=0,
+        diagnostics=diagnostics,
+    )
+    assert diagnostics.alignment_matches == 2
+    assert diagnostics.anchor_only_groups == 0
+    assert not torch.equal(merged_down, reference_down)
+    assert not torch.equal(merged_up, reference_up)
+
+
+def test_eight_input_lora_merge_normalizes_before_variable_rank_alignment(
+    monkeypatch, tmp_path, cwb
+):
+    paths = {}
+    events = []
+    original_normalize = cwb.normalize_lora_pair
+    original_merge = cwb.merge_cwb_lora_pairs
+    original_mark_processed = cwb.MemoryEfficientSafeOpen.mark_processed
+    received_ranks = []
+    processed = []
+    for index in range(8):
+        rank = 1 if index < 4 else 2
+        name = f"lora_{index}"
+        path = tmp_path / f"{name}.safetensors"
+        save_file({
+            "diffusion_model.foo.lora_A.weight": torch.full(
+                (rank, 2), 1.0 + index * 0.01
+            ),
+            "diffusion_model.foo.lora_B.weight": torch.full(
+                (2, rank), 1.0 + index * 0.02
+            ),
+            "diffusion_model.foo.alpha": torch.tensor(float(rank) * 0.5),
+        }, str(path))
+        paths[name] = str(path)
+
+    def record_normalize(*args, **kwargs):
+        events.append("normalize")
+        return original_normalize(*args, **kwargs)
+
+    def record_merge(downs, ups, *args, **kwargs):
+        events.append("merge")
+        received_ranks.extend(down.shape[0] for down in downs)
+        for down, up in zip(downs, ups):
+            assert down.shape[0] == up.shape[1]
+        return original_merge(downs, ups, *args, **kwargs)
+
+    def record_processed(loader, key):
+        processed.append(key)
+        return original_mark_processed(loader, key)
+
+    monkeypatch.setattr(cwb, "normalize_lora_pair", record_normalize)
+    monkeypatch.setattr(cwb, "merge_cwb_lora_pairs", record_merge)
+    monkeypatch.setattr(
+        cwb.MemoryEfficientSafeOpen, "mark_processed", record_processed
+    )
+    _patch_io(monkeypatch, cwb, tmp_path, paths)
+    result = cwb.ConsensusMergerLogic.execute(
+        list(paths), "loras", _params("eight_input"), lora_mode=True
+    )
+    tensors = load_file(str(_result_path(tmp_path, "loras", result)))
+    assert tensors["diffusion_model.foo.lora_A.weight"].shape[0] == 2
+    assert "diffusion_model.foo.alpha" not in tensors
+    assert events.count("normalize") == 8
+    assert events.index("merge") > max(
+        index for index, event in enumerate(events) if event == "normalize"
+    )
+    assert received_ranks == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert len(processed) == 24
+    assert processed.count("diffusion_model.foo.lora_A.weight") == 8
+    assert processed.count("diffusion_model.foo.lora_B.weight") == 8
+    assert processed.count("diffusion_model.foo.alpha") == 8
+
+
+def test_lora_mismatch_zeros_remains_explicit_across_full_output_rank(
+    monkeypatch, tmp_path, cwb
+):
+    a = tmp_path / "mismatch_zero_a.safetensors"
+    b = tmp_path / "mismatch_zero_b.safetensors"
+    save_file({
+        "diffusion_model.foo.lora_A.weight": torch.eye(2),
+        "diffusion_model.foo.lora_B.weight": torch.eye(2),
+    }, str(a))
+    save_file({"unrelated": torch.tensor([1.0])}, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "loras",
+        _params(
+            "mismatch_zero",
+            mismatch_mode="zeros",
+            consensus_type="mean",
+            alignment_method="index",
+            rescale_norm=True,
+            save_dtype="fp32",
+        ),
+        lora_mode=True,
+    )
+    tensors = load_file(str(_result_path(tmp_path, "loras", result)))
+
+    torch.testing.assert_close(
+        tensors["diffusion_model.foo.lora_A.weight"], torch.eye(2) * 0.5
+    )
+    torch.testing.assert_close(
+        tensors["diffusion_model.foo.lora_B.weight"], torch.eye(2) * 0.5
+    )
+
+
+def test_lora_multi_wrapper_validates_count_and_forwards_equal_prior_names(
+    monkeypatch, cwb
+):
+    kwargs = {
+        "execution_mode": "MERGE",
+        "lora_count": "3",
+        "lora_1": "a.safetensors",
+        "lora_2": "b.safetensors",
+        "lora_3": "None",
+        "lora_4": "None",
+        "lora_5": "None",
+        "lora_6": "None",
+        "lora_7": "None",
+        "lora_8": "None",
+        "cwb_preset": "broad_sim_medn_rn_softcb",
+        "cwb_config": None,
+    }
+    monkeypatch.setattr(cwb, "load_documentation_from_file", lambda _: "DOCS")
+    with pytest.raises(ValueError, match="unselected input.*3"):
+        cwb.CWBLoRAMultiMerger.execute(**kwargs)
+
+    captured = {}
+
+    def execute(names, model_type, params, **options):
+        captured.update(
+            names=names,
+            model_type=model_type,
+            params=params,
+            options=options,
+        )
+        return "merged.safetensors", "REPORT"
+
+    monkeypatch.setattr(cwb.ConsensusMergerLogic, "execute", execute)
+    kwargs["lora_3"] = "c.safetensors"
+    result = cwb.CWBLoRAMultiMerger.execute(**kwargs)
+    assert captured["names"] == [
+        "a.safetensors", "b.safetensors", "c.safetensors"
+    ]
+    assert captured["model_type"] == "loras"
+    assert captured["options"] == {"lora_mode": True}
+    assert result.result == ("merged.safetensors", "DOCS", "REPORT")
 
 
 def test_streaming_dtype_nonfloat_and_secondary_preservation(
@@ -434,6 +993,25 @@ def test_embedding_union_uses_longest_first_dimension(monkeypatch, tmp_path, cwb
     torch.testing.assert_close(tensors["emb"][:2], torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
     torch.testing.assert_close(tensors["emb"][2], torch.tensor([4.0, 4.0]))
     torch.testing.assert_close(tensors["secondary_only"], torch.tensor([[7.0, 0.0]]))
+
+
+def test_output_name_preserves_category_relative_subdirectory(
+    monkeypatch, tmp_path, cwb
+):
+    a = tmp_path / "relative_a.safetensors"
+    b = tmp_path / "relative_b.safetensors"
+    save_file({"layer": torch.tensor([[1.0]])}, str(a))
+    save_file({"layer": torch.tensor([[1.0]])}, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"],
+        "loras",
+        _params("groupfolder/modelname"),
+    )
+
+    assert result == "groupfolder/modelname.safetensors"
+    assert (tmp_path / "loras" / "groupfolder" / "modelname.safetensors").is_file()
 
 
 def test_three_input_streaming_merge(monkeypatch, tmp_path, cwb):

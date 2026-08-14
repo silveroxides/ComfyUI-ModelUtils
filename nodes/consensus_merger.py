@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 import comfy.utils
@@ -22,6 +22,7 @@ from .device_utils import (
     prepare_for_large_operation,
 )
 from .uel_io import atomic_uel_writer, stream_work_units
+from .artifact_paths import canonical_model_artifact_path
 from .lora_alpha import normalize_lora_pair
 from .lora_resize import (
     canonical_lora_key,
@@ -42,83 +43,195 @@ from .quantization_guard import (
 )
 
 
-CWB_PRESETS = {
-    "baseline": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-    },
-    "power_blend": {
-        "consensus_type": "median", "alignment_method": "similarity",
-        "alignment_threshold": 0.9, "power_alpha": 8.0,
-        "similarity_threshold": 0.75, "diversity_beta": 0.0,
-        "rescale_norm": True, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True,
-    },
-    "high_clarity": {
-        "consensus_type": "median", "power_alpha": 3.0,
-        "similarity_threshold": 0.3, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-    },
-    "smooth": {
-        "consensus_type": "mean", "power_alpha": 1.5,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-    },
-    "varied_merge": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": True, "global_scale": 1.0,
-    },
-    "diverse_concept": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 1.0,
-        "rescale_norm": True, "global_scale": 1.0,
-    },
-    "high_diversity_concept": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 2.0,
-        "rescale_norm": True, "global_scale": 1.0,
-    },
-    "dsc_baseline": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
-    "dsc_high_clarity": {
-        "consensus_type": "median", "power_alpha": 4.0,
-        "similarity_threshold": 0.3, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
-    "dsc_smooth": {
-        "consensus_type": "mean", "power_alpha": 1.0,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": False, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
-    "dsc_varied_merge": {
-        "consensus_type": "median", "power_alpha": 2.5,
-        "similarity_threshold": 0.0, "diversity_beta": 0.0,
-        "rescale_norm": True, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
-    "dsc_diverse_concept": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 1.5,
-        "rescale_norm": True, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
-    "dsc_high_diversity_concept": {
-        "consensus_type": "median", "power_alpha": 2.0,
-        "similarity_threshold": 0.0, "diversity_beta": 3.0,
-        "rescale_norm": True, "global_scale": 1.0,
-        "dynamic_similarity_contrast": True, "soft_comfort_bandpass": True,
-    },
+def _preset(
+    *, consensus_type, alignment_method, alignment_threshold,
+    similarity_threshold, power_alpha, diversity_beta,
+    rescale_norm, global_scale, dynamic_similarity_contrast,
+    soft_comfort_bandpass, position_weight, preserve_common_prefix,
+):
+    return {
+        "consensus_type": consensus_type,
+        "alignment_method": alignment_method,
+        "alignment_threshold": alignment_threshold,
+        "similarity_threshold": similarity_threshold,
+        "power_alpha": power_alpha,
+        "diversity_beta": diversity_beta,
+        "rescale_norm": rescale_norm,
+        "global_scale": global_scale,
+        "dynamic_similarity_contrast": dynamic_similarity_contrast,
+        "soft_comfort_bandpass": soft_comfort_bandpass,
+        "position_weight": position_weight,
+        "preserve_common_prefix": preserve_common_prefix,
+    }
+
+
+DENSE_CWB_PRESETS = {
+    "balanced_mean": _preset(
+        consensus_type="mean", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=1.0, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "robust_medn": _preset(
+        consensus_type="median", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=2.0, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "selective_mean": _preset(
+        consensus_type="mean", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.3, power_alpha=3.0, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "varied_mean_rn_softcb": _preset(
+        consensus_type="mean", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=1.5, diversity_beta=2.0,
+        rescale_norm=True, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "diverse_medn_rn_dsc_softcb": _preset(
+        consensus_type="median", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=2.0, diversity_beta=4.0,
+        rescale_norm=True, global_scale=1.0, dynamic_similarity_contrast=True,
+        soft_comfort_bandpass=True, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "strongdiv_medn_rn_dsc_softcb": _preset(
+        consensus_type="median", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=2.0, diversity_beta=10.0,
+        rescale_norm=True, global_scale=1.0, dynamic_similarity_contrast=True,
+        soft_comfort_bandpass=True, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
 }
 
-CWB_PRESET_OPTIONS = ["custom", *CWB_PRESETS]
+EMBEDDING_CWB_PRESETS = {
+    "balanced_idx_mean": _preset(
+        consensus_type="mean", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=1.5, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "balanced_sim_mean": _preset(
+        consensus_type="mean", alignment_method="similarity", alignment_threshold=0.4,
+        similarity_threshold=0.0, power_alpha=1.5, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.1,
+        preserve_common_prefix=False,
+    ),
+    "robust_idx_medn": _preset(
+        consensus_type="median", alignment_method="index", alignment_threshold=0.0,
+        similarity_threshold=0.0, power_alpha=2.0, diversity_beta=0.0,
+        rescale_norm=False, global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.0,
+        preserve_common_prefix=False,
+    ),
+    "robust_sim_medn": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.4, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=0.0, rescale_norm=False,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.1,
+        preserve_common_prefix=False,
+    ),
+    "varied_sim_mean_rn_softcb": _preset(
+        consensus_type="mean", alignment_method="similarity",
+        alignment_threshold=0.2, similarity_threshold=0.0,
+        power_alpha=1.5, diversity_beta=2.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.1,
+        preserve_common_prefix=False,
+    ),
+    "diverse_sim_medn_rn_dsc_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0,
+        dynamic_similarity_contrast=True, soft_comfort_bandpass=True,
+        position_weight=0.1, preserve_common_prefix=False,
+    ),
+}
+
+LORA_CWB_PRESETS = {
+    "broad_sim_medn_rn_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "moderate_sim_medn_rn_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0005, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "conservative_sim_medn_rn_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0025, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "direct_idx_medn_rn_softcb": _preset(
+        consensus_type="median", alignment_method="index",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "broad_sim_mean_rn_softcb": _preset(
+        consensus_type="mean", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "neutral_sim_medn_rn": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=0.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=False,
+        soft_comfort_bandpass=False, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "focused_sim_medn_rn_dsc_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=4.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=True,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+    "strongfocus_sim_medn_rn_dsc_softcb": _preset(
+        consensus_type="median", alignment_method="similarity",
+        alignment_threshold=0.0, similarity_threshold=0.0,
+        power_alpha=2.0, diversity_beta=7.0, rescale_norm=True,
+        global_scale=1.0, dynamic_similarity_contrast=True,
+        soft_comfort_bandpass=True, position_weight=0.05,
+        preserve_common_prefix=False,
+    ),
+}
+
+
+def _presets_for(*, embedding_union: bool, lora_mode: bool):
+    if lora_mode:
+        return LORA_CWB_PRESETS
+    if embedding_union:
+        return EMBEDDING_CWB_PRESETS
+    return DENSE_CWB_PRESETS
 LORA_PREFIXES = (
     "base_model.model.",
     "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_",
@@ -142,42 +255,506 @@ class CWBSettings:
     preserve_common_prefix: bool
 
 
-def resolve_cwb_settings(**values) -> CWBSettings:
-    """Resolve a named preset without hiding position/prefix controls."""
-    preset_name = values.get("cwb_preset", "baseline")
-    resolved = {
-        "consensus_type": values.get("consensus_type", "median"),
-        "alignment_method": values.get("alignment_method", "similarity"),
-        "alignment_threshold": float(values.get("alignment_threshold", 0.4)),
-        "similarity_threshold": float(values.get("similarity_threshold", 0.0)),
-        "power_alpha": float(values.get("power_alpha", 2.0)),
-        "diversity_beta": float(values.get("diversity_beta", 0.0)),
-        "rescale_norm": bool(values.get("rescale_norm", False)),
-        "global_scale": float(values.get("global_scale", 1.0)),
-        "dynamic_similarity_contrast": bool(
-            values.get("dynamic_similarity_contrast", False)
-        ),
-        "soft_comfort_bandpass": bool(values.get("soft_comfort_bandpass", False)),
-        "position_weight": float(values.get("position_weight", 0.0)),
-        "preserve_common_prefix": bool(values.get("preserve_common_prefix", False)),
-    }
+def _optional_min(current: float | None, value: float | None) -> float | None:
+    if value is None:
+        return current
+    return value if current is None else min(current, value)
+
+
+def _optional_max(current: float | None, value: float | None) -> float | None:
+    if value is None:
+        return current
+    return value if current is None else max(current, value)
+
+
+COUNTERFACTUAL_SIMILARITY_THRESHOLDS = (0.0, 0.1, 0.25)
+COUNTERFACTUAL_POWER_ALPHAS = (1.0, 2.0, 4.0)
+COUNTERFACTUAL_DIVERSITY_BETAS = (0.0, 2.0, 4.0, 7.0, 10.0)
+
+
+@dataclass
+class CWBWeightSweepStat:
+    groups: int = 0
+    contributors: int = 0
+    accepted: int = 0
+    all_rejected: int = 0
+    zero_weight: int = 0
+    dominant_sum: float = 0.0
+    dominant_max: float = 0.0
+    effective_sum: float = 0.0
+    effective_min: float | None = None
+
+    def absorb(self, other: "CWBWeightSweepStat") -> None:
+        self.groups += other.groups
+        self.contributors += other.contributors
+        self.accepted += other.accepted
+        self.all_rejected += other.all_rejected
+        self.zero_weight += other.zero_weight
+        self.dominant_sum += other.dominant_sum
+        self.dominant_max = max(self.dominant_max, other.dominant_max)
+        self.effective_sum += other.effective_sum
+        self.effective_min = _optional_min(self.effective_min, other.effective_min)
+
+
+@dataclass
+class CWBWeightSweepDiagnostics:
+    stats: dict[tuple, CWBWeightSweepStat] = field(default_factory=dict)
+
+    def record(self, stacked: torch.Tensor) -> None:
+        for consensus_type in ("mean", "median"):
+            consensus = (
+                torch.mean(stacked, dim=0)
+                if consensus_type == "mean"
+                else torch.median(stacked, dim=0).values
+            )
+            similarities = torch.mv(
+                F.normalize(stacked, p=2, dim=1, eps=1e-8),
+                F.normalize(consensus, p=2, dim=0, eps=1e-8),
+            )
+            self._record_similarities(consensus_type, similarities)
+
+    def _record_similarities(
+        self,
+        consensus_type: str,
+        similarities: torch.Tensor,
+    ) -> None:
+        values = similarities.detach().float().cpu().tolist()
+        minimum = min(values)
+        maximum = max(values)
+        for dsc in (False, True):
+            if dsc and maximum > minimum:
+                weighted = [
+                    0.7 + 0.3 * (value - minimum) / (maximum - minimum + 1e-8)
+                    for value in values
+                ]
+            else:
+                weighted = values
+            for threshold in COUNTERFACTUAL_SIMILARITY_THRESHOLDS:
+                accepted = [value >= threshold for value in values]
+                for alpha in COUNTERFACTUAL_POWER_ALPHAS:
+                    for beta in COUNTERFACTUAL_DIVERSITY_BETAS:
+                        for softcb in (False, True):
+                            key = (
+                                consensus_type, threshold, alpha, beta, dsc, softcb
+                            )
+                            stat = self.stats.setdefault(key, CWBWeightSweepStat())
+                            stat.groups += 1
+                            stat.contributors += len(values)
+                            stat.accepted += sum(accepted)
+                            if not any(accepted):
+                                stat.all_rejected += 1
+                                weights = [1.0 / len(values)] * len(values)
+                            else:
+                                distance_base = 1.5 if softcb else 1.001
+                                weights = []
+                                for value, include in zip(weighted, accepted):
+                                    if not include:
+                                        weights.append(0.0)
+                                        continue
+                                    safe = min(max(value, 0.0), 1.0)
+                                    weight = safe ** alpha
+                                    if beta > 0.0:
+                                        weight *= max(distance_base - safe, 0.0) ** beta
+                                    weights.append(weight)
+                                total = sum(weights)
+                                if total <= 0.0:
+                                    stat.zero_weight += 1
+                                    weights = [1.0 / len(values)] * len(values)
+                                else:
+                                    weights = [weight / total for weight in weights]
+                            dominant = max(weights)
+                            effective = 1.0 / sum(weight * weight for weight in weights)
+                            stat.dominant_sum += dominant
+                            stat.dominant_max = max(stat.dominant_max, dominant)
+                            stat.effective_sum += effective
+                            stat.effective_min = _optional_min(
+                                stat.effective_min, effective
+                            )
+
+    def absorb(self, other: "CWBWeightSweepDiagnostics") -> None:
+        for key, other_stat in other.stats.items():
+            self.stats.setdefault(key, CWBWeightSweepStat()).absorb(other_stat)
+
+    def render(self) -> str:
+        lines = [
+            "",
+            "CWB COUNTERFACTUAL WEIGHT SWEEP",
+            "consensus | sim_threshold | alpha | beta | dsc | softcb | accepted | fallbacks | dominant_mean/max | effective_mean/min",
+        ]
+        for key in sorted(self.stats):
+            consensus_type, threshold, alpha, beta, dsc, softcb = key
+            stat = self.stats[key]
+            lines.append(
+                f"{consensus_type} | {threshold:.6g} | {alpha:.6g} | {beta:.6g} | "
+                f"{str(dsc).lower()} | {str(softcb).lower()} | "
+                f"{stat.accepted}/{stat.contributors} | "
+                f"{stat.all_rejected + stat.zero_weight} | "
+                f"{stat.dominant_sum / stat.groups:.6g}/{stat.dominant_max:.6g} | "
+                f"{stat.effective_sum / stat.groups:.6g}/{stat.effective_min:.6g}"
+            )
+        return "\n".join(lines)
+
+
+@dataclass
+class CWBDiagnostics:
+    alignment_candidates: int = 0
+    alignment_matches: int = 0
+    anchor_only_groups: int = 0
+    weighting_groups: int = 0
+    all_rejected_fallbacks: int = 0
+    zero_weight_fallbacks: int = 0
+    weighting_contributors: int = 0
+    accepted_weighting_contributors: int = 0
+    consensus_similarity_sum: float = 0.0
+    consensus_similarity_min: float | None = None
+    consensus_similarity_max: float | None = None
+    dominant_weight_sum: float = 0.0
+    dominant_weight_min: float | None = None
+    dominant_weight_max: float | None = None
+    effective_contributor_sum: float = 0.0
+    effective_contributor_min: float | None = None
+    effective_contributor_max: float | None = None
+    cpu_fallbacks: int = 0
+    lora_groups: int = 0
+    mixed_rank_lora_groups: int = 0
+    genuine_lora_components: int = 0
+    structural_rank_slots_excluded: int = 0
+    explicit_zero_contributors: int = 0
+    lora_layer_reports: list["LoRALayerReport"] = field(default_factory=list)
+    weight_sweep: CWBWeightSweepDiagnostics | None = None
+
+    def absorb_runtime(self, other: "CWBDiagnostics") -> None:
+        self.alignment_candidates += other.alignment_candidates
+        self.alignment_matches += other.alignment_matches
+        self.anchor_only_groups += other.anchor_only_groups
+        self.weighting_groups += other.weighting_groups
+        self.all_rejected_fallbacks += other.all_rejected_fallbacks
+        self.zero_weight_fallbacks += other.zero_weight_fallbacks
+        self.weighting_contributors += other.weighting_contributors
+        self.accepted_weighting_contributors += other.accepted_weighting_contributors
+        self.consensus_similarity_sum += other.consensus_similarity_sum
+        self.consensus_similarity_min = _optional_min(
+            self.consensus_similarity_min, other.consensus_similarity_min
+        )
+        self.consensus_similarity_max = _optional_max(
+            self.consensus_similarity_max, other.consensus_similarity_max
+        )
+        self.dominant_weight_sum += other.dominant_weight_sum
+        self.dominant_weight_min = _optional_min(
+            self.dominant_weight_min, other.dominant_weight_min
+        )
+        self.dominant_weight_max = _optional_max(
+            self.dominant_weight_max, other.dominant_weight_max
+        )
+        self.effective_contributor_sum += other.effective_contributor_sum
+        self.effective_contributor_min = _optional_min(
+            self.effective_contributor_min, other.effective_contributor_min
+        )
+        self.effective_contributor_max = _optional_max(
+            self.effective_contributor_max, other.effective_contributor_max
+        )
+        if other.weight_sweep is not None:
+            if self.weight_sweep is None:
+                self.weight_sweep = CWBWeightSweepDiagnostics()
+            self.weight_sweep.absorb(other.weight_sweep)
+
+    def record_weighting(
+        self,
+        similarities: torch.Tensor,
+        accepted: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        count = similarities.numel()
+        self.weighting_contributors += count
+        self.accepted_weighting_contributors += int(accepted.sum().item())
+        minimum = float(similarities.min().item())
+        maximum = float(similarities.max().item())
+        self.consensus_similarity_sum += float(similarities.sum().item())
+        self.consensus_similarity_min = _optional_min(
+            self.consensus_similarity_min, minimum
+        )
+        self.consensus_similarity_max = _optional_max(
+            self.consensus_similarity_max, maximum
+        )
+        dominant = float(weights.max().item())
+        effective = float((1.0 / weights.square().sum().clamp_min(1e-12)).item())
+        self.dominant_weight_sum += dominant
+        self.dominant_weight_min = _optional_min(self.dominant_weight_min, dominant)
+        self.dominant_weight_max = _optional_max(self.dominant_weight_max, dominant)
+        self.effective_contributor_sum += effective
+        self.effective_contributor_min = _optional_min(
+            self.effective_contributor_min, effective
+        )
+        self.effective_contributor_max = _optional_max(
+            self.effective_contributor_max, effective
+        )
+
+    def render(self, preset_name: str, input_count: int, custom: bool) -> str:
+        source = "connected custom configuration" if custom else preset_name
+        lines = [
+            "CWB MERGE SUMMARY",
+            f"Settings: {source}",
+            f"Input contributors: {input_count}",
+            f"Alignment candidates: {self.alignment_candidates}",
+            f"Alignment matches: {self.alignment_matches}",
+            f"Anchor-only groups: {self.anchor_only_groups}",
+            f"Weighted vector groups: {self.weighting_groups}",
+            f"All-rejected equal fallbacks: {self.all_rejected_fallbacks}",
+            f"Zero-weight equal fallbacks: {self.zero_weight_fallbacks}",
+            "Accepted weighting contributors: "
+            f"{self.accepted_weighting_contributors}/{self.weighting_contributors}",
+            "Consensus similarity min/mean/max: "
+            f"{_format_metric(self.consensus_similarity_min)} / "
+            f"{_format_metric(self.consensus_similarity_sum / self.weighting_contributors if self.weighting_contributors else None)} / "
+            f"{_format_metric(self.consensus_similarity_max)}",
+            "Dominant normalized weight min/mean/max: "
+            f"{_format_metric(self.dominant_weight_min)} / "
+            f"{_format_metric(self.dominant_weight_sum / self.weighting_groups if self.weighting_groups else None)} / "
+            f"{_format_metric(self.dominant_weight_max)}",
+            "Effective contributors min/mean/max: "
+            f"{_format_metric(self.effective_contributor_min)} / "
+            f"{_format_metric(self.effective_contributor_sum / self.weighting_groups if self.weighting_groups else None)} / "
+            f"{_format_metric(self.effective_contributor_max)}",
+            f"CUDA OOM CPU fallbacks: {self.cpu_fallbacks}",
+        ]
+        if self.lora_groups:
+            lines.extend([
+                f"LoRA groups: {self.lora_groups}",
+                f"Mixed-rank LoRA groups: {self.mixed_rank_lora_groups}",
+                f"Genuine LoRA components: {self.genuine_lora_components}",
+                "Structural rank slots excluded: "
+                f"{self.structural_rank_slots_excluded}",
+                f"Explicit mismatch-zero contributors: {self.explicit_zero_contributors}",
+            ])
+        if self.lora_layer_reports:
+            lines.extend(_render_lora_dimension_groups(self.lora_layer_reports))
+        if self.weight_sweep is not None:
+            lines.append(self.weight_sweep.render())
+        return "\n".join(lines)
+
+
+@dataclass
+class LoRALayerReport:
+    layer: str
+    ranks: tuple[int, ...]
+    reference_input: int
+    reference_rank: int
+    down_dimensions: tuple[int, ...]
+    up_dimensions: tuple[int, ...]
+    alignment_method: str
+    structural_slots_excluded: int
+    explicit_zero_contributors: int
+    reference_components: int = 0
+    prefix_components: int = 0
+    alignable_source_components: int = 0
+    matches: int = 0
+    anchor_only_components: int = 0
+    candidate_score_count: int = 0
+    candidate_score_sum: float = 0.0
+    candidate_score_min: float | None = None
+    candidate_score_max: float | None = None
+    matched_scores: list[float] = field(default_factory=list)
+    norm_ratios: list[float] = field(default_factory=list)
+    matrix_shapes: list[tuple[int, int]] = field(default_factory=list)
+
+    def record_candidates(self, scores: torch.Tensor) -> None:
+        values = scores.detach().float()
+        count = values.numel()
+        if not count:
+            return
+        minimum = float(values.min().item())
+        maximum = float(values.max().item())
+        self.candidate_score_count += count
+        self.candidate_score_sum += float(values.sum().item())
+        self.candidate_score_min = (
+            minimum if self.candidate_score_min is None
+            else min(self.candidate_score_min, minimum)
+        )
+        self.candidate_score_max = (
+            maximum if self.candidate_score_max is None
+            else max(self.candidate_score_max, maximum)
+        )
+
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _format_metric(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.6g}"
+
+
+def _render_lora_dimension_groups(
+    layers: list[LoRALayerReport],
+) -> list[str]:
+    grouped = {}
+    for layer in layers:
+        key = (
+            layer.down_dimensions,
+            layer.up_dimensions,
+            layer.ranks,
+            layer.reference_input,
+            layer.alignment_method,
+        )
+        grouped.setdefault(key, []).append(layer)
+
+    lines = ["", "CWB LORA DIMENSION GROUPS"]
+    ordered_groups = sorted(
+        grouped.values(),
+        key=lambda group: (-len(group), group[0].layer),
+    )
+    for number, group in enumerate(ordered_groups, start=1):
+        sample = group[0]
+        candidate_count = sum(item.candidate_score_count for item in group)
+        candidate_sum = sum(item.candidate_score_sum for item in group)
+        candidate_min = min(
+            (item.candidate_score_min for item in group if item.candidate_score_min is not None),
+            default=None,
+        )
+        candidate_max = max(
+            (item.candidate_score_max for item in group if item.candidate_score_max is not None),
+            default=None,
+        )
+        matched_scores = [score for item in group for score in item.matched_scores]
+        norm_ratios = [ratio for item in group for ratio in item.norm_ratios]
+        alignable = sum(item.alignable_source_components for item in group)
+        matches = sum(item.matches for item in group)
+        reference_components = sum(item.reference_components for item in group)
+        anchor_only = sum(item.anchor_only_components for item in group)
+        matrix_shapes = sorted({shape for item in group for shape in item.matrix_shapes})
+        matrix_text = (
+            ", ".join(f"{rows}x{columns}" for rows, columns in matrix_shapes)
+            if matrix_shapes else "index alignment"
+        )
+        lines.extend([
+            "",
+            f"Group {number}: {len(group)} layer(s)",
+            f"Down non-rank dimensions: {sample.down_dimensions}",
+            f"Up non-rank dimensions: {sample.up_dimensions}",
+            f"Input ranks: {sample.ranks}",
+            f"Reference: input {sample.reference_input}, rank {sample.reference_rank}",
+            f"Alignment: {sample.alignment_method}; matrices: {matrix_text}",
+            f"Matched source components: {matches}/{alignable} "
+            f"({(100.0 * matches / alignable) if alignable else 100.0:.2f}%)",
+            f"Reference-only components: {anchor_only}/{reference_components}",
+            "Structural rank slots excluded: "
+            f"{sum(item.structural_slots_excluded for item in group)}",
+            "Explicit mismatch-zero contributors: "
+            f"{sum(item.explicit_zero_contributors for item in group)}",
+            f"Candidate similarity count: {candidate_count}",
+            "Candidate similarity min/mean/max: "
+            f"{_format_metric(candidate_min)} / "
+            f"{_format_metric(candidate_sum / candidate_count if candidate_count else None)} / "
+            f"{_format_metric(candidate_max)}",
+            "Matched similarity p05/median/p95: "
+            f"{_format_metric(_percentile(matched_scores, 0.05))} / "
+            f"{_format_metric(_percentile(matched_scores, 0.5))} / "
+            f"{_format_metric(_percentile(matched_scores, 0.95))}",
+            "Rank-one delta norm ratio count/min/mean/max: "
+            f"{len(norm_ratios)} / "
+            f"{_format_metric(min(norm_ratios) if norm_ratios else None)} / "
+            f"{_format_metric(sum(norm_ratios) / len(norm_ratios) if norm_ratios else None)} / "
+            f"{_format_metric(max(norm_ratios) if norm_ratios else None)}",
+        ])
+
+    def coverage(item: LoRALayerReport) -> float:
+        return (
+            item.matches / item.alignable_source_components
+            if item.alignable_source_components else 1.0
+        )
+
+    coverage_exceptions = sorted(layers, key=lambda item: (coverage(item), item.layer))[:5]
+    norm_exceptions = sorted(
+        (item for item in layers if item.norm_ratios),
+        key=lambda item: max(abs(value - 1.0) for value in item.norm_ratios),
+        reverse=True,
+    )[:5]
+    lines.extend(["", "CWB LORA EXCEPTIONS", "Lowest match coverage:"])
+    lines.extend(
+        f"- {item.layer}: {item.matches}/{item.alignable_source_components} "
+        f"({coverage(item) * 100.0:.2f}%)"
+        for item in coverage_exceptions
+    )
+    lines.append("Largest rank-one delta norm change:")
+    lines.extend(
+        f"- {item.layer}: min={min(item.norm_ratios):.6g}, "
+        f"max={max(item.norm_ratios):.6g}"
+        for item in norm_exceptions
+    )
+    return lines
+
+
+@dataclass
+class LoRAPairSource:
+    """One genuine normalized pair or one intentional mismatch-zero input."""
+
+    source_index: int
+    down: torch.Tensor | None
+    up: torch.Tensor | None
+    scale: float = 1.0
+    synthetic_zero: bool = False
+
+    @classmethod
+    def zero(cls, source_index: int) -> "LoRAPairSource":
+        return cls(source_index, None, None, synthetic_zero=True)
+
+    @property
+    def rank(self) -> int:
+        if self.synthetic_zero or self.down is None:
+            raise ValueError("A synthetic-zero LoRA source has no genuine rank.")
+        return int(self.down.shape[0])
+
+
+CWB_CONFIG = io.Custom("CWB_CONFIG")
+
+
+def resolve_cwb_settings(
+    preset_name: str,
+    presets: dict[str, dict],
+    custom_config: CWBSettings | None = None,
+) -> CWBSettings:
+    """Resolve one complete use-case preset or an explicitly connected config."""
+    if custom_config is not None:
+        if not isinstance(custom_config, CWBSettings):
+            raise TypeError("CWB config input must come from CWB Custom Configuration.")
+        return custom_config
+    try:
+        resolved = presets[preset_name].copy()
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported CWB preset '{preset_name}' for this merge type. "
+            "Select a current preset or connect CWB Custom Configuration."
+        ) from exc
     if not 0.0 <= resolved["position_weight"] <= 1.0:
         raise ValueError("Position weight must be between 0.0 and 1.0.")
-    if preset_name != "custom":
-        try:
-            preset = CWB_PRESETS[preset_name]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported CWB preset: {preset_name}") from exc
-        user_scale = resolved["global_scale"]
-        resolved.update(
-            alignment_method="similarity",
-            dynamic_similarity_contrast=False,
-            soft_comfort_bandpass=False,
-        )
-        resolved.update(preset)
-        if user_scale != 1.0:
-            resolved["global_scale"] = user_scale
     return CWBSettings(**resolved)
+
+
+def build_custom_cwb_settings(**values) -> CWBSettings:
+    settings = CWBSettings(
+        consensus_type=values["consensus_type"],
+        alignment_method=values["alignment_method"],
+        alignment_threshold=float(values["alignment_threshold"]),
+        similarity_threshold=float(values["similarity_threshold"]),
+        power_alpha=float(values["power_alpha"]),
+        diversity_beta=float(values["diversity_beta"]),
+        rescale_norm=bool(values["rescale_norm"]),
+        global_scale=float(values["global_scale"]),
+        dynamic_similarity_contrast=bool(values["dynamic_similarity_contrast"]),
+        soft_comfort_bandpass=bool(values["soft_comfort_bandpass"]),
+        position_weight=float(values["position_weight"]),
+        preserve_common_prefix=bool(values["preserve_common_prefix"]),
+    )
+    if not 0.0 <= settings.position_weight <= 1.0:
+        raise ValueError("Position weight must be between 0.0 and 1.0.")
+    return settings
 
 
 def _common_prefix_length(tensors: list[torch.Tensor]) -> int:
@@ -214,11 +791,16 @@ def merge_consensus_group(
     settings: CWBSettings,
     *,
     apply_global_scale: bool = True,
+    diagnostics: CWBDiagnostics | None = None,
 ) -> torch.Tensor:
     """Merge one aligned vector group using CWB."""
     if stacked.shape[0] == 1:
         merged = stacked[0].clone()
     else:
+        if diagnostics is not None:
+            diagnostics.weighting_groups += 1
+            if diagnostics.weight_sweep is not None:
+                diagnostics.weight_sweep.record(stacked)
         consensus = (
             torch.median(stacked, dim=0).values
             if settings.consensus_type == "median"
@@ -251,9 +833,15 @@ def merge_consensus_group(
             if weight_sum > 0:
                 row_weights /= weight_sum
             else:
+                if diagnostics is not None:
+                    diagnostics.zero_weight_fallbacks += 1
                 row_weights.fill_(1.0 / len(similarities))
         else:
+            if diagnostics is not None:
+                diagnostics.all_rejected_fallbacks += 1
             row_weights.fill_(1.0 / len(similarities))
+        if diagnostics is not None:
+            diagnostics.record_weighting(similarities, mask, row_weights)
         merged = (stacked * row_weights.unsqueeze(1)).sum(dim=0)
 
         if settings.rescale_norm:
@@ -269,11 +857,14 @@ def merge_consensus_group(
 def _greedy_similarity_matches(
     similarities: torch.Tensor,
     settings: CWBSettings,
+    diagnostics: CWBDiagnostics | None = None,
 ) -> list[int]:
     """Match source rows to reference rows without duplicating the score matrix."""
     scores = _position_biased_scores(similarities, settings.position_weight)
     scores.masked_fill_(similarities < settings.alignment_threshold, -100.0)
     matched = [-1] * similarities.shape[0]
+    if diagnostics is not None:
+        diagnostics.alignment_candidates += similarities.shape[0]
     for _ in range(min(similarities.shape)):
         flat_index = torch.argmax(scores)
         best = scores.flatten()[flat_index].item()
@@ -282,6 +873,8 @@ def _greedy_similarity_matches(
         ref_row = int((flat_index // similarities.shape[1]).item())
         source_row = int((flat_index % similarities.shape[1]).item())
         matched[ref_row] = source_row
+        if diagnostics is not None:
+            diagnostics.alignment_matches += 1
         scores[ref_row, :] = -100.0
         scores[:, source_row] = -100.0
     return matched
@@ -293,6 +886,7 @@ def merge_cwb_tensors(
     *,
     reference_index: int = 0,
     allow_similarity_alignment: bool = True,
+    diagnostics: CWBDiagnostics | None = None,
 ) -> torch.Tensor:
     """CWB tensors with a shared rank and trailing vector dimensions."""
     if not tensors:
@@ -354,15 +948,21 @@ def merge_cwb_tensors(
             F.normalize(reference_flat, p=2, dim=1, eps=1e-8),
             F.normalize(flat, p=2, dim=1, eps=1e-8).t(),
         )
-        matched = _greedy_similarity_matches(similarities, settings)
+        matched = _greedy_similarity_matches(similarities, settings, diagnostics)
         for ref_row, source_row in enumerate(matched):
             if source_row >= 0:
                 groups[ref_row].append(tensor[source_row])
 
     merged_rows = []
+    if diagnostics is not None and len(tensors) > 1:
+        diagnostics.anchor_only_groups += sum(len(group) == 1 for group in groups)
     for group in groups:
         stacked = torch.stack([row.reshape(-1) for row in group])
-        merged_rows.append(merge_consensus_group(stacked, settings).reshape(group[0].shape))
+        merged_rows.append(
+            merge_consensus_group(
+                stacked, settings, diagnostics=diagnostics
+            ).reshape(group[0].shape)
+        )
     merged = torch.stack(merged_rows)
     if prefix_length:
         merged = torch.cat([preserved_prefix, merged], dim=0)
@@ -373,22 +973,36 @@ def _common_lora_prefix_length(
     downs: list[torch.Tensor],
     ups: list[torch.Tensor],
     reference_index: int,
+    synthetic_zero_count: int = 0,
 ) -> int:
     reference_down = downs[reference_index]
     reference_up = ups[reference_index]
-    limit = reference_down.shape[0]
+    limit = min(down.shape[0] for down in downs)
     common = torch.ones(limit, dtype=torch.bool, device=reference_down.device)
     for down, up in zip(downs, ups):
         down_equal = torch.isclose(
-            reference_down, down, rtol=1e-5, atol=1e-6
+            reference_down[:limit], down[:limit], rtol=1e-5, atol=1e-6
         ).reshape(limit, -1).all(dim=1)
         up_equal = torch.isclose(
-            reference_up.movedim(1, 0),
-            up.movedim(1, 0),
+            reference_up.movedim(1, 0)[:limit],
+            up.movedim(1, 0)[:limit],
             rtol=1e-5,
             atol=1e-6,
         ).reshape(limit, -1).all(dim=1)
         common &= down_equal & up_equal
+    if synthetic_zero_count:
+        common &= torch.isclose(
+            reference_down[:limit],
+            torch.zeros((), device=reference_down.device, dtype=reference_down.dtype),
+            rtol=1e-5,
+            atol=1e-6,
+        ).reshape(limit, -1).all(dim=1)
+        common &= torch.isclose(
+            reference_up.movedim(1, 0)[:limit],
+            torch.zeros((), device=reference_up.device, dtype=reference_up.dtype),
+            rtol=1e-5,
+            atol=1e-6,
+        ).reshape(limit, -1).all(dim=1)
     mismatch = torch.nonzero(~common, as_tuple=False)
     return limit if mismatch.numel() == 0 else int(mismatch[0].item())
 
@@ -399,23 +1013,45 @@ def merge_cwb_lora_pairs(
     settings: CWBSettings,
     *,
     reference_index: int,
+    synthetic_zero_count: int = 0,
+    diagnostics: CWBDiagnostics | None = None,
+    layer_report: LoRALayerReport | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CWB LoRA rank components while keeping A rows paired with B columns."""
     if not downs or len(downs) != len(ups):
         raise ValueError("CWB requires matching LoRA A/B source lists.")
-    rank = downs[reference_index].shape[0]
-    if any(down.shape[0] != rank or up.shape[1] != rank for down, up in zip(downs, ups)):
-        raise ValueError("CWB LoRA sources must be padded to one shared rank.")
-
-    prefix = (
-        _common_lora_prefix_length(downs, ups, reference_index)
-        if settings.preserve_common_prefix else 0
-    )
+    if not 0 <= reference_index < len(downs):
+        raise ValueError("CWB LoRA reference index is out of range.")
+    for down, up in zip(downs, ups):
+        if down.ndim < 2 or up.ndim < 2 or down.shape[0] <= 0:
+            raise ValueError("CWB LoRA sources must contain positive-rank factor pairs.")
+        if down.shape[0] != up.shape[1]:
+            raise ValueError("CWB LoRA down/up factors must have matching ranks.")
     reference_down = downs[reference_index]
     reference_up = ups[reference_index]
+    rank = reference_down.shape[0]
+    if any(
+        tuple(down.shape[1:]) != tuple(reference_down.shape[1:])
+        or up.shape[0] != reference_up.shape[0]
+        or tuple(up.shape[2:]) != tuple(reference_up.shape[2:])
+        for down, up in zip(downs, ups)
+    ):
+        raise ValueError("CWB LoRA sources must have matching non-rank dimensions.")
+
+    prefix = (
+        _common_lora_prefix_length(
+            downs, ups, reference_index, synthetic_zero_count
+        )
+        if settings.preserve_common_prefix else 0
+    )
+    if layer_report is not None:
+        layer_report.prefix_components = prefix
+        layer_report.reference_components = rank - prefix
     reference_up_components = reference_up.movedim(1, 0)
     down_groups = [[reference_down[row]] for row in range(prefix, rank)]
     up_groups = [[reference_up_components[row]] for row in range(prefix, rank)]
+    matched_score_tensors = []
+    norm_ratio_tensors = []
 
     ref_down_body = reference_down[prefix:].reshape(rank - prefix, -1)
     ref_up_body = reference_up_components[prefix:].reshape(rank - prefix, -1)
@@ -424,8 +1060,12 @@ def merge_cwb_lora_pairs(
             continue
         source_down_components = down[prefix:]
         source_up_components = up.movedim(1, 0)[prefix:]
-        source_down = source_down_components.reshape(rank - prefix, -1)
-        source_up = source_up_components.reshape(rank - prefix, -1)
+        if source_down_components.shape[0] == 0:
+            continue
+        if layer_report is not None:
+            layer_report.alignable_source_components += source_down_components.shape[0]
+        source_down = source_down_components.reshape(source_down_components.shape[0], -1)
+        source_up = source_up_components.reshape(source_up_components.shape[0], -1)
         if settings.alignment_method == "index":
             matched = list(range(source_down.shape[0]))
             down_similarities = up_similarities = None
@@ -439,11 +1079,23 @@ def merge_cwb_lora_pairs(
                 F.normalize(source_up, p=2, dim=1, eps=1e-8).T,
             )
             contribution_similarities = down_similarities * up_similarities
-            matched = _greedy_similarity_matches(contribution_similarities, settings)
+            if layer_report is not None:
+                layer_report.matrix_shapes.append(tuple(contribution_similarities.shape))
+                layer_report.record_candidates(contribution_similarities)
+            matched = _greedy_similarity_matches(
+                contribution_similarities, settings, diagnostics
+            )
 
         for ref_row, source_row in enumerate(matched):
             if source_row < 0 or ref_row >= len(down_groups):
                 continue
+            if layer_report is not None:
+                layer_report.matches += 1
+                if down_similarities is not None:
+                    matched_score_tensors.append(
+                        down_similarities[ref_row, source_row]
+                        * up_similarities[ref_row, source_row]
+                    )
             source_down_row = source_down_components[source_row]
             source_up_column = source_up_components[source_row]
             if (
@@ -456,20 +1108,63 @@ def merge_cwb_lora_pairs(
             down_groups[ref_row].append(source_down_row)
             up_groups[ref_row].append(source_up_column)
 
-    merged_down_rows = [
-        merge_consensus_group(
-            torch.stack([component.reshape(-1) for component in group]),
+    if synthetic_zero_count:
+        zero_down = torch.zeros_like(reference_down[0])
+        zero_up = torch.zeros_like(reference_up_components[0])
+        for down_group, up_group in zip(down_groups, up_groups):
+            down_group.extend([zero_down] * synthetic_zero_count)
+            up_group.extend([zero_up] * synthetic_zero_count)
+
+    if diagnostics is not None and len(downs) > 1:
+        diagnostics.anchor_only_groups += sum(
+            len(group) == 1 for group in down_groups
+        )
+    if layer_report is not None:
+        layer_report.anchor_only_components = sum(
+            len(group) == 1 for group in down_groups
+        )
+    merged_down_rows = []
+    merged_up_columns = []
+    for down_group, up_group in zip(down_groups, up_groups):
+        merged_down = merge_consensus_group(
+            torch.stack([component.reshape(-1) for component in down_group]),
             settings,
             apply_global_scale=False,
-        ).reshape(group[0].shape)
-        for group in down_groups
-    ]
-    merged_up_columns = [
-        merge_consensus_group(
-            torch.stack([component.reshape(-1) for component in group]), settings
-        ).reshape(group[0].shape)
-        for group in up_groups
-    ]
+            diagnostics=diagnostics,
+        ).reshape(down_group[0].shape)
+        merged_up = merge_consensus_group(
+            torch.stack([component.reshape(-1) for component in up_group]),
+            settings,
+            diagnostics=diagnostics,
+        ).reshape(up_group[0].shape)
+        merged_down_rows.append(merged_down)
+        merged_up_columns.append(merged_up)
+        if layer_report is not None:
+            input_norms = torch.stack([
+                torch.linalg.vector_norm(down_component)
+                * torch.linalg.vector_norm(up_component)
+                for down_component, up_component in zip(down_group, up_group)
+            ])
+            mean_input_norm = input_norms.mean()
+            output_norm = (
+                torch.linalg.vector_norm(merged_down)
+                * torch.linalg.vector_norm(merged_up)
+            )
+            norm_ratio_tensors.append(
+                torch.where(
+                    mean_input_norm > 0.0,
+                    output_norm / mean_input_norm.clamp_min(1e-12),
+                    torch.full_like(output_norm, torch.nan),
+                )
+            )
+    if layer_report is not None:
+        if matched_score_tensors:
+            layer_report.matched_scores.extend(
+                torch.stack(matched_score_tensors).detach().float().cpu().tolist()
+            )
+        if norm_ratio_tensors:
+            ratios = torch.stack(norm_ratio_tensors).detach().float().cpu().tolist()
+            layer_report.norm_ratios.extend(value for value in ratios if value == value)
     if prefix:
         merged_down_rows = [*reference_down[:prefix], *merged_down_rows]
         merged_up_columns = [*reference_up_components[:prefix], *merged_up_columns]
@@ -511,6 +1206,7 @@ def _merge_tensors_to_cpu(
     reference_index: int = 0,
     allow_similarity_alignment: bool,
     operation_label: str = "tensor",
+    diagnostics: CWBDiagnostics | None = None,
 ) -> torch.Tensor:
     """Own one tensor operation's GPU lifetime and return only its CPU result."""
     def execute(target_device: str) -> torch.Tensor:
@@ -521,6 +1217,7 @@ def _merge_tensors_to_cpu(
                 settings,
                 reference_index=reference_index,
                 allow_similarity_alignment=allow_similarity_alignment,
+                diagnostics=diagnostics,
             )
             return merged.to(target_dtype).cpu().contiguous()
         finally:
@@ -536,45 +1233,91 @@ def _merge_tensors_to_cpu(
             "[CWB Merge] CUDA OOM for '%s'; retrying this layer on CPU.",
             operation_label,
         )
+        if diagnostics is not None:
+            diagnostics.cpu_fallbacks += 1
         return execute("cpu")
 
 
 def _merge_lora_pair_to_cpu(
-    pair_sources: list[tuple[int, torch.Tensor, torch.Tensor, float]],
+    pair_sources: list[LoRAPairSource],
     settings: CWBSettings,
     device: str,
     target_dtype: torch.dtype,
     operation_label: str = "LoRA pair",
+    diagnostics: CWBDiagnostics | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Own one LoRA pair operation's GPU lifetime and return CPU A/B tensors."""
-    max_rank = max(down.shape[0] for _, down, _, _ in pair_sources)
+    genuine_sources = [source for source in pair_sources if not source.synthetic_zero]
+    if not genuine_sources:
+        raise ValueError("CWB LoRA merge requires at least one genuine factor pair.")
+    max_rank = max(source.rank for source in genuine_sources)
     reference_index = max(
-        range(len(pair_sources)),
-        key=lambda index: pair_sources[index][1].shape[0],
+        range(len(genuine_sources)),
+        key=lambda index: genuine_sources[index].rank,
     )
+    reference_source = genuine_sources[reference_index]
+    if reference_source.down is None or reference_source.up is None:
+        raise ValueError("CWB LoRA reference source is missing its factors.")
+    synthetic_zero_count = len(pair_sources) - len(genuine_sources)
+    ranks = [source.rank for source in genuine_sources]
+    structural_slots_excluded = sum(max_rank - rank for rank in ranks)
+    if diagnostics is not None:
+        diagnostics.lora_groups += 1
+        diagnostics.mixed_rank_lora_groups += int(len(set(ranks)) > 1)
+        diagnostics.genuine_lora_components += sum(ranks)
+        diagnostics.structural_rank_slots_excluded += structural_slots_excluded
+        diagnostics.explicit_zero_contributors += synthetic_zero_count
+
     def execute(target_device: str) -> tuple[torch.Tensor, torch.Tensor, int]:
-        downs = [
-            _to_compute(_pad_rank_axis(down, 0, max_rank), target_device)
-            for _, down, _, _ in pair_sources
-        ]
-        ups = [
-            _to_compute(_pad_rank_axis(up, 1, max_rank), target_device) * scale
-            for _, _, up, scale in pair_sources
-        ]
+        downs = []
+        ups = []
+        attempt_diagnostics = (
+            CWBDiagnostics(
+                weight_sweep=(
+                    CWBWeightSweepDiagnostics()
+                    if diagnostics.weight_sweep is not None else None
+                )
+            )
+            if diagnostics is not None else None
+        )
+        layer_report = LoRALayerReport(
+            layer=operation_label,
+            ranks=tuple(ranks),
+            reference_input=reference_source.source_index + 1,
+            reference_rank=max_rank,
+            down_dimensions=tuple(reference_source.down.shape[1:]),
+            up_dimensions=(
+                int(reference_source.up.shape[0]),
+                *tuple(reference_source.up.shape[2:]),
+            ),
+            alignment_method=settings.alignment_method,
+            structural_slots_excluded=structural_slots_excluded,
+            explicit_zero_contributors=synthetic_zero_count,
+        )
         try:
+            for source in genuine_sources:
+                if source.down is None or source.up is None:
+                    raise ValueError("A genuine LoRA source is missing its factors.")
+                downs.append(_to_compute(source.down, target_device))
+                ups.append(_to_compute(source.up, target_device) * source.scale)
             merged_down, merged_up = merge_cwb_lora_pairs(
                 downs,
                 ups,
                 settings,
                 reference_index=reference_index,
+                synthetic_zero_count=synthetic_zero_count,
+                diagnostics=attempt_diagnostics,
+                layer_report=layer_report,
             )
-            return (
-                merged_down.to(target_dtype).cpu().contiguous(),
-                merged_up.to(target_dtype).cpu().contiguous(),
-                max_rank,
-            )
+            output_down = merged_down.to(target_dtype).cpu().contiguous()
+            output_up = merged_up.to(target_dtype).cpu().contiguous()
+            if diagnostics is not None and attempt_diagnostics is not None:
+                diagnostics.absorb_runtime(attempt_diagnostics)
+                diagnostics.lora_layer_reports.append(layer_report)
+            return output_down, output_up, max_rank
         finally:
-            del downs, ups
+            downs.clear()
+            ups.clear()
 
     try:
         return execute(device)
@@ -586,6 +1329,8 @@ def _merge_lora_pair_to_cpu(
             "[CWB Merge] CUDA OOM for '%s'; retrying this layer on CPU.",
             operation_label,
         )
+        if diagnostics is not None:
+            diagnostics.cpu_fallbacks += 1
         return execute("cpu")
 
 
@@ -647,15 +1392,6 @@ def _secondary_lora_map(
     return result
 
 
-def _pad_rank_axis(tensor: torch.Tensor, axis: int, rank: int) -> torch.Tensor:
-    if tensor.shape[axis] == rank:
-        return tensor
-    padding = [0] * (tensor.ndim * 2)
-    reverse_axis = tensor.ndim - 1 - axis
-    padding[reverse_axis * 2 + 1] = rank - tensor.shape[axis]
-    return F.pad(tensor, tuple(padding))
-
-
 class ConsensusMergerLogic:
     """Shared streaming execution for the dedicated CWB node family."""
 
@@ -668,7 +1404,14 @@ class ConsensusMergerLogic:
         *,
         embedding_union: bool = False,
         lora_mode: bool = False,
-    ) -> str:
+    ) -> str | tuple[str, str]:
+        diagnostics = CWBDiagnostics(
+            weight_sweep=(
+                CWBWeightSweepDiagnostics()
+                if params.get("counterfactual_weight_sweep", False) else None
+            )
+        )
+        params = {**params, "_cwb_diagnostics": diagnostics}
         paths = []
         for name in model_names:
             path = folder_paths.get_full_path(model_type, name)
@@ -691,17 +1434,34 @@ class ConsensusMergerLogic:
                 )
                 for index, (handler, path) in enumerate(zip(handlers, paths))
             ]
-            settings = resolve_cwb_settings(**params)
-            if lora_mode:
-                return cls._merge_loras(handlers, low_bit_sets, model_type, params, settings)
-            return cls._merge_generic(
-                handlers,
-                low_bit_sets,
-                model_type,
-                params,
-                settings,
-                embedding_union=embedding_union,
+            settings = resolve_cwb_settings(
+                params["cwb_preset"],
+                _presets_for(
+                    embedding_union=embedding_union,
+                    lora_mode=lora_mode,
+                ),
+                params.get("cwb_config"),
             )
+            if lora_mode:
+                result = cls._merge_loras(
+                    handlers, low_bit_sets, model_type, params, settings
+                )
+            else:
+                result = cls._merge_generic(
+                    handlers,
+                    low_bit_sets,
+                    model_type,
+                    params,
+                    settings,
+                    embedding_union=embedding_union,
+                )
+            if params.get("_return_cwb_report"):
+                return result, diagnostics.render(
+                    params["cwb_preset"],
+                    len(model_names),
+                    params.get("cwb_config") is not None,
+                )
+            return result
         finally:
             for handler in handlers:
                 handler.__exit__(None, None, None)
@@ -709,9 +1469,12 @@ class ConsensusMergerLogic:
 
     @staticmethod
     def _output_path(model_type: str, output_filename: str) -> str:
-        output_dir = os.path.join(folder_paths.models_dir, model_type)
-        os.makedirs(output_dir, exist_ok=True)
-        return os.path.join(output_dir, f"{output_filename.strip()}.safetensors")
+        return canonical_model_artifact_path(model_type, output_filename)[0]
+
+    @staticmethod
+    def _output_name(model_type: str, output_path: str) -> str:
+        output_dir = os.path.abspath(os.path.join(folder_paths.models_dir, model_type))
+        return os.path.relpath(output_path, output_dir).replace(os.sep, "/")
 
     @classmethod
     def _merge_generic(
@@ -892,6 +1655,7 @@ class ConsensusMergerLogic:
                         reference_index=reference_index,
                         allow_similarity_alignment=embedding_union,
                         operation_label=key,
+                        diagnostics=params.get("_cwb_diagnostics"),
                     )
                     writer.write_batch([(key, merged)])
                     del merged
@@ -904,7 +1668,7 @@ class ConsensusMergerLogic:
                 secondary_only_copied,
                 secondary_only_merged,
             )
-        return os.path.basename(output_path)
+        return cls._output_name(model_type, output_path)
 
     @classmethod
     def _merge_loras(cls, handlers, low_bit_sets, model_type, params, settings):
@@ -1109,7 +1873,6 @@ class ConsensusMergerLogic:
                     compatible = []
                     direct = []
                     down = up = alpha = tensor = anchor_tensor = None
-                    anchor_down_template = anchor_up_template = None
                     matches = core_matches(core)
                     anchor_index, anchor_block, anchor_keys = next(
                         (index, block, keys)
@@ -1175,8 +1938,6 @@ class ConsensusMergerLogic:
                     if "down" in anchor_keys and "up" in anchor_keys:
                         pair_sources = []
                         pair_failed = False
-                        anchor_down_template = current_loaded[(anchor_index, anchor_keys["down"])]
-                        anchor_up_template = current_loaded[(anchor_index, anchor_keys["up"])]
                         for index, _, keys in matches:
                             if not keys:
                                 if secondary_only:
@@ -1186,12 +1947,7 @@ class ConsensusMergerLogic:
                                 if mismatch_mode == "skip":
                                     pair_failed = True
                                     break
-                                pair_sources.append((
-                                    index,
-                                    torch.zeros_like(anchor_down_template),
-                                    torch.zeros_like(anchor_up_template),
-                                    1.0,
-                                ))
+                                pair_sources.append(LoRAPairSource.zero(index))
                                 continue
                             if "down" not in keys or "up" not in keys:
                                 if mismatch_mode == "error":
@@ -1199,12 +1955,7 @@ class ConsensusMergerLogic:
                                 if mismatch_mode == "skip":
                                     pair_failed = True
                                     break
-                                pair_sources.append((
-                                    index,
-                                    torch.zeros_like(anchor_down_template),
-                                    torch.zeros_like(anchor_up_template),
-                                    1.0,
-                                ))
+                                pair_sources.append(LoRAPairSource.zero(index))
                                 continue
                             down = current_loaded[(index, keys["down"])]
                             up = current_loaded[(index, keys["up"])]
@@ -1214,12 +1965,7 @@ class ConsensusMergerLogic:
                                 if mismatch_mode == "skip":
                                     pair_failed = True
                                     break
-                                pair_sources.append((
-                                    index,
-                                    torch.zeros_like(anchor_down_template),
-                                    torch.zeros_like(anchor_up_template),
-                                    1.0,
-                                ))
+                                pair_sources.append(LoRAPairSource.zero(index))
                                 continue
                             alpha = (
                                 current_loaded[(index, keys["alpha"])]
@@ -1230,7 +1976,9 @@ class ConsensusMergerLogic:
                             )
                             current_loaded[(index, keys["down"])] = down
                             current_loaded[(index, keys["up"])] = up
-                            pair_sources.append((index, down, up, 1.0))
+                            pair_sources.append(
+                                LoRAPairSource(index, down, up)
+                            )
                         if pair_failed:
                             preserve_roles(
                                 writer,
@@ -1240,10 +1988,28 @@ class ConsensusMergerLogic:
                                 anchor_index,
                             )
                         elif pair_sources:
-                            anchor_down = pair_sources[0][1]
-                            anchor_up = pair_sources[0][2]
+                            anchor_source = next(
+                                source for source in pair_sources
+                                if not source.synthetic_zero
+                            )
+                            anchor_down = anchor_source.down
+                            anchor_up = anchor_source.up
+                            if anchor_down is None or anchor_up is None:
+                                raise ValueError(
+                                    f"LoRA pair '{anchor_block}' has no genuine anchor."
+                                )
                             compatible = []
-                            for index, down, up, scale in pair_sources:
+                            for source in pair_sources:
+                                if source.synthetic_zero:
+                                    compatible.append(source)
+                                    continue
+                                index = source.source_index
+                                down = source.down
+                                up = source.up
+                                if down is None or up is None:
+                                    raise ValueError(
+                                        f"LoRA pair '{anchor_block}' has missing factors."
+                                    )
                                 valid = (
                                     tuple(down.shape[1:]) == tuple(anchor_down.shape[1:])
                                     and up.shape[0] == anchor_up.shape[0]
@@ -1255,14 +2021,9 @@ class ConsensusMergerLogic:
                                     if mismatch_mode == "skip":
                                         compatible = []
                                         break
-                                    compatible.append((
-                                        index,
-                                        torch.zeros_like(anchor_down),
-                                        torch.zeros_like(anchor_up),
-                                        1.0,
-                                    ))
+                                    compatible.append(LoRAPairSource.zero(index))
                                     continue
-                                compatible.append((index, down, up, scale))
+                                compatible.append(source)
                             if not compatible:
                                 preserve_roles(
                                     writer,
@@ -1283,6 +2044,7 @@ class ConsensusMergerLogic:
                                     params["process_device"],
                                     target_dtype,
                                     operation_label=anchor_block,
+                                    diagnostics=params.get("_cwb_diagnostics"),
                                 )
                                 writer.write(
                                     canonical_lora_key(anchor_block, "down"),
@@ -1385,6 +2147,7 @@ class ConsensusMergerLogic:
                             target_dtype,
                             allow_similarity_alignment=False,
                             operation_label=output_key,
+                            diagnostics=params.get("_cwb_diagnostics"),
                         )
                         writer.write(output_key, merged)
                         del merged
@@ -1402,7 +2165,6 @@ class ConsensusMergerLogic:
                     direct.clear()
                     current_loaded.clear()
                     down = up = alpha = tensor = anchor_tensor = None
-                    anchor_down_template = anchor_up_template = None
                     pbar.update(1)
 
         if preserved_companion_groups:
@@ -1416,10 +2178,16 @@ class ConsensusMergerLogic:
                 secondary_only_copied,
                 secondary_only_merged,
             )
-        return os.path.basename(output_path)
+        return cls._output_name(model_type, output_path)
 
 
-def _common_inputs(model_type: str, input_count: int, default_filename: str):
+def _common_inputs(
+    model_type: str,
+    input_count: int,
+    default_filename: str,
+    presets: dict[str, dict],
+    default_preset: str,
+):
     label = model_type
     inputs = [
         io.Combo.Input(
@@ -1447,89 +2215,14 @@ def _common_inputs(model_type: str, input_count: int, default_filename: str):
     inputs.extend([
         io.Combo.Input(
             "cwb_preset",
-            options=CWB_PRESET_OPTIONS,
-            default="baseline",
-            tooltip="Select custom to use every manual CWB control. Named presets set their listed controls; position/prefix controls, most alignment thresholds, and any explicit non-1.0 global scale remain active.",
+            options=list(presets),
+            default=default_preset,
+            tooltip="Use-case preset. Name suffixes expose alignment, consensus, norm rescaling, DSC, soft comfort bandpass, and prefix preservation. A connected CWB Config overrides it completely.",
         ),
-        io.Combo.Input(
-            "consensus_type",
-            options=["mean", "median"],
-            default="median",
-            tooltip="Baseline vector used to score contributors. Median resists coordinate outliers; mean represents their arithmetic center. Manual value requires the custom preset.",
-        ),
-        io.Combo.Input(
-            "alignment_method",
-            options=["index", "similarity"],
-            default="similarity",
-            tooltip="Pair rows by original index or greedy cosine similarity. Row reordering applies only to embeddings and LoRA rank components; ordinary model tensors keep fixed coordinates.",
-        ),
-        io.Float.Input(
-            "alignment_threshold",
-            default=0.4,
-            min=0.0,
-            max=1.0,
-            step=0.01,
-            tooltip="Minimum original cosine score for a greedy row match. Applies only to similarity-aligned embeddings and LoRA rank components; unmatched rows do not contribute.",
-        ),
-        io.Float.Input(
-            "similarity_threshold",
-            default=0.0,
-            min=-1.0,
-            max=1.0,
-            step=0.01,
-            tooltip="Minimum cosine similarity to the mean/median consensus for a paired vector to receive weight. If every vector is rejected, CWB falls back to equal weights.",
-        ),
-        io.Float.Input(
-            "power_alpha",
-            default=2.0,
-            min=0.0,
-            max=10.0,
-            step=0.1,
-            tooltip="Exponent applied to accepted non-negative consensus similarities. Higher values concentrate weight on vectors closest to consensus. Manual value requires the custom preset.",
-        ),
-        io.Float.Input(
-            "diversity_beta",
-            default=0.0,
-            min=0.0,
-            max=10.0,
-            step=0.1,
-            tooltip="Bandpass exponent that suppresses near-consensus dominance to retain more variation. Zero disables diversity weighting. Manual value requires the custom preset.",
-        ),
-        io.Boolean.Input(
-            "rescale_norm",
-            default=False,
-            tooltip="Preserve vector energy after blending: keep the merged direction but set its L2 norm to the mean norm of participating vectors. Applied per row; for LoRA, separately per paired A row and B column.",
-        ),
-        io.Float.Input(
-            "global_scale",
-            default=1.0,
-            min=0.0,
-            max=10.0,
-            step=0.01,
-            tooltip="Multiply the final merged contribution. For LoRA it is applied once through B/up, not to both factors. Named presets remain neutral unless this is explicitly set away from 1.0.",
-        ),
-        io.Boolean.Input(
-            "dynamic_similarity_contrast",
-            default=False,
-            tooltip="Remap unequal consensus similarities into 0.7-1.0 before alpha/beta weighting to increase relative separation. It does not change row-alignment scores.",
-        ),
-        io.Boolean.Input(
-            "soft_comfort_bandpass",
-            default=False,
-            tooltip="When diversity_beta is positive, broaden its distance term from 1.001-similarity to 1.5-similarity. Has no effect when diversity_beta is zero.",
-        ),
-        io.Float.Input(
-            "position_weight",
-            default=0.0,
-            min=0.0,
-            max=1.0,
-            step=0.01,
-            tooltip="Blend positional proximity into greedy row selection: 0 uses cosine only; 1 uses position affinity only. Relevant only to similarity-aligned embeddings and LoRA rank components.",
-        ),
-        io.Boolean.Input(
-            "preserve_common_prefix",
-            default=False,
-            tooltip="Copy the longest numerically identical leading first-axis span from Model A before CWB. The current merger applies this to all tensors with at least two dimensions.",
+        CWB_CONFIG.Input(
+            "cwb_config",
+            optional=True,
+            tooltip="Optional settings from CWB Custom Configuration. When connected, it completely overrides the selected preset.",
         ),
         io.Combo.Input(
             "mismatch_mode",
@@ -1588,6 +2281,36 @@ def _common_inputs(model_type: str, input_count: int, default_filename: str):
     return inputs
 
 
+class CWBCustomConfiguration(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CWBCustomConfiguration",
+            display_name="CWB Custom Configuration",
+            category="ModelUtils/Merging/Configuration",
+            description="Build complete custom Consensus-Weighted Blending settings for any CWB merge node.",
+            inputs=[
+                io.Combo.Input("consensus_type", options=["mean", "median"], default="median", tooltip="Mean is a symmetric center; median is more robust with three or more contributors."),
+                io.Combo.Input("alignment_method", options=["index", "similarity"], default="similarity", tooltip="Pair vectors by position or greedy cosine similarity where the merge type supports alignment."),
+                io.Float.Input("alignment_threshold", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Minimum cosine product or score for accepting a similarity-aligned row match."),
+                io.Float.Input("similarity_threshold", default=0.0, min=-1.0, max=1.0, step=0.01, tooltip="Minimum contributor similarity to the group consensus before weighting."),
+                io.Float.Input("power_alpha", default=2.0, min=0.0, max=10.0, step=0.1, tooltip="Exponent applied to accepted non-negative consensus similarities."),
+                io.Float.Input("diversity_beta", default=10.0, min=0.0, max=10.0, step=0.1, tooltip="Bandpass exponent used to suppress near-consensus dominance; zero disables it."),
+                io.Boolean.Input("rescale_norm", default=True, tooltip="Set each merged vector norm to the mean participating norm after weighting."),
+                io.Float.Input("global_scale", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Multiply the final contribution once; LoRA applies this through the up factor."),
+                io.Boolean.Input("dynamic_similarity_contrast", default=False, tooltip="Remap unequal consensus similarities into 0.7 to 1.0 before alpha and beta weighting."),
+                io.Boolean.Input("soft_comfort_bandpass", default=True, tooltip="Use 1.5 minus similarity instead of 1.001 minus similarity for diversity weighting."),
+                io.Float.Input("position_weight", default=0.05, min=0.0, max=1.0, step=0.01, tooltip="Blend positional affinity into similarity-based greedy matching."),
+                io.Boolean.Input("preserve_common_prefix", default=False, tooltip="Copy a numerically identical leading component span from the anchor."),
+            ],
+            outputs=[CWB_CONFIG.Output(display_name="cwb_config")],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        return io.NodeOutput(build_custom_cwb_settings(**kwargs))
+
+
 class _CWBMergerNode(io.ComfyNode):
     MODEL_TYPE = "diffusion_models"
     INPUT_COUNT = 2
@@ -1596,10 +2319,21 @@ class _CWBMergerNode(io.ComfyNode):
     DEFAULT_FILENAME = "cwb_merged"
     EMBEDDING_UNION = False
     LORA_MODE = False
+    DEFAULT_PRESET = "balanced_mean"
 
     @classmethod
     def define_schema(cls):
-        inputs = _common_inputs(cls.MODEL_TYPE, cls.INPUT_COUNT, cls.DEFAULT_FILENAME)
+        presets = _presets_for(
+            embedding_union=cls.EMBEDDING_UNION,
+            lora_mode=cls.LORA_MODE,
+        )
+        inputs = _common_inputs(
+            cls.MODEL_TYPE,
+            cls.INPUT_COUNT,
+            cls.DEFAULT_FILENAME,
+            presets,
+            cls.DEFAULT_PRESET,
+        )
         if cls.LORA_MODE:
             inputs.append(io.Boolean.Input(
                 "include_1d_diffs",
@@ -1613,8 +2347,9 @@ class _CWBMergerNode(io.ComfyNode):
             description="Merge two or three safetensors files with Consensus-Weighted Blending. Use each input tooltip or Documentation Only for exact control scope.",
             inputs=inputs,
             outputs=[
-                io.String.Output(display_name="output_filename"),
+                io.AnyType.Output(display_name="output_filename"),
                 io.String.Output(display_name="documentation"),
+                io.String.Output(display_name="cwb_report"),
             ],
             is_experimental=True,
         )
@@ -1623,18 +2358,22 @@ class _CWBMergerNode(io.ComfyNode):
     def execute(cls, **kwargs):
         documentation = load_documentation_from_file("consensus_mergers.md")
         if kwargs["execution_mode"] == "DOCUMENTATION ONLY":
-            return io.NodeOutput("Documentation mode active. No merge performed.", documentation)
+            return io.NodeOutput(
+                "Documentation mode active. No merge performed.",
+                documentation,
+                "CWB report unavailable because no merge was performed.",
+            )
         names = [kwargs["model_a"], kwargs["model_b"]]
         if cls.INPUT_COUNT == 3:
             names.append(kwargs["model_c"])
-        filename = ConsensusMergerLogic.execute(
+        filename, report = ConsensusMergerLogic.execute(
             names,
             cls.MODEL_TYPE,
-            kwargs,
+            {**kwargs, "_return_cwb_report": True},
             embedding_union=cls.EMBEDDING_UNION,
             lora_mode=cls.LORA_MODE,
         )
-        return io.NodeOutput(filename, documentation)
+        return io.NodeOutput(filename, documentation, report)
 
 
 class CWBCheckpointTwoMerger(_CWBMergerNode):
@@ -1684,6 +2423,7 @@ class CWBLoRATwoMerger(_CWBMergerNode):
     DISPLAY_NAME = "CWB Merge LoRAs (2 Models)"
     DEFAULT_FILENAME = "cwb_merged_2_lora"
     LORA_MODE = True
+    DEFAULT_PRESET = "broad_sim_medn_rn_softcb"
 
 
 class CWBLoRAThreeMerger(CWBLoRATwoMerger):
@@ -1693,12 +2433,81 @@ class CWBLoRAThreeMerger(CWBLoRATwoMerger):
     DEFAULT_FILENAME = "cwb_merged_3_lora"
 
 
+class CWBLoRAMultiMerger(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        lora_options = folder_paths.get_filename_list("loras")
+        optional_loras = ["None", *lora_options]
+        return io.Schema(
+            node_id="CWBLoRAMultiMerger",
+            display_name="CWB LoRA Multi-Merge",
+            category="ModelUtils/LoRA/Merge",
+            description="Consensus-merge 2 to 8 equal-prior LoRAs with bounded UEL streaming.",
+            inputs=[
+                io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"], default="MERGE", tooltip="MERGE writes an output; DOCUMENTATION ONLY opens no model files."),
+                io.Combo.Input("lora_count", options=[str(i) for i in range(2, 9)], default="2", tooltip="Number of consecutive LoRA inputs to include."),
+                io.Combo.Input("lora_1", options=lora_options, tooltip="Anchor LoRA and metadata source."),
+                io.Combo.Input("lora_2", options=lora_options, tooltip="Second equal-prior LoRA contributor."),
+                io.Combo.Input("lora_3", options=optional_loras, default="None", tooltip="Optional third equal-prior contributor."),
+                io.Combo.Input("lora_4", options=optional_loras, default="None", tooltip="Optional fourth equal-prior contributor."),
+                io.Combo.Input("lora_5", options=optional_loras, default="None", tooltip="Optional fifth equal-prior contributor."),
+                io.Combo.Input("lora_6", options=optional_loras, default="None", tooltip="Optional sixth equal-prior contributor."),
+                io.Combo.Input("lora_7", options=optional_loras, default="None", tooltip="Optional seventh equal-prior contributor."),
+                io.Combo.Input("lora_8", options=optional_loras, default="None", tooltip="Optional eighth equal-prior contributor."),
+                io.Combo.Input("cwb_preset", options=list(LORA_CWB_PRESETS), default="broad_sim_medn_rn_softcb", tooltip="LoRA-specific preset. A connected CWB Config overrides it completely."),
+                CWB_CONFIG.Input("cwb_config", optional=True, tooltip="Optional complete override from CWB Custom Configuration."),
+                io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip", tooltip="Preserve the anchor, insert zeros, or abort for missing and incompatible logical groups."),
+                io.String.Input("output_filename", default="cwb_merged_multi_lora", tooltip="Filename without extension under ComfyUI's LoRA directory."),
+                io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"], default="bf16", tooltip="Requested dtype for generated floating factors."),
+                io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda", tooltip="Per-layer FP32 processing device; CUDA OOM retries the affected layer on CPU."),
+                io.String.Input("exclude_patterns", default="", multiline=True, tooltip="Preserve matching logical groups from the anchor."),
+                io.String.Input("discard_patterns", default="", multiline=True, tooltip="Omit matching tensors or logical groups from the output."),
+                io.Boolean.Input("glob_patterns", default=False, tooltip="Interpret filter entries as shell-style globs instead of regular expressions."),
+                io.Boolean.Input("lazy_load", default=True, tooltip="Use bounded UEL work-unit streaming and release each completed input layer."),
+                io.Boolean.Input("force_clear_cache", default=True, tooltip="Collect Python and CUDA caches before each layer at a potential speed cost."),
+                io.Boolean.Input("override_dtype", default=False, tooltip="Force generated floating factors to the requested save dtype."),
+                io.Boolean.Input("include_1d_diffs", default=False, tooltip="CWB-merge 1D direct differences as FP32 instead of preserving the anchor."),
+                io.Boolean.Input("counterfactual_weight_sweep", default=False, tooltip="Evaluate alpha, beta, similarity-threshold, DSC, and comfort-bandpass weight combinations from each already-computed consensus similarity vector and append them to the report without additional model loads or saved outputs."),
+            ],
+            outputs=[
+                io.AnyType.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+                io.String.Output(display_name="cwb_report"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        documentation = load_documentation_from_file("consensus_mergers.md")
+        if kwargs["execution_mode"] == "DOCUMENTATION ONLY":
+            return io.NodeOutput(
+                "Documentation mode active. No merge performed.",
+                documentation,
+                "CWB report unavailable because no merge was performed.",
+            )
+        count = int(kwargs["lora_count"])
+        names = [kwargs[f"lora_{index}"] for index in range(1, count + 1)]
+        missing = [index for index, name in enumerate(names, start=1) if not name or name == "None"]
+        if missing:
+            joined = ", ".join(str(index) for index in missing)
+            raise ValueError(f"LoRA Count includes unselected input(s): {joined}.")
+        filename, report = ConsensusMergerLogic.execute(
+            names,
+            "loras",
+            {**kwargs, "_return_cwb_report": True},
+            lora_mode=True,
+        )
+        return io.NodeOutput(filename, documentation, report)
+
+
 class CWBEmbeddingTwoMerger(_CWBMergerNode):
     MODEL_TYPE = "embeddings"
     NODE_ID = "CWBEmbeddingTwoMerger"
     DISPLAY_NAME = "CWB Merge Embeddings (2 Models)"
     DEFAULT_FILENAME = "cwb_merged_2_embedding"
     EMBEDDING_UNION = True
+    DEFAULT_PRESET = "balanced_idx_mean"
 
 
 class CWBEmbeddingThreeMerger(CWBEmbeddingTwoMerger):
@@ -1709,6 +2518,7 @@ class CWBEmbeddingThreeMerger(CWBEmbeddingTwoMerger):
 
 
 CWB_MERGER_NODES = [
+    CWBCustomConfiguration,
     CWBCheckpointTwoMerger,
     CWBCheckpointThreeMerger,
     CWBModelTwoMerger,
@@ -1717,6 +2527,7 @@ CWB_MERGER_NODES = [
     CWBTextEncoderThreeMerger,
     CWBLoRATwoMerger,
     CWBLoRAThreeMerger,
+    CWBLoRAMultiMerger,
     CWBEmbeddingTwoMerger,
     CWBEmbeddingThreeMerger,
 ]

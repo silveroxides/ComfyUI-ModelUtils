@@ -14,7 +14,8 @@ conditioning and spatial fusion, which are not controls of these nodes.
 ## Node families
 
 Two-input and three-input variants are provided for checkpoints, standalone
-diffusion models, text encoders, LoRAs, and embeddings.
+diffusion models, text encoders, LoRAs, and embeddings. LoRA also provides a
+Multi-Merge variant for 2 to 8 equal-prior inputs.
 
 Model A supplies output metadata and anchors shared-layer shape, naming, and
 mismatch behavior. The output key set is the union of all inputs. A valid
@@ -26,12 +27,18 @@ alignment reference.
 
 ## Presets and custom controls
 
-`baseline` is the default. The standard clarity, smooth, varied, and diversity
-presets are joined by `power_blend` and the DSC presets demonstrated by the CWB
-conditioning implementation. Select `custom` to make every manual CWB control
-authoritative. Every named merger preset keeps `global_scale` at `1.0`; scaling
-persisted model or LoRA weights is only performed when explicitly selected in
-the custom controls.
+Presets are separated by merge type. Dense tensors, embeddings, and LoRA
+factor pairs never share one menu. Every named preset supplies every CWB
+setting and cannot inherit hidden widget state.
+
+Manual controls live in the separate CWB Custom Configuration node. Connecting
+its `CWB_CONFIG` output completely overrides the selected preset. Leaving it
+unconnected uses the named preset.
+
+Preset names expose categorical and boolean behavior. `_idx` and `_sim`
+identify alignment, `_medn` and `_mean` identify consensus, and `_rn`, `_dsc`,
+`_softcb`, and `_pcp` identify enabled boolean transformations. Dense presets
+omit alignment tokens because dense model coordinates are fixed.
 
 Similarity alignment greedily matches source rows to the reference by cosine
 similarity. Index alignment keeps absolute row positions. Position weight can
@@ -68,13 +75,8 @@ For each aligned vector group, the merger performs these operations in order:
 - **Model B / Model C**: additional equal-prior contributors. CWB derives their
   effective per-vector influence from consensus similarity; these nodes do not
   expose model-level weights.
-- **CWB Preset**: `custom` makes all manual CWB controls authoritative. A named
-  preset sets consensus, similarity cutoff, alpha/beta, norm rescaling, and its
-  DSC fields. Named presets force similarity alignment. Only `power_blend`
-  supplies an alignment threshold (0.9); other presets retain the manual
-  alignment threshold. `position_weight` and `preserve_common_prefix` remain
-  explicit extensions. A manually selected `global_scale` other than 1.0 also
-  remains active.
+- **CWB Preset**: complete use-case settings selected from the node's own dense,
+  embedding, or LoRA registry. A connected CWB Config overrides it completely.
 - **Consensus Type**: `mean` uses the arithmetic center; `median` uses the
   element-wise median and is less sensitive to coordinate outliers.
 - **Alignment Method**: `index` pairs first-axis vectors by position;
@@ -154,26 +156,44 @@ in tensors with at least two dimensions, not to those scalar/1D paths.
 
 ### Presets implemented by these nodes
 
-All named file-merger presets use a neutral `global_scale` of 1.0. This is an
-intentional repository safety difference from the broad specification's 0.7
-calibration for some conditioning-oriented presets: persisted model and LoRA
-strength is not reduced unless the user explicitly changes Global Scale.
+Dense nodes offer `balanced_mean`, `robust_medn`, `selective_mean`,
+`varied_mean_rn_softcb`, `diverse_medn_rn_dsc_softcb`, and
+`strongdiv_medn_rn_dsc_softcb`.
 
-| Preset | Consensus | Alpha | Similarity cutoff | Beta | Norm rescale | DSC | Soft comfort | Alignment cutoff |
-| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |
-| `baseline` | median | 2.0 | 0.0 | 0.0 | no | no | no | manual value |
-| `power_blend` | median | 8.0 | 0.75 | 0.0 | yes | yes | no | 0.9 |
-| `high_clarity` | median | 3.0 | 0.3 | 0.0 | no | no | no | manual value |
-| `smooth` | mean | 1.5 | 0.0 | 0.0 | no | no | no | manual value |
-| `varied_merge` | median | 2.0 | 0.0 | 0.0 | yes | no | no | manual value |
-| `diverse_concept` | median | 2.0 | 0.0 | 1.0 | yes | no | no | manual value |
-| `high_diversity_concept` | median | 2.0 | 0.0 | 2.0 | yes | no | no | manual value |
-| `dsc_baseline` | median | 2.0 | 0.0 | 0.0 | no | yes | yes | manual value |
-| `dsc_high_clarity` | median | 4.0 | 0.3 | 0.0 | no | yes | yes | manual value |
-| `dsc_smooth` | mean | 1.0 | 0.0 | 0.0 | no | yes | yes | manual value |
-| `dsc_varied_merge` | median | 2.5 | 0.0 | 0.0 | yes | yes | yes | manual value |
-| `dsc_diverse_concept` | median | 2.0 | 0.0 | 1.5 | yes | yes | yes | manual value |
-| `dsc_high_diversity_concept` | median | 2.0 | 0.0 | 3.0 | yes | yes | yes | manual value |
+Embedding nodes offer `balanced_idx_mean`, `balanced_sim_mean`,
+`robust_idx_medn`, `robust_sim_medn`, `varied_sim_mean_rn_softcb`, and
+`diverse_sim_medn_rn_dsc_softcb`.
+
+LoRA nodes offer `broad_sim_medn_rn_softcb`,
+`moderate_sim_medn_rn_softcb`, `conservative_sim_medn_rn_softcb`,
+`direct_idx_medn_rn_softcb`, `broad_sim_mean_rn_softcb`,
+`neutral_sim_medn_rn`, `focused_sim_medn_rn_dsc_softcb`, and
+`strongfocus_sim_medn_rn_dsc_softcb`.
+
+The LoRA default is `broad_sim_medn_rn_softcb`: median consensus,
+similarity alignment, zero similarity threshold, alpha 2, beta 4, norm
+rescaling, scale 1, DSC disabled, soft comfort bandpass enabled, position
+weight 0.05, and common-prefix preservation disabled. Broad, moderate, and
+conservative use alignment thresholds 0, 0.0005, and 0.0025. They represent
+increasing anchor preservation in automated mixed-rank LoRA tests.
+
+Every LoRA preset fixes all 12 controls explicitly:
+
+| preset | consensus | alignment | align threshold | sim threshold | alpha | beta | RN | scale | DSC | soft CB | position | prefix | intent |
+|---|---|---|---:|---:|---:|---:|---|---:|---|---|---:|---|---|
+| `broad_sim_medn_rn_softcb` | median | similarity | 0 | 0 | 2 | 4 | on | 1 | off | on | 0.05 | off | Broad row matching; default |
+| `moderate_sim_medn_rn_softcb` | median | similarity | 0.0005 | 0 | 2 | 4 | on | 1 | off | on | 0.05 | off | Moderate anchor preservation |
+| `conservative_sim_medn_rn_softcb` | median | similarity | 0.0025 | 0 | 2 | 4 | on | 1 | off | on | 0.05 | off | Strong anchor preservation |
+| `direct_idx_medn_rn_softcb` | median | index | 0 | 0 | 2 | 4 | on | 1 | off | on | 0.05 | off | Fixed rank-row correspondence |
+| `broad_sim_mean_rn_softcb` | mean | similarity | 0 | 0 | 2 | 4 | on | 1 | off | on | 0.05 | off | Mean-consensus broad merge |
+| `neutral_sim_medn_rn` | median | similarity | 0 | 0 | 2 | 0 | on | 1 | off | off | 0.05 | off | Similarity weighting without diversity modulation |
+| `focused_sim_medn_rn_dsc_softcb` | median | similarity | 0 | 0 | 2 | 4 | on | 1 | on | on | 0.05 | off | Moderate DSC concentration |
+| `strongfocus_sim_medn_rn_dsc_softcb` | median | similarity | 0 | 0 | 2 | 7 | on | 1 | on | on | 0.05 | off | Strong DSC concentration |
+
+The LoRA Multi-Merge counterfactual weight sweep reuses each consensus vector
+already computed by the active merge. It reports mean and median consensus
+results across configured alpha, beta, similarity-threshold, DSC, and comfort
+bandpass values without additional model loads or output files.
 
 ## Missing tensors and filtering
 
@@ -200,15 +220,28 @@ direct `.diff`, `.diff_b`, `.w_norm`, `.b_norm`, and `.set_weight` layers.
 
 Recognized diffusion-model outputs use the canonical
 `diffusion_model.<layer>.lora_A.weight` / `.lora_B.weight` convention.
-Secondary formats are matched by normalized logical layer name. Differing
-ranks are zero-padded like the DARE/TIES mergers: A/down tensors on dimension 0
-and B/up tensors on dimension 1. An existing anchor-source alpha key is updated
-to the resulting maximum rank; no alpha key is invented when the anchor has
-none.
+Secondary formats are matched by normalized logical layer name. Alpha is
+absorbed mathematically into each B/up factor using its original rank before
+alignment, weighting, or merge. Genuine factor ranks remain variable during
+CWB. The first maximum-rank input supplies the output component space, so the
+output rank remains the largest genuine input rank. Merged outputs never
+contain or invent alpha tensors.
 Similarity alignment operates on paired latent-rank components. A rows and B
 columns share one mapping; fixed input/output feature axes are never reordered.
-Input alpha scaling is absorbed into the B factor before blending, and global
-scale is applied once to the resulting pair rather than once per factor.
+For a rank-R reference and rank-r source it evaluates an R-by-r similarity
+matrix, reduced only by a preserved common prefix. Every genuine source
+component can therefore match any genuine reference component. Index alignment
+maps source component i to reference component i. In either mode, reference
+components without a genuine contributor remain singleton groups and are not
+weighted or norm-rescaled against nonexistent rank padding.
+
+Structural rank absence is different from `mismatch_mode=zeros`. The latter is
+an explicit request for a semantic zero contributor and continues to apply to
+every output-rank component where the mismatch policy is active. Numerical zero
+values inside a genuine factor do not identify padding; validity comes from the
+factor's original rank.
+
+Global scale is applied once to the resulting pair rather than once per factor.
 Incomplete pairs and unrecognized tensors are copied from the earliest
 available source unchanged.
 Companion-bearing groups (`lora_mid`, reshape, DoRA, or set-weight) are kept
@@ -234,6 +267,40 @@ opened. Files with three or more bare INT8, UINT8, FP8, or FP4 tensors are also
 rejected. One or two isolated low-bit tensors produce one warning per input and
 are preserved without CWB arithmetic; an affected LoRA causes its complete
 logical layer to be preserved.
+
+## CWB report output
+
+Every CWB merge node provides a separate `cwb_report` string output after the
+existing filename and documentation outputs. Documentation-only execution
+returns an explicit message that no report exists because no tensors were
+processed.
+
+The filename output uses ComfyUI's wildcard socket type and returns the path
+relative to the matching ComfyUI model category. A filename such as
+`groupfolder/modelname` therefore returns
+`groupfolder/modelname.safetensors`. It can connect directly to compatible
+loader Combo inputs without exposing the absolute models-directory path.
+
+The report begins with model-wide counters. LoRA arithmetic then adds grouped
+mathematical evidence without retaining tensors or dumping complete similarity
+matrices. Layers are grouped only when they share:
+
+- down non-rank dimensions;
+- up non-rank dimensions;
+- ordered genuine input ranks;
+- selected reference input and rank;
+- alignment method.
+
+Each dimension group reports layer count, effective matrix dimensions, genuine
+source-component match coverage, reference-only components, structural rank
+slots excluded from arithmetic, explicit mismatch-zero contributors, candidate
+similarity min/mean/max, accepted-match similarity percentiles, and rank-one
+delta norm ratios. A compact exception section identifies the lowest match
+coverage and largest norm changes by layer name.
+
+For a rank-384 reference and rank-128 source, the report identifies a `384x128`
+matrix, at most 128 genuine matches, and the 256 structural rank slots that were
+excluded rather than treated as zero-valued contributors.
 
 ## Streaming and failure safety
 
