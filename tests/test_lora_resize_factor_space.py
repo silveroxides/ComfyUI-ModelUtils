@@ -189,6 +189,91 @@ def test_resize_file_uses_only_async_uel_and_preserves_per_layer_scale(
     assert "diffusion_model.r3.alpha" not in output_tensors
 
 
+def test_normalize_alpha_uses_bounded_uel_and_removes_alpha(
+    monkeypatch, tmp_path, resize
+):
+    source = tmp_path / "alpha_input.safetensors"
+    down = torch.eye(2, dtype=torch.float16)
+    up = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=torch.float16)
+    _write_uel(
+        source,
+        {
+            "diffusion_model.block.lora_A.weight": down,
+            "diffusion_model.block.lora_B.weight": up,
+            "diffusion_model.block.alpha": torch.tensor(1.0),
+            "other.weight": torch.tensor([3.0]),
+        },
+        metadata={"source": "test"},
+    )
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    original_async = resize.MemoryEfficientSafeOpen.async_stream
+    original_mark = resize.MemoryEfficientSafeOpen.mark_processed
+    async_calls = []
+    marked = []
+
+    def track_async(self, keys, **kwargs):
+        async_calls.append((tuple(keys), kwargs, self.low_memory))
+        yield from original_async(self, keys, **kwargs)
+
+    def track_mark(self, key):
+        marked.append(key)
+        return original_mark(self, key)
+
+    def reject_sync_get(*args, **kwargs):
+        raise AssertionError("alpha normalization used synchronous get_tensor")
+
+    monkeypatch.setattr(resize.MemoryEfficientSafeOpen, "async_stream", track_async)
+    monkeypatch.setattr(resize.MemoryEfficientSafeOpen, "mark_processed", track_mark)
+    monkeypatch.setattr(resize.MemoryEfficientSafeOpen, "get_tensor", reject_sync_get)
+
+    output = resize.normalize_lora_alpha_file(
+        str(source), "alpha_normalized", verbose=False
+    )
+
+    assert len(async_calls) == 1
+    streamed_keys, options, low_memory = async_calls[0]
+    assert streamed_keys == (
+        "diffusion_model.block.lora_B.weight",
+        "diffusion_model.block.alpha",
+    )
+    assert options == {
+        "batch_size": 1,
+        "prefetch_batches": 1,
+        "pin_memory": False,
+    }
+    assert low_memory is True
+    assert Counter(marked) == Counter(streamed_keys)
+
+    output_tensors = _read_uel(output, original_async, original_mark)
+    assert "diffusion_model.block.alpha" not in output_tensors
+    assert torch.equal(output_tensors["diffusion_model.block.lora_A.weight"], down)
+    assert torch.equal(
+        output_tensors["diffusion_model.block.lora_B.weight"], up * 0.5
+    )
+    assert torch.equal(output_tensors["other.weight"], torch.tensor([3.0]))
+    with MemoryEfficientSafeOpen(output, low_memory=True) as loader:
+        assert loader.metadata()["alpha_normalized"] == "true"
+
+
+def test_normalize_alpha_rejects_alpha_free_input(monkeypatch, tmp_path, resize):
+    source = tmp_path / "no_alpha.safetensors"
+    _write_uel(
+        source,
+        {
+            "diffusion_model.block.lora_A.weight": torch.eye(2),
+            "diffusion_model.block.lora_B.weight": torch.eye(2),
+        },
+    )
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    with pytest.raises(ValueError, match="contains no alpha tensors"):
+        resize.normalize_lora_alpha_file(
+            str(source), "unused", verbose=False
+        )
+
+
 def test_resize_does_not_invent_alpha_for_peft_pair(monkeypatch, tmp_path, resize):
     source = tmp_path / "peft_no_alpha.safetensors"
     _write_uel(

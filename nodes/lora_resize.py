@@ -19,7 +19,7 @@ from .device_utils import estimate_model_size, prepare_for_large_operation, clea
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 from .uel_io import atomic_uel_writer, stream_work_units
 from .artifact_paths import canonical_model_artifact_path
-from .lora_alpha import normalize_lora_pair
+from .lora_alpha import lora_alpha_scale, normalize_lora_pair
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
 
@@ -633,6 +633,116 @@ def _rank_summary(rank_counts: Counter) -> str:
 # Main Resize Function
 # =============================================================================
 
+def normalize_lora_alpha_file(
+    lora_path: str,
+    output_filename: str,
+    verbose: bool = True,
+) -> str:
+    """Materialize LoRA alpha scaling and remove alpha tensors."""
+    handler = MemoryEfficientSafeOpen(lora_path, low_memory=True)
+    try:
+        low_bit_keys = inspect_low_bit_input(
+            handler, f"LoRA ({lora_path})", "LoRA Alpha Normalize"
+        )
+        metadata = (handler.metadata() or {}).copy()
+        all_keys = handler.keys()
+        pairs, _ = parse_lora_layers(all_keys)
+
+        work_units = []
+        normalized_up_keys = set()
+        consumed_alpha_keys = set()
+        for block_name, block_keys in pairs.items():
+            alpha_key = block_keys.get("alpha")
+            if alpha_key is None:
+                continue
+            down_key = block_keys.get("down")
+            up_key = block_keys.get("up")
+            if down_key is None or up_key is None:
+                raise ValueError(
+                    f"Alpha tensor for '{block_name}' has no complete LoRA pair."
+                )
+            if down_key in low_bit_keys or up_key in low_bit_keys:
+                raise ValueError(
+                    f"Cannot alpha-normalize low-bit LoRA factors for '{block_name}'."
+                )
+            down_shape = handler.get_shape(down_key)
+            up_shape = handler.get_shape(up_key)
+            if len(down_shape) < 2 or len(up_shape) < 2:
+                raise ValueError(
+                    f"LoRA factors for '{block_name}' must have at least two dimensions."
+                )
+            rank = int(down_shape[0])
+            if rank <= 0 or int(up_shape[1]) != rank:
+                raise ValueError(f"LoRA factor rank mismatch for '{block_name}'.")
+            work_units.append((block_name, {0: [up_key, alpha_key]}))
+            normalized_up_keys.add(up_key)
+            consumed_alpha_keys.add(alpha_key)
+
+        all_alpha_keys = {key for key in all_keys if key.endswith(".alpha")}
+        orphan_alpha_keys = sorted(all_alpha_keys - consumed_alpha_keys)
+        if orphan_alpha_keys:
+            raise ValueError(
+                f"Alpha tensor has no complete LoRA pair: {orphan_alpha_keys[0]}"
+            )
+        if not work_units:
+            raise ValueError("Input LoRA contains no alpha tensors.")
+
+        metadata["alpha_normalized"] = "true"
+        metadata["alpha_normalization"] = (
+            "up factor multiplied by alpha divided by rank; alpha tensors removed"
+        )
+        output_path, _ = canonical_model_artifact_path("loras", output_filename)
+
+        with atomic_uel_writer(output_path, metadata) as writer:
+            for key in all_keys:
+                if key in all_alpha_keys or key in normalized_up_keys:
+                    continue
+                write_preserved_tensor(writer, key, handler, force_raw=True)
+
+            with torch.no_grad():
+                iterator = stream_work_units(
+                    {0: handler}, work_units, pin_memory=False
+                )
+                try:
+                    for block_name, loaded in iterator:
+                        block_keys = pairs[block_name]
+                        up_key = block_keys["up"]
+                        alpha_key = block_keys["alpha"]
+                        rank = int(handler.get_shape(block_keys["down"])[0])
+                        up = loaded[(0, up_key)]
+                        alpha = loaded[(0, alpha_key)]
+                        if alpha.numel() != 1 or not torch.isfinite(alpha).all().item():
+                            raise ValueError(
+                                f"LoRA alpha for '{block_name}' must be a finite scalar."
+                            )
+                        scale = lora_alpha_scale(alpha, rank, layer=block_name)
+                        output = up
+                        try:
+                            if scale != 1.0:
+                                output = (
+                                    up.to(dtype=torch.float32)
+                                    .mul_(scale)
+                                    .to(dtype=up.dtype)
+                                    .contiguous()
+                                )
+                            writer.write_batch([(up_key, output.cpu().contiguous())])
+                        finally:
+                            del output
+                            del up
+                            del alpha
+                finally:
+                    iterator.close()
+
+        if verbose:
+            print(
+                f"[LoRA Alpha Normalize] Removed {len(work_units)} alpha tensors"
+            )
+            print(f"[LoRA Alpha Normalize] Saved to {output_path}")
+        return output_path
+    finally:
+        handler.__exit__(None, None, None)
+        cleanup_after_operation()
+
 def resize_lora_file(
     lora_path: str,
     new_rank: int,
@@ -896,6 +1006,39 @@ def resize_lora_file(
 # =============================================================================
 # Node Definitions
 # =============================================================================
+
+class LoRANormalizeAlpha(io.ComfyNode):
+    """Materialize LoRA alpha scaling into its up factors."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRANormalizeAlpha",
+            display_name="LoRA Normalize Alpha",
+            category="ModelUtils/LoRA/Utilities",
+            description="Apply each alpha divided by rank scale to its LoRA up factor and save an alpha-free LoRA.",
+            inputs=[
+                io.Combo.Input(
+                    "lora_name",
+                    options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA whose per-layer alpha scaling will be materialized.",
+                ),
+                io.String.Input(
+                    "output_filename",
+                    default="normalized_lora",
+                    tooltip="Output filename without extension, written under ComfyUI's LoRA directory.",
+                ),
+            ],
+            outputs=[io.AnyType.Output(display_name="output_path")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, lora_name, output_filename) -> io.NodeOutput:
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        normalize_lora_alpha_file(lora_path, output_filename)
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
 
 class LoRAResizeFixed(io.ComfyNode):
     """Resize LoRA to a fixed rank."""

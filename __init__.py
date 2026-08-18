@@ -42,6 +42,7 @@ from .nodes.text_encoder_extract import (
     TextEncoderDoRAExtractKnee, TextEncoderDoRAExtractFrobenius,
 )
 from .nodes.lora_resize import (
+    LoRANormalizeAlpha,
     LoRAResizeFixed, LoRAResizeRatio,
     LoRAResizeFrobenius, LoRAResizeCumulative,
     LoRAMergeToModel
@@ -98,6 +99,7 @@ class ModelUtilsExtension(ComfyExtension):
             TextEncoderDoRAExtractRatio, TextEncoderDoRAExtractQuantile,
             TextEncoderDoRAExtractKnee, TextEncoderDoRAExtractFrobenius,
             # LoRA Resize
+            LoRANormalizeAlpha,
             LoRAResizeFixed, LoRAResizeRatio,
             LoRAResizeFrobenius, LoRAResizeCumulative,
             # LoRA Multi-Merge
