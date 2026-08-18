@@ -1,0 +1,53 @@
+[groups.repository_contract]
+paths = ["__init__.py", "nodes/*.py"]
+python_tests = [
+  "tests/test_schema_tooltips.py",
+  "tests/test_uel_repository_contract.py",
+]
+
+[groups.artifact_paths]
+paths = [
+  "nodes/artifact_paths.py", "nodes/dora_extract_wd.py",
+  "nodes/dora_learned_wd.py", "nodes/dtype_conversion.py",
+  "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
+  "nodes/lora_rename.py", "nodes/lora_resize.py", "nodes/merger.py",
+  "nodes/prunekeys.py", "nodes/renamekeys.py", "nodes/text_encoder_extract.py",
+]
+python_tests = ["tests/test_artifact_paths.py"]
+
+[groups.cwb]
+paths = ["nodes/consensus_merger.py", "run_cwb_api_workflow.py", "run_cwb_preset_sweep.py"]
+python_tests = [
+  "tests/test_consensus_merger.py", "tests/test_cwb_api_runner.py",
+  "tests/test_cwb_preset_sweep.py",
+]
+
+[groups.model_analysis]
+paths = ["nodes/model_analysis.py", "run_model_analysis_api_workflow.py"]
+python_tests = ["tests/test_model_analysis.py", "tests/test_model_analysis_api_runner.py"]
+
+[groups.adaptive_extraction]
+paths = [
+  "nodes/adaptive_svd.py", "nodes/dora_extract_wd.py", "nodes/dora_learned_wd.py",
+  "nodes/extraction_stream.py", "nodes/lora_extract_svd.py",
+  "nodes/text_encoder_extract.py",
+]
+python_tests = ["tests/test_adaptive_extraction_pipeline.py", "tests/test_knee_partial_svd.py"]
+
+[groups.lora_merge]
+paths = [
+  "nodes/device_utils.py", "nodes/lora_alpha.py", "nodes/lora_merger.py",
+  "nodes/quantization_guard.py", "nodes/uel_io.py",
+]
+python_tests = [
+  "tests/test_lora_diff_dtype_contract.py", "tests/test_lora_merger_async.py",
+  "tests/test_lora_quantization_guard.py",
+]
+
+[groups.lora_resize]
+paths = ["nodes/lora_resize.py"]
+python_tests = ["tests/test_lora_resize_factor_space.py", "tests/test_lora_resize_min_rank.py"]
+
+[groups.dtype_conversion]
+paths = ["nodes/dtype_conversion.py"]
+python_tests = ["tests/test_dtype_conversion.py"]
