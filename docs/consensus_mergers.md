@@ -17,6 +17,21 @@ Two-input and three-input variants are provided for checkpoints, standalone
 diffusion models, text encoders, LoRAs, and embeddings. LoRA also provides a
 Multi-Merge variant for 2 to 8 equal-prior inputs.
 
+## Embedding coalescing
+
+`CWB Embedding Self-Coalesce` reduces one embedding by replacing mutually
+nearest body-vector pairs that meet both cosine and normalized-position limits.
+`CWB Embedding Multi-Merge` accepts 2 to 8 embeddings, performs normal CWB
+alignment first, then applies the same reduction. A target row count of zero
+continues until no eligible pair remains.
+
+Vision Boundary Embeddings preserves encoded vision-start and vision-end rows
+unchanged and applies CWB only to their interior. Normal vision inputs validate
+their outer rows before writing. Legacy Boundary Search trims accidental outer
+template rows by matching a selected known-clean visual embedding; an absent,
+ambiguous, or low-similarity boundary pair is an error rather than a guessed
+crop. Disable Vision Boundary Embeddings for open textual-inversion tensors.
+
 Model A supplies output metadata and anchors shared-layer shape, naming, and
 mismatch behavior. The output key set is the union of all inputs. A valid
 tensor found only in a secondary input is copied unchanged. When Model A lacks

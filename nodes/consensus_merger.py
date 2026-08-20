@@ -255,6 +255,45 @@ class CWBSettings:
     preserve_common_prefix: bool
 
 
+@dataclass
+class EmbeddingCoalesceReport:
+    """Per-output accounting for dedicated embedding coalescing nodes."""
+
+    target_vector_count: int
+    similarity_threshold: float
+    position_window: float
+    vision_boundary_embeddings: bool
+    legacy_boundary_search: bool
+    boundary_similarity_threshold: float
+    boundary_reference: str | None
+    tensors: list[tuple[str, int, int, int, tuple[float, ...], tuple[tuple[int, int], ...]]] = field(default_factory=list)
+
+    def record(self, key, input_rows, output_rows, trimmed_rows, boundary_scores, pairs):
+        self.tensors.append((
+            key, input_rows, output_rows, trimmed_rows,
+            tuple(float(score) for score in boundary_scores), tuple(pairs),
+        ))
+
+    def render(self) -> str:
+        lines = [
+            "", "CWB EMBEDDING COALESCING",
+            f"Target vector count: {self.target_vector_count} (0 means all eligible pairs)",
+            "Minimum retained body rows: 1",
+            f"Similarity threshold: {self.similarity_threshold:.4f}",
+            f"Position window: {self.position_window:.4f} normalized sequence distance",
+            f"Vision boundaries: {self.vision_boundary_embeddings}",
+            f"Legacy boundary search: {self.legacy_boundary_search}",
+            f"Boundary similarity threshold: {self.boundary_similarity_threshold:.4f}",
+            f"Boundary reference: {self.boundary_reference or 'none'}",
+        ]
+        for key, before, after, trimmed, scores, pairs in self.tensors:
+            lines.append(
+                f"{key}: {before} -> {after} rows; trimmed={trimmed}; "
+                f"boundary_scores={[round(score, 6) for score in scores]}; pairs={list(pairs)}"
+            )
+        return "\n".join(lines)
+
+
 def _optional_min(current: float | None, value: float | None) -> float | None:
     if value is None:
         return current
@@ -1183,6 +1222,136 @@ def _copy_to_target_shape(tensor: torch.Tensor, target: torch.Size) -> torch.Ten
     return output
 
 
+def _row_cosine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    return F.cosine_similarity(left.reshape(1, -1), right.reshape(1, -1), dim=1)[0]
+
+
+def _find_legacy_boundary_pair(
+    tensor: torch.Tensor,
+    start_reference: torch.Tensor,
+    end_reference: torch.Tensor,
+    threshold: float,
+) -> tuple[int, int, tuple[float, float]]:
+    """Locate one ordered encoded visual-boundary pair in a legacy tensor."""
+    if tensor.ndim != 2 or tensor.shape[0] < 2:
+        raise ValueError("Legacy vision boundary search requires a 2D tensor with at least two rows.")
+    rows = F.normalize(tensor.float(), p=2, dim=1, eps=1e-8)
+    start_scores = torch.mv(rows, F.normalize(start_reference.float(), p=2, dim=0, eps=1e-8))
+    end_scores = torch.mv(rows, F.normalize(end_reference.float(), p=2, dim=0, eps=1e-8))
+    pair_scores = start_scores[:, None] + end_scores[None, :]
+    ordered = torch.ones_like(pair_scores, dtype=torch.bool).triu_(diagonal=1)
+    pair_scores.masked_fill_(~ordered, -float("inf"))
+    flat_index = torch.argmax(pair_scores)
+    start = int((flat_index // tensor.shape[0]).item())
+    end = int((flat_index % tensor.shape[0]).item())
+    start_score = float(start_scores[start].item())
+    end_score = float(end_scores[end].item())
+    if start >= end or min(start_score, end_score) < threshold:
+        raise ValueError(
+            "Legacy vision boundary search found no ordered start/end pair meeting "
+            f"the boundary similarity threshold {threshold:.4f}."
+        )
+    return start, end, (start_score, end_score)
+
+
+def _prepare_vision_embedding(
+    tensor: torch.Tensor,
+    *,
+    start_reference: torch.Tensor,
+    end_reference: torch.Tensor,
+    legacy_search: bool,
+    threshold: float,
+) -> tuple[torch.Tensor, tuple[float, float], int]:
+    if tensor.ndim != 2 or tensor.shape[0] < 2:
+        raise ValueError("Vision boundary embeddings require a 2D tensor with start and end rows.")
+    if tensor.shape[1] != start_reference.numel() or tensor.shape[1] != end_reference.numel():
+        raise ValueError("Vision boundary embedding hidden sizes must match the selected boundary reference.")
+    if legacy_search:
+        start, end, scores = _find_legacy_boundary_pair(
+            tensor, start_reference, end_reference, threshold
+        )
+    else:
+        start, end = 0, tensor.shape[0] - 1
+        scores = (
+            float(_row_cosine(tensor[start], start_reference).item()),
+            float(_row_cosine(tensor[end], end_reference).item()),
+        )
+        if min(scores) < threshold:
+            raise ValueError(
+                "Vision boundary validation failed: encoded start/end rows do not meet "
+                f"the boundary similarity threshold {threshold:.4f}."
+            )
+    return tensor[start + 1:end], scores, start + (tensor.shape[0] - end - 1)
+
+
+def coalesce_embedding_rows(
+    tensor: torch.Tensor,
+    settings: CWBSettings,
+    *,
+    target_vector_count: int,
+    similarity_threshold: float,
+    position_window: float,
+) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
+    """Repeatedly replace a mutual-nearest local pair with one CWB vector."""
+    if tensor.ndim != 2:
+        return tensor, ()
+    if target_vector_count < 0:
+        raise ValueError("Target vector count must be zero or positive.")
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise ValueError("Embedding coalescing similarity threshold must be between 0 and 1.")
+    if not 0.0 <= position_window <= 1.0:
+        raise ValueError("Embedding coalescing position window must be between 0 and 1.")
+
+    rows = tensor
+    merged_pairs = []
+    while rows.shape[0] > max(target_vector_count, 1):
+        count = rows.shape[0]
+        if count < 2:
+            break
+        normalized = F.normalize(rows.float(), p=2, dim=1, eps=1e-8)
+        scores = normalized @ normalized.t()
+        scores.fill_diagonal_(-float("inf"))
+        positions = torch.linspace(0.0, 1.0, count, device=rows.device)
+        scores[(positions[:, None] - positions[None, :]).abs() > position_window] = -float("inf")
+        nearest = scores.argmax(dim=1)
+        candidate_scores = scores[torch.arange(count, device=rows.device), nearest]
+        mutual = torch.arange(count, device=rows.device) == nearest[nearest]
+        candidate_scores[~mutual] = -float("inf")
+        candidate_scores[candidate_scores < similarity_threshold] = -float("inf")
+        first = int(torch.argmax(candidate_scores).item())
+        if not torch.isfinite(candidate_scores[first]):
+            break
+        second = int(nearest[first].item())
+        first, second = sorted((first, second))
+        merged = merge_consensus_group(torch.stack((rows[first], rows[second])), settings)
+        insert_at = (first + second) // 2
+        keep = torch.ones(count, dtype=torch.bool, device=rows.device)
+        keep[first] = False
+        keep[second] = False
+        remaining = rows[keep]
+        rows = torch.cat((remaining[:insert_at], merged.unsqueeze(0), remaining[insert_at:]), dim=0)
+        merged_pairs.append((first, second))
+    return rows, tuple(merged_pairs)
+
+
+def _read_visual_boundary_reference(handler, key: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read and release only one reference tensor work unit through UEL."""
+    if key not in handler.keys():
+        raise ValueError(f"Boundary reference is missing embedding tensor '{key}'.")
+    stream = handler.async_stream([key], batch_size=1, prefetch_batches=1, pin_memory=False)
+    try:
+        batch = next(stream)
+        loaded_key, tensor = batch[0]
+        if loaded_key != key or tensor.ndim != 2 or tensor.shape[0] < 2:
+            raise ValueError("Boundary reference must contain a 2D embedding tensor with start and end rows.")
+        return tensor[0].detach().clone(), tensor[-1].detach().clone()
+    finally:
+        handler.mark_processed(key)
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
+
+
 def _to_compute(tensor: torch.Tensor, device: str) -> torch.Tensor:
     if device == "cuda":
         return transfer_to_gpu_pinned(tensor, device, torch.float32)
@@ -1425,6 +1594,15 @@ class ConsensusMergerLogic:
             prepare_for_large_operation(total_size * 1.2, torch.device(device))
 
         handlers = [MemoryEfficientSafeOpen(path, low_memory=params["lazy_load"]) for path in paths]
+        boundary_handler = None
+        boundary_name = params.get("boundary_reference_embedding")
+        if boundary_name and boundary_name != "None":
+            boundary_path = folder_paths.get_full_path("embeddings", boundary_name)
+            if not boundary_path:
+                raise FileNotFoundError(f"Boundary reference embedding '{boundary_name}' was not found.")
+            boundary_handler = MemoryEfficientSafeOpen(
+                boundary_path, low_memory=params["lazy_load"]
+            )
         try:
             low_bit_sets = [
                 inspect_low_bit_input(
@@ -1454,17 +1632,24 @@ class ConsensusMergerLogic:
                     params,
                     settings,
                     embedding_union=embedding_union,
+                    boundary_handler=boundary_handler,
                 )
             if params.get("_return_cwb_report"):
-                return result, diagnostics.render(
+                report = diagnostics.render(
                     params["cwb_preset"],
                     len(model_names),
                     params.get("cwb_config") is not None,
                 )
+                embedding_report = params.get("_embedding_coalesce_report")
+                if embedding_report is not None:
+                    report += embedding_report.render()
+                return result, report
             return result
         finally:
             for handler in handlers:
                 handler.__exit__(None, None, None)
+            if boundary_handler is not None:
+                boundary_handler.__exit__(None, None, None)
             cleanup_after_operation()
 
     @staticmethod
@@ -1486,6 +1671,7 @@ class ConsensusMergerLogic:
         settings,
         *,
         embedding_union,
+        boundary_handler=None,
     ):
         primary = handlers[0]
         keys = set()
@@ -1579,6 +1765,41 @@ class ConsensusMergerLogic:
                             continue
 
                     raw = {i: loaded[(i, key)] for i in source_indices}
+                    embedding_coalesce = bool(params.get("embedding_coalesce", False))
+                    vision_boundaries = bool(params.get("vision_boundary_embeddings", False))
+                    boundary_scores = []
+                    trimmed_rows = 0
+                    boundary_start = boundary_end = None
+                    if embedding_coalesce and vision_boundaries:
+                        if not all(tensor.ndim == 2 for tensor in raw.values()):
+                            raise ValueError(
+                                f"Vision boundary mode requires 2D embedding tensor '{key}'."
+                            )
+                        if params.get("legacy_boundary_search", False):
+                            if boundary_handler is None:
+                                raise ValueError(
+                                    "Legacy vision boundary search requires a boundary reference embedding."
+                                )
+                            boundary_start, boundary_end = _read_visual_boundary_reference(
+                                boundary_handler, key
+                            )
+                        else:
+                            anchor = raw[preserve_index]
+                            boundary_start = anchor[0].detach().clone()
+                            boundary_end = anchor[-1].detach().clone()
+                        prepared_raw = {}
+                        for source_index, tensor in raw.items():
+                            body, scores, trimmed = _prepare_vision_embedding(
+                                tensor,
+                                start_reference=boundary_start,
+                                end_reference=boundary_end,
+                                legacy_search=params.get("legacy_boundary_search", False),
+                                threshold=float(params["boundary_similarity_threshold"]),
+                            )
+                            prepared_raw[source_index] = body
+                            boundary_scores.extend(scores)
+                            trimmed_rows += trimmed
+                        raw = prepared_raw
                     reference_index = 0
                     if embedding_union:
                         reference_source = max(
@@ -1657,6 +1878,31 @@ class ConsensusMergerLogic:
                         operation_label=key,
                         diagnostics=params.get("_cwb_diagnostics"),
                     )
+                    if embedding_coalesce and merged.ndim == 2:
+                        before_rows = merged.shape[0]
+                        merged, pairs = coalesce_embedding_rows(
+                            merged,
+                            settings,
+                            target_vector_count=int(params["target_vector_count"]),
+                            similarity_threshold=float(params["coalesce_similarity_threshold"]),
+                            position_window=float(params["coalesce_position_window"]),
+                        )
+                        if vision_boundaries:
+                            merged = torch.cat((
+                                boundary_start.to(dtype=merged.dtype, device=merged.device).unsqueeze(0),
+                                merged,
+                                boundary_end.to(dtype=merged.dtype, device=merged.device).unsqueeze(0),
+                            ), dim=0)
+                        report = params.get("_embedding_coalesce_report")
+                        if report is not None:
+                            report.record(
+                                key,
+                                before_rows + (2 if vision_boundaries else 0),
+                                merged.shape[0],
+                                trimmed_rows,
+                                boundary_scores,
+                                pairs,
+                            )
                     writer.write_batch([(key, merged)])
                     del merged
                     if secondary_only:
@@ -2517,6 +2763,118 @@ class CWBEmbeddingThreeMerger(CWBEmbeddingTwoMerger):
     DEFAULT_FILENAME = "cwb_merged_3_embedding"
 
 
+def _embedding_coalesce_controls(default_filename: str):
+    embedding_options = folder_paths.get_filename_list("embeddings")
+    return [
+        io.Combo.Input("execution_mode", options=["MERGE", "DOCUMENTATION ONLY"], default="MERGE", tooltip="MERGE writes a new embedding. DOCUMENTATION ONLY opens no files."),
+        io.Combo.Input("cwb_preset", options=list(EMBEDDING_CWB_PRESETS), default="balanced_sim_mean", tooltip="Embedding CWB preset used for multi-input alignment and coalesced row pairs."),
+        CWB_CONFIG.Input("cwb_config", optional=True, tooltip="Optional complete CWB configuration override."),
+        io.Int.Input("target_vector_count", default=0, min=0, max=100000, step=1, tooltip="Target body-row count. Zero coalesces every eligible pair; otherwise stops at this count or when no eligible pair remains."),
+        io.Float.Input("coalesce_similarity_threshold", default=0.95, min=0.0, max=1.0, step=0.01, tooltip="Minimum cosine similarity for a mutual-nearest body-row pair to coalesce."),
+        io.Float.Input("coalesce_position_window", default=0.10, min=0.0, max=1.0, step=0.01, tooltip="Maximum normalized row-position distance for an eligible pair."),
+        io.Boolean.Input("vision_boundary_embeddings", default=False, tooltip="Enable for complete encoded visual blocks. Start/end rows are validated and preserved; False treats the full tensor as open textual inversion."),
+        io.Boolean.Input("legacy_boundary_search", default=False, tooltip="Search and trim legacy template rows using Boundary Reference Embedding. Requires vision boundary mode and a selected reference."),
+        io.Combo.Input("boundary_reference_embedding", options=["None", *embedding_options], default="None", tooltip="Known-clean visual block used by legacy boundary search. Its first and last encoded rows define vision start/end."),
+        io.Float.Input("boundary_similarity_threshold", default=0.95, min=-1.0, max=1.0, step=0.01, tooltip="Minimum encoded cosine similarity required independently for visual start and end validation."),
+        io.String.Input("output_filename", default=default_filename, tooltip="Filename without extension under ComfyUI's embeddings category."),
+        io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"], default="fp32", tooltip="Requested dtype for generated floating embedding tensors."),
+        io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda", tooltip="Per-tensor FP32 CWB arithmetic device; CUDA OOM retries that tensor on CPU."),
+        io.Boolean.Input("lazy_load", default=True, tooltip="Use bounded UEL streaming and release each tensor after its work unit."),
+        io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear Python and CUDA caches before each tensor at a possible speed cost."),
+        io.Boolean.Input("override_dtype", default=False, tooltip="Force generated floating tensors to Save Dtype."),
+    ]
+
+
+def _embedding_coalesce_params(kwargs: dict) -> dict:
+    return {
+        **kwargs,
+        "mismatch_mode": "error",
+        "exclude_patterns": "",
+        "discard_patterns": "",
+        "glob_patterns": False,
+        "include_1d_diffs": False,
+        "embedding_coalesce": True,
+        "_embedding_coalesce_report": EmbeddingCoalesceReport(
+            target_vector_count=int(kwargs["target_vector_count"]),
+            similarity_threshold=float(kwargs["coalesce_similarity_threshold"]),
+            position_window=float(kwargs["coalesce_position_window"]),
+            vision_boundary_embeddings=bool(kwargs["vision_boundary_embeddings"]),
+            legacy_boundary_search=bool(kwargs["legacy_boundary_search"]),
+            boundary_similarity_threshold=float(kwargs["boundary_similarity_threshold"]),
+            boundary_reference=None if kwargs["boundary_reference_embedding"] == "None" else kwargs["boundary_reference_embedding"],
+        ),
+        "_return_cwb_report": True,
+    }
+
+
+class CWBEmbeddingSelfCoalesce(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CWBEmbeddingSelfCoalesce",
+            display_name="CWB Embedding Self-Coalesce",
+            category="ModelUtils/Embeddings/Merge",
+            description="Reduce one embedding's locally similar encoded vectors with CWB while preserving optional visual boundaries.",
+            inputs=[
+                io.Combo.Input("embedding", options=folder_paths.get_filename_list("embeddings"), tooltip="Embedding to coalesce."),
+                *_embedding_coalesce_controls("cwb_coalesced_embedding"),
+            ],
+            outputs=[io.AnyType.Output(display_name="output_filename"), io.String.Output(display_name="documentation"), io.String.Output(display_name="cwb_report")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        documentation = load_documentation_from_file("consensus_mergers.md")
+        if kwargs["execution_mode"] == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", documentation, "CWB report unavailable because no merge was performed.")
+        if kwargs["legacy_boundary_search"] and not kwargs["vision_boundary_embeddings"]:
+            raise ValueError("Legacy boundary search requires Vision Boundary Embeddings.")
+        filename, report = ConsensusMergerLogic.execute(
+            [kwargs["embedding"]], "embeddings", _embedding_coalesce_params(kwargs), embedding_union=True
+        )
+        return io.NodeOutput(filename, documentation, report)
+
+
+class CWBEmbeddingMultiMerger(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        embeddings = folder_paths.get_filename_list("embeddings")
+        optional_embeddings = ["None", *embeddings]
+        return io.Schema(
+            node_id="CWBEmbeddingMultiMerger",
+            display_name="CWB Embedding Multi-Merge",
+            category="ModelUtils/Embeddings/Merge",
+            description="CWB-merge 2 to 8 embeddings, then coalesce locally similar output vectors.",
+            inputs=[
+                io.Combo.Input("embedding_count", options=[str(index) for index in range(2, 9)], default="2", tooltip="Number of consecutive embedding inputs to merge."),
+                io.Combo.Input("embedding_1", options=embeddings, tooltip="Primary embedding and normal visual-boundary anchor."),
+                io.Combo.Input("embedding_2", options=embeddings, tooltip="Second equal-prior embedding contributor."),
+                *[io.Combo.Input(f"embedding_{index}", options=optional_embeddings, default="None", tooltip="Optional embedding contributor.") for index in range(3, 9)],
+                *_embedding_coalesce_controls("cwb_merged_coalesced_embedding"),
+            ],
+            outputs=[io.AnyType.Output(display_name="output_filename"), io.String.Output(display_name="documentation"), io.String.Output(display_name="cwb_report")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        documentation = load_documentation_from_file("consensus_mergers.md")
+        if kwargs["execution_mode"] == "DOCUMENTATION ONLY":
+            return io.NodeOutput("Documentation mode active. No merge performed.", documentation, "CWB report unavailable because no merge was performed.")
+        if kwargs["legacy_boundary_search"] and not kwargs["vision_boundary_embeddings"]:
+            raise ValueError("Legacy boundary search requires Vision Boundary Embeddings.")
+        count = int(kwargs["embedding_count"])
+        names = [kwargs[f"embedding_{index}"] for index in range(1, count + 1)]
+        missing = [str(index) for index, name in enumerate(names, start=1) if not name or name == "None"]
+        if missing:
+            raise ValueError(f"Embedding Count includes unselected input(s): {', '.join(missing)}.")
+        filename, report = ConsensusMergerLogic.execute(
+            names, "embeddings", _embedding_coalesce_params(kwargs), embedding_union=True
+        )
+        return io.NodeOutput(filename, documentation, report)
+
+
 CWB_MERGER_NODES = [
     CWBCustomConfiguration,
     CWBCheckpointTwoMerger,
@@ -2530,4 +2888,6 @@ CWB_MERGER_NODES = [
     CWBLoRAMultiMerger,
     CWBEmbeddingTwoMerger,
     CWBEmbeddingThreeMerger,
+    CWBEmbeddingSelfCoalesce,
+    CWBEmbeddingMultiMerger,
 ]

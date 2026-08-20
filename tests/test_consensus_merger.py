@@ -588,9 +588,9 @@ def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
 
 
 def test_all_cwb_schemas_and_compact_control_contract(cwb):
-    assert len(cwb.CWB_MERGER_NODES) == 12
+    assert len(cwb.CWB_MERGER_NODES) == 14
     schemas = [node.define_schema() for node in cwb.CWB_MERGER_NODES]
-    assert len({schema.node_id for schema in schemas}) == 12
+    assert len({schema.node_id for schema in schemas}) == 14
     advanced = {
         "consensus_type", "alignment_method", "alignment_threshold",
         "similarity_threshold", "power_alpha", "diversity_beta",
@@ -622,6 +622,13 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
                 "include_1d_diffs",
                 "counterfactual_weight_sweep",
             ]
+            continue
+        if node in (cwb.CWBEmbeddingSelfCoalesce, cwb.CWBEmbeddingMultiMerger):
+            assert "vision_boundary_embeddings" in ids
+            assert "legacy_boundary_search" in ids
+            assert "boundary_reference_embedding" in ids
+            assert "boundary_similarity_threshold" in ids
+            assert "target_vector_count" in ids
             continue
         assert ids[:3] == ["execution_mode", "model_a", "model_b"]
         if node.INPUT_COUNT == 3:
@@ -900,6 +907,130 @@ def test_lora_multi_wrapper_validates_count_and_forwards_equal_prior_names(
     ]
     assert captured["model_type"] == "loras"
     assert captured["options"] == {"lora_mode": True}
+    assert result.result == ("merged.safetensors", "DOCS", "REPORT")
+
+
+def test_embedding_coalescing_uses_mutual_local_pairs(cwb):
+    rows = torch.tensor([
+        [1.0, 0.0],
+        [0.99, 0.01],
+        [0.0, 1.0],
+    ])
+    merged, pairs = cwb.coalesce_embedding_rows(
+        rows,
+        _settings(cwb),
+        target_vector_count=2,
+        similarity_threshold=0.95,
+        position_window=1.0,
+    )
+    assert merged.shape == (2, 2)
+    assert pairs == ((0, 1),)
+    torch.testing.assert_close(merged[1], rows[2])
+
+
+def test_visual_boundary_preparation_validates_and_searches_legacy_rows(cwb):
+    start = torch.tensor([1.0, 0.0])
+    end = torch.tensor([0.0, 1.0])
+    body = torch.tensor([[0.6, 0.4]])
+    legacy = torch.stack((torch.tensor([-1.0, 0.0]), start, body[0], end, torch.tensor([0.0, -1.0])))
+    prepared, scores, trimmed = cwb._prepare_vision_embedding(
+        legacy,
+        start_reference=start,
+        end_reference=end,
+        legacy_search=True,
+        threshold=0.99,
+    )
+    torch.testing.assert_close(prepared, body)
+    assert scores == pytest.approx((1.0, 1.0))
+    assert trimmed == 2
+
+    with pytest.raises(ValueError, match="Vision boundary validation failed"):
+        cwb._prepare_vision_embedding(
+            torch.stack((start, body[0], -end)),
+            start_reference=start,
+            end_reference=end,
+            legacy_search=False,
+            threshold=0.99,
+        )
+
+
+def test_embedding_self_coalesce_streams_and_restores_visual_boundaries(
+    monkeypatch, tmp_path, cwb
+):
+    source = tmp_path / "source.safetensors"
+    start = torch.tensor([1.0, 0.0])
+    end = torch.tensor([0.0, 1.0])
+    save_file({"visual": torch.stack((start, torch.tensor([0.99, 0.01]), torch.tensor([0.98, 0.02]), end))}, str(source))
+    _patch_io(monkeypatch, cwb, tmp_path, {"source": str(source)})
+    monkeypatch.setattr(cwb, "load_documentation_from_file", lambda _: "DOCS")
+    result = cwb.CWBEmbeddingSelfCoalesce.execute(
+        embedding="source",
+        execution_mode="MERGE",
+        cwb_preset="balanced_sim_mean",
+        cwb_config=_settings(cwb),
+        target_vector_count=1,
+        coalesce_similarity_threshold=0.95,
+        coalesce_position_window=1.0,
+        vision_boundary_embeddings=True,
+        legacy_boundary_search=False,
+        boundary_reference_embedding="None",
+        boundary_similarity_threshold=0.99,
+        output_filename="visual_coalesced",
+        save_dtype="fp32",
+        process_device="cpu",
+        lazy_load=True,
+        force_clear_cache=False,
+        override_dtype=False,
+    )
+    output = load_file(str(_result_path(tmp_path, "embeddings", result.result[0])))
+    assert output["visual"].shape == (3, 2)
+    torch.testing.assert_close(output["visual"][0], start)
+    torch.testing.assert_close(output["visual"][-1], end)
+    assert "CWB EMBEDDING COALESCING" in result.result[2]
+    assert "Similarity threshold: 0.9500" in result.result[2]
+
+
+def test_embedding_multi_wrapper_forwards_selected_inputs(monkeypatch, cwb):
+    kwargs = {
+        "execution_mode": "MERGE",
+        "embedding_count": "3",
+        "embedding_1": "a.safetensors",
+        "embedding_2": "b.safetensors",
+        "embedding_3": "c.safetensors",
+        "embedding_4": "None",
+        "embedding_5": "None",
+        "embedding_6": "None",
+        "embedding_7": "None",
+        "embedding_8": "None",
+        "cwb_preset": "balanced_sim_mean",
+        "cwb_config": None,
+        "target_vector_count": 0,
+        "coalesce_similarity_threshold": 0.95,
+        "coalesce_position_window": 0.1,
+        "vision_boundary_embeddings": False,
+        "legacy_boundary_search": False,
+        "boundary_reference_embedding": "None",
+        "boundary_similarity_threshold": 0.95,
+        "output_filename": "merged",
+        "save_dtype": "fp32",
+        "process_device": "cpu",
+        "lazy_load": True,
+        "force_clear_cache": False,
+        "override_dtype": False,
+    }
+    monkeypatch.setattr(cwb, "load_documentation_from_file", lambda _: "DOCS")
+    captured = {}
+
+    def execute(names, model_type, params, **options):
+        captured.update(names=names, model_type=model_type, params=params, options=options)
+        return "merged.safetensors", "REPORT"
+
+    monkeypatch.setattr(cwb.ConsensusMergerLogic, "execute", execute)
+    result = cwb.CWBEmbeddingMultiMerger.execute(**kwargs)
+    assert captured["names"] == ["a.safetensors", "b.safetensors", "c.safetensors"]
+    assert captured["model_type"] == "embeddings"
+    assert captured["options"] == {"embedding_union": True}
+    assert captured["params"]["embedding_coalesce"] is True
     assert result.result == ("merged.safetensors", "DOCS", "REPORT")
 
 
