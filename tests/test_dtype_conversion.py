@@ -65,6 +65,7 @@ def test_schema_is_diffusion_model_scoped(conversion):
     assert [item.id for item in schema.inputs] == [
         "model_name",
         "target_dtype",
+        "reference_model",
         "exclude_patterns",
         "output_filename",
     ]
@@ -73,6 +74,47 @@ def test_schema_is_diffusion_model_scoped(conversion):
         "output_path",
         "conversion_report",
     ]
+
+
+def test_reference_model_dtypes_override_target_without_tensor_loading(
+    monkeypatch, tmp_path, conversion
+):
+    source = tmp_path / "source.safetensors"
+    reference = tmp_path / "reference.safetensors"
+    _write_uel(source, {
+        "mapped_bf16": torch.ones(2, dtype=torch.float32),
+        "mapped_fp32": torch.ones(2, dtype=torch.float16),
+        "fallback": torch.ones(2, dtype=torch.float32),
+        "nonfloating": torch.tensor([1], dtype=torch.int64),
+    })
+    _write_uel(reference, {
+        "mapped_bf16": torch.ones(2, dtype=torch.bfloat16),
+        "mapped_fp32": torch.ones(2, dtype=torch.float32),
+        "nonfloating": torch.tensor([1], dtype=torch.int64),
+    })
+    monkeypatch.setattr(conversion.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(
+        conversion.folder_paths,
+        "get_full_path_or_raise",
+        lambda _, name: {"source": str(source), "reference": str(reference)}[name],
+    )
+    monkeypatch.setattr(conversion, "cleanup_after_operation", lambda: None)
+    monkeypatch.setattr(
+        conversion.MemoryEfficientSafeOpen,
+        "get_tensor",
+        lambda *args, **kwargs: pytest.fail("synchronous reference loading was used"),
+    )
+
+    output_path, report = conversion.convert_diffusion_model_dtype(
+        "source", "fp16", "", "reference_mapped", "reference"
+    )
+    result, _ = _read_uel(tmp_path / "diffusion_models" / output_path)
+    assert result["mapped_bf16"].dtype == torch.bfloat16
+    assert result["mapped_fp32"].dtype == torch.float32
+    assert result["fallback"].dtype == torch.float16
+    assert result["nonfloating"].dtype == torch.int64
+    assert "Reference-mapped floating tensors: 2" in report
+    assert "Reference-missing fallback tensors: 1" in report
 
 
 @pytest.mark.parametrize(

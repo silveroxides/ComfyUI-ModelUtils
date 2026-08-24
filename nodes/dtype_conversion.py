@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
+from contextlib import nullcontext
 
 import comfy.utils
 import folder_paths
@@ -53,6 +54,7 @@ def convert_diffusion_model_dtype(
     target_dtype: str,
     exclude_patterns: str,
     output_filename: str,
+    reference_model: str | None = None,
 ) -> tuple[str, str]:
     try:
         destination_dtype = TARGET_DTYPES[target_dtype]
@@ -71,10 +73,19 @@ def convert_diffusion_model_dtype(
     exclusions = _compile_exclusions(exclude_patterns)
     counts = Counter()
     original_dtypes = Counter()
+    reference_path = None
+    if reference_model and reference_model != "None":
+        reference_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models", reference_model
+        )
 
     try:
-        with MemoryEfficientSafeOpen(source_path, low_memory=True) as loader:
+        with MemoryEfficientSafeOpen(source_path, low_memory=True) as loader, (
+            MemoryEfficientSafeOpen(reference_path, low_memory=True)
+            if reference_path else nullcontext()
+        ) as reference_loader:
             metadata = (loader.metadata() or {}).copy()
+            reference_keys = set(reference_loader.keys()) if reference_loader else set()
             with atomic_uel_writer(output_path, metadata) as writer:
                 keys = list(loader.keys())
                 progress = comfy.utils.ProgressBar(len(keys))
@@ -97,6 +108,22 @@ def convert_diffusion_model_dtype(
                         counts["excluded"] += 1
                     elif not source.is_floating_point():
                         counts["non_floating"] += 1
+                    elif reference_loader is not None and key in reference_keys:
+                        reference_dtype = reference_loader.get_dtype(key)
+                        if not reference_dtype.is_floating_point:
+                            raise ValueError(
+                                f"Reference tensor '{key}' is {reference_dtype}, but the input tensor is floating."
+                            )
+                        if source.dtype == reference_dtype:
+                            counts["reference_already_matched"] += 1
+                        else:
+                            output = source.to(dtype=reference_dtype).contiguous()
+                            counts["reference_mapped"] += 1
+                    elif reference_loader is not None:
+                        output = source if source.dtype == destination_dtype else source.to(
+                            dtype=destination_dtype
+                        ).contiguous()
+                        counts["reference_missing_fallback"] += 1
                     elif source.dtype == destination_dtype:
                         counts["already_target"] += 1
                     else:
@@ -121,12 +148,16 @@ def convert_diffusion_model_dtype(
         (
             "DIFFUSION MODEL DTYPE CONVERSION",
             f"Input: {model_name}",
+            f"Reference model: {reference_model or 'None'}",
             f"Output: {output_name}",
             f"Target dtype: {target_dtype}",
             f"Total tensors: {total}",
             f"Converted floating tensors: {counts['converted']}",
             f"Excluded tensors preserved: {counts['excluded']}",
             f"Already target dtype: {counts['already_target']}",
+            f"Reference-mapped floating tensors: {counts['reference_mapped']}",
+            f"Reference dtype already matched: {counts['reference_already_matched']}",
+            f"Reference-missing fallback tensors: {counts['reference_missing_fallback']}",
             f"Non-floating tensors preserved: {counts['non_floating']}",
             f"Original dtype counts: {dtype_summary or 'None'}",
         )
@@ -156,6 +187,12 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
                     "target_dtype", options=["fp32", "fp16", "bf16"],
                     tooltip="Target dtype for floating tensors not matched by an exclusion pattern.",
                 ),
+                io.Combo.Input(
+                    "reference_model",
+                    options=["None", *folder_paths.get_filename_list("diffusion_models")],
+                    default="None",
+                    tooltip="Optional authoritative dtype map. Matching floating tensor keys use this model's header dtype without loading its tensors; missing keys use Target Dtype.",
+                ),
                 io.String.Input(
                     "exclude_patterns",
                     default="",
@@ -182,6 +219,7 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
         cls,
         model_name: str,
         target_dtype: str,
+        reference_model: str,
         exclude_patterns: str,
         output_filename: str,
     ) -> io.NodeOutput:
@@ -190,5 +228,6 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
             target_dtype,
             exclude_patterns,
             output_filename,
+            reference_model,
         )
         return io.NodeOutput(output_path, report)
