@@ -177,13 +177,17 @@ Dense nodes offer `balanced_mean`, `robust_medn`, `selective_mean`,
 
 Embedding nodes offer `balanced_idx_mean`, `balanced_sim_mean`,
 `robust_idx_medn`, `robust_sim_medn`, `varied_sim_mean_rn_softcb`, and
-`diverse_sim_medn_rn_dsc_softcb`.
+`diverse_sim_medn_rn_dsc_softcb`, `focused_strong_sim_medn`,
+`focused_balance_sim_medn`, `focused_soft_sim_medn`, and
+`focused_weak_sim_medn`.
 
 LoRA nodes offer `broad_sim_medn_rn_softcb`,
 `moderate_sim_medn_rn_softcb`, `conservative_sim_medn_rn_softcb`,
 `direct_idx_medn_rn_softcb`, `broad_sim_mean_rn_softcb`,
 `neutral_sim_medn_rn`, `focused_sim_medn_rn_dsc_softcb`, and
-`strongfocus_sim_medn_rn_dsc_softcb`.
+`strongfocus_sim_medn_rn_dsc_softcb`, `focused_strong_sim_medn`,
+`focused_balance_sim_medn`, `focused_soft_sim_medn`, and
+`focused_weak_sim_medn`.
 
 The LoRA default is `broad_sim_medn_rn_softcb`: median consensus,
 similarity alignment, zero similarity threshold, alpha 2, beta 4, norm
@@ -204,6 +208,13 @@ Every LoRA preset fixes all 12 controls explicitly:
 | `neutral_sim_medn_rn` | median | similarity | 0 | 0 | 2 | 0 | on | 1 | off | off | 0.05 | off | Similarity weighting without diversity modulation |
 | `focused_sim_medn_rn_dsc_softcb` | median | similarity | 0 | 0 | 2 | 4 | on | 1 | on | on | 0.05 | off | Moderate DSC concentration |
 | `strongfocus_sim_medn_rn_dsc_softcb` | median | similarity | 0 | 0 | 2 | 7 | on | 1 | on | on | 0.05 | off | Strong DSC concentration |
+| `focused_strong_sim_medn` | median | similarity | 0.85 | 0.60 | 1.25 | 0 | off | 1 | off | off | 0.20 | off | Strongly focused matching |
+| `focused_balance_sim_medn` | median | similarity | 0.75 | 0.55 | 1.25 | 0 | off | 1 | off | off | 0.20 | off | Balanced focused matching |
+| `focused_soft_sim_medn` | median | similarity | 0.55 | 0.50 | 1.25 | 0 | off | 1 | off | off | 0.20 | off | Soft focused matching |
+| `focused_weak_sim_medn` | median | similarity | 0.25 | 0.35 | 1.25 | 0 | off | 1 | off | off | 0.20 | off | Weak focused matching |
+
+The four focused median similarity presets have identical settings in the
+embedding and LoRA registries.
 
 The LoRA Multi-Merge counterfactual weight sweep reuses each consensus vector
 already computed by the active merge. It reports mean and median consensus

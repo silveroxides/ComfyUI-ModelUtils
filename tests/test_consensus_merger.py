@@ -135,6 +135,39 @@ def test_lora_alignment_presets_use_sweep_verified_thresholds(cwb):
     ] == pytest.approx(0.0025)
 
 
+@pytest.mark.parametrize(
+    ("registry_name", "preset", "alignment_threshold", "similarity_threshold"),
+    [
+        (registry_name, preset, alignment_threshold, similarity_threshold)
+        for registry_name in ("EMBEDDING_CWB_PRESETS", "LORA_CWB_PRESETS")
+        for preset, alignment_threshold, similarity_threshold in (
+            ("focused_strong_sim_medn", 0.85, 0.60),
+            ("focused_balance_sim_medn", 0.75, 0.55),
+            ("focused_soft_sim_medn", 0.55, 0.50),
+            ("focused_weak_sim_medn", 0.25, 0.35),
+        )
+    ],
+)
+def test_focused_median_similarity_presets(
+    cwb, registry_name, preset, alignment_threshold, similarity_threshold
+):
+    settings = getattr(cwb, registry_name)[preset]
+    assert settings == {
+        "consensus_type": "median",
+        "alignment_method": "similarity",
+        "alignment_threshold": alignment_threshold,
+        "similarity_threshold": similarity_threshold,
+        "power_alpha": 1.25,
+        "diversity_beta": 0.0,
+        "rescale_norm": False,
+        "global_scale": 1.0,
+        "dynamic_similarity_contrast": False,
+        "soft_comfort_bandpass": False,
+        "position_weight": 0.20,
+        "preserve_common_prefix": False,
+    }
+
+
 def test_cwb_math_index_prefix_and_scale(cwb):
     settings = _settings(
         cwb,
@@ -647,7 +680,7 @@ def test_use_case_preset_names_match_complete_settings(cwb):
         cwb.EMBEDDING_CWB_PRESETS,
         cwb.LORA_CWB_PRESETS,
     ):
-        assert 6 <= len(registry) <= 8
+        assert len(registry) >= 6
         for name, values in registry.items():
             assert set(values) == fields
             assert ("_rn" in name) is values["rescale_norm"]
