@@ -241,6 +241,12 @@ alignment, weighting, or merge. Genuine factor ranks remain variable during
 CWB. The first maximum-rank input supplies the output component space, so the
 output rank remains the largest genuine input rank. Merged outputs never
 contain or invent alpha tensors.
+
+Every CWB merge node writes a `cwb.merge` safetensors metadata record. It
+contains selected source model names, fully resolved CWB settings, and merge
+options. Presets are stored as effective settings rather than by preset name.
+Non-empty exclude/discard filters and their glob mode are included. CWB reports
+and diagnostics are not saved in metadata.
 Similarity alignment operates on paired latent-rank components. A rows and B
 columns share one mapping; fixed input/output feature axes are never reordered.
 For a rank-R reference and rank-r source it evaluates an R-by-r similarity

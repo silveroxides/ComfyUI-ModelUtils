@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
 import comfy.utils
@@ -794,6 +795,51 @@ def build_custom_cwb_settings(**values) -> CWBSettings:
     if not 0.0 <= settings.position_weight <= 1.0:
         raise ValueError("Position weight must be between 0.0 and 1.0.")
     return settings
+
+
+def _cwb_merge_metadata(
+    source_models: list[str],
+    params: dict,
+    settings: CWBSettings,
+    *,
+    operation: str,
+) -> str:
+    metadata = {
+        "schema_version": 1,
+        "operation": operation,
+        "source_models": source_models,
+        "effective_cwb_settings": asdict(settings),
+        "merge_options": {},
+    }
+    for key in (
+        "mismatch_mode",
+        "save_dtype",
+        "process_device",
+        "lazy_load",
+        "force_clear_cache",
+        "override_dtype",
+        "include_1d_diffs",
+        "counterfactual_weight_sweep",
+        "embedding_coalesce",
+        "target_vector_count",
+        "coalesce_similarity_threshold",
+        "coalesce_position_window",
+        "vision_boundary_embeddings",
+        "legacy_boundary_search",
+        "boundary_reference_embedding",
+        "boundary_similarity_threshold",
+    ):
+        if key in params:
+            metadata["merge_options"][key] = params[key]
+    exclude_patterns = params["exclude_patterns"].split()
+    discard_patterns = params["discard_patterns"].split()
+    if exclude_patterns or discard_patterns:
+        metadata["filters"] = {
+            "exclude_patterns": exclude_patterns,
+            "discard_patterns": discard_patterns,
+            "glob_patterns": params["glob_patterns"],
+        }
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
 
 
 def _common_prefix_length(tensors: list[torch.Tensor]) -> int:
@@ -1622,7 +1668,7 @@ class ConsensusMergerLogic:
             )
             if lora_mode:
                 result = cls._merge_loras(
-                    handlers, low_bit_sets, model_type, params, settings
+                    handlers, low_bit_sets, model_type, params, settings, model_names
                 )
             else:
                 result = cls._merge_generic(
@@ -1633,6 +1679,7 @@ class ConsensusMergerLogic:
                     settings,
                     embedding_union=embedding_union,
                     boundary_handler=boundary_handler,
+                    source_models=model_names,
                 )
             if params.get("_return_cwb_report"):
                 report = diagnostics.render(
@@ -1672,6 +1719,7 @@ class ConsensusMergerLogic:
         *,
         embedding_union,
         boundary_handler=None,
+        source_models,
     ):
         primary = handlers[0]
         keys = set()
@@ -1699,7 +1747,14 @@ class ConsensusMergerLogic:
             }
             work_units.append((key, entries))
 
-        with atomic_uel_writer(output_path, primary.metadata()) as writer, torch.no_grad(), closing(
+        output_metadata = (primary.metadata() or {}).copy()
+        output_metadata["cwb.merge"] = _cwb_merge_metadata(
+            source_models,
+            params,
+            settings,
+            operation="cwb_embedding_merge" if embedding_union else "cwb_tensor_merge",
+        )
+        with atomic_uel_writer(output_path, output_metadata) as writer, torch.no_grad(), closing(
             stream_work_units(
                 handler_map, work_units,
                 pin_memory=str(params["process_device"]).startswith("cuda"),
@@ -1917,7 +1972,9 @@ class ConsensusMergerLogic:
         return cls._output_name(model_type, output_path)
 
     @classmethod
-    def _merge_loras(cls, handlers, low_bit_sets, model_type, params, settings):
+    def _merge_loras(
+        cls, handlers, low_bit_sets, model_type, params, settings, source_loras
+    ):
         parsed = [parse_lora_layers(handler.keys()) for handler in handlers]
         logical_maps = []
         logical_cores = []
@@ -2077,6 +2134,9 @@ class ConsensusMergerLogic:
             work_units.append((("passthrough", key), entries))
 
         output_metadata = (handlers[0].metadata() or {}).copy()
+        output_metadata["cwb.merge"] = _cwb_merge_metadata(
+            source_loras, params, settings, operation="cwb_lora_merge"
+        )
         output_metadata["alpha_normalized"] = "true"
         output_metadata["alpha_normalization"] = (
             "lora_up := lora_up * (alpha / rank); alpha tensors removed"
