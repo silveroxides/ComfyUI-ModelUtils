@@ -13,6 +13,7 @@ MIGRATED_SAVE_MODULES = (
     "consensus_merger.py",
     "merger.py",
     "lora_merger.py",
+    "lodestone_merger.py",
     "lora_resize.py",
     "dtype_conversion.py",
     "lora_extract_svd.py",

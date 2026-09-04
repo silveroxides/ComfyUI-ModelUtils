@@ -21,6 +21,7 @@ from .nodes.merger import (
     CheckpointThreeMerger, EmbeddingThreeMerger
 )
 from .nodes.consensus_merger import CWB_MERGER_NODES
+from .nodes.lodestone_merger import LODESTONE_MERGER_NODES
 from .nodes.model_analysis import MODEL_ANALYSIS_NODES
 from .nodes.lora_extract_svd import (
     LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
@@ -81,6 +82,8 @@ class ModelUtilsExtension(ComfyExtension):
             CheckpointThreeMerger, EmbeddingThreeMerger,
             # Dedicated CWB Mergers
             *CWB_MERGER_NODES,
+            # Dedicated Lodestone LoRA Mergers
+            *LODESTONE_MERGER_NODES,
             # Two-Model Analysis
             *MODEL_ANALYSIS_NODES,
             # LoRA Extraction
