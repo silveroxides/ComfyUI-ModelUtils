@@ -9,17 +9,17 @@ python_tests = [
 paths = [
   "nodes/artifact_paths.py", "nodes/dora_extract_wd.py",
   "nodes/dora_learned_wd.py", "nodes/dtype_conversion.py",
-  "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
+  "nodes/cwb_delta_lora_merger.py", "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
   "nodes/lora_rename.py", "nodes/lora_resize.py", "nodes/merger.py",
   "nodes/prunekeys.py", "nodes/renamekeys.py", "nodes/text_encoder_extract.py",
 ]
 python_tests = ["tests/test_artifact_paths.py"]
 
 [groups.cwb]
-paths = ["nodes/consensus_merger.py", "run_cwb_api_workflow.py", "run_cwb_preset_sweep.py"]
+paths = ["nodes/consensus_merger.py", "nodes/cwb_delta_lora_merger.py", "run_cwb_api_workflow.py", "run_cwb_preset_sweep.py"]
 python_tests = [
   "tests/test_consensus_merger.py", "tests/test_cwb_api_runner.py",
-  "tests/test_cwb_preset_sweep.py",
+  "tests/test_cwb_delta_lora_merger.py", "tests/test_cwb_preset_sweep.py",
 ]
 
 [groups.model_analysis]
@@ -36,12 +36,12 @@ python_tests = ["tests/test_adaptive_extraction_pipeline.py", "tests/test_knee_p
 
 [groups.lora_merge]
 paths = [
-  "nodes/device_utils.py", "nodes/lodestone_merger.py", "nodes/lora_alpha.py",
+  "nodes/cwb_delta_lora_merger.py", "nodes/device_utils.py", "nodes/lodestone_merger.py", "nodes/lora_alpha.py",
   "nodes/lora_merger.py", "nodes/quantization_guard.py", "nodes/uel_io.py",
 ]
 python_tests = [
   "tests/test_lora_diff_dtype_contract.py", "tests/test_lora_merger_async.py",
-  "tests/test_lodestone_merger.py", "tests/test_lora_quantization_guard.py",
+  "tests/test_cwb_delta_lora_merger.py", "tests/test_lodestone_merger.py", "tests/test_lora_quantization_guard.py",
 ]
 
 [groups.lora_resize]

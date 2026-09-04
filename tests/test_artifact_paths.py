@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "modelutils_artifact_path_tests"
 MIGRATED_SAVE_MODULES = (
     "consensus_merger.py",
+    "cwb_delta_lora_merger.py",
     "merger.py",
     "lora_merger.py",
     "lodestone_merger.py",
