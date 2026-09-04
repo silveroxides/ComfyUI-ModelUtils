@@ -10,9 +10,10 @@ import folder_paths
 import comfy.utils
 from tqdm import tqdm
 from comfy_api.latest import io
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 from .lora_resize import (
+    build_lora_layer_map,
     canonical_lora_key,
     detect_lora_format,
     layer_has_companions,
@@ -27,88 +28,6 @@ from .lora_alpha import normalize_lora_pair
 from .artifact_paths import canonical_model_artifact_path
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
-
-
-BASE_PREFIXES = ["model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net."]
-LORA_PREFIXES = [
-    "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
-    "lycoris_", "diffusion_model.", "transformer.", "unet.",
-]
-
-
-def _strip_prefix(value: str, prefixes: List[str]) -> str:
-    for prefix in prefixes:
-        if value.startswith(prefix):
-            return value[len(prefix):]
-    return value
-
-
-def _lora_core(block_name: str) -> str:
-    core = _strip_prefix(block_name, LORA_PREFIXES)
-    if core.endswith(".lora"):
-        core = core[:-5]
-    return core
-
-
-def _build_layer_map(lora_infos: List[Dict], base_model_path: Optional[str]) -> Dict[str, List[Tuple[int, str]]]:
-    """Build a union map while optionally normalizing names against a reference model."""
-    if not base_model_path:
-        layer_map = {}
-        for idx, info in enumerate(lora_infos):
-            for block_name in info["pairs"]:
-                layer_map.setdefault(block_name, []).append((idx, block_name))
-        return layer_map
-
-    with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
-        base_keys = list(base_handler.keys())
-
-    normalized_base = {}
-    for base_key in base_keys:
-        normalized = _strip_prefix(base_key, BASE_PREFIXES)
-        normalized_base[normalized] = base_key
-        normalized_base[normalized.replace(".", "_")] = base_key
-
-    layer_map = {}
-    mapped = set()
-    for idx, info in enumerate(lora_infos):
-        for block_name, block_keys in info["pairs"].items():
-            core = _lora_core(block_name)
-            target = None
-            if "down" in block_keys or "up" in block_keys:
-                candidate = f"{core}.weight"
-                target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
-            elif "diff_b" in block_keys or "b_norm" in block_keys:
-                candidate = f"{core}.bias"
-                target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
-            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
-                target = normalized_base.get(core) or normalized_base.get(core.replace(".", "_"))
-                if target is None:
-                    candidate = f"{core}.weight"
-                    target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
-
-            if target is None:
-                continue
-            normalized_target = _strip_prefix(target, BASE_PREFIXES)
-            if ("diff_b" in block_keys or "b_norm" in block_keys) and normalized_target.endswith(".bias"):
-                output_core = normalized_target[:-5]
-            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")) and normalized_target.endswith(".weight"):
-                output_core = normalized_target[:-7]
-            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
-                output_core = normalized_target
-            else:
-                output_core = normalized_target[:-7] if normalized_target.endswith(".weight") else normalized_target
-            output_core = f"diffusion_model.{output_core}"
-            layer_map.setdefault(output_core, []).append((idx, block_name))
-            mapped.add((idx, block_name))
-
-    # Direct patches must not disappear merely because a reference model cannot resolve them.
-    for idx, info in enumerate(lora_infos):
-        for block_name, block_keys in info["pairs"].items():
-            if (idx, block_name) not in mapped and any(
-                role in block_keys for role in ("diff", "diff_b", "w_norm", "b_norm", "set_weight")
-            ):
-                layer_map.setdefault(block_name, []).append((idx, block_name))
-    return layer_map
 
 
 def _logical_output_dtypes(indices, lora_infos, handlers):
@@ -727,9 +646,9 @@ def _run_multi_lora_merge(
                     f"format={info['format']['format']}"
                 )
 
-        layer_map = _build_layer_map(lora_infos, base_model_path)
-        validate_canonical_blocks(layer_map, operation)
+        layer_map = build_lora_layer_map(lora_infos, base_model_path)
         _ensure_guarded_layers_mapped(layer_map, lora_infos)
+        validate_canonical_blocks(layer_map, operation)
         units, stream_keys = _build_merge_work_units(
             layer_map, lora_infos, handlers, include_1d_diffs
         )

@@ -274,6 +274,50 @@ def test_normalize_alpha_rejects_alpha_free_input(monkeypatch, tmp_path, resize)
         )
 
 
+def test_normalize_alpha_maps_flattened_names_with_reference(
+    monkeypatch, tmp_path, resize
+):
+    source = tmp_path / "flattened_alpha.safetensors"
+    reference = tmp_path / "reference.safetensors"
+    down = torch.eye(2, dtype=torch.float16)
+    up = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=torch.float16)
+    _write_uel(
+        source,
+        {
+            "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight": down,
+            "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight": up,
+            "lora_unet_double_blocks_0_img_attn_qkv.alpha": torch.tensor(1.0),
+        },
+    )
+    _write_uel(
+        reference,
+        {"diffusion_model.double_blocks.0.img_attn.qkv.weight": torch.eye(2)},
+    )
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    output = resize.normalize_lora_alpha_file(
+        str(source),
+        "reference_mapped_alpha",
+        verbose=False,
+        reference_model_path=str(reference),
+    )
+
+    output_tensors = _read_uel(output)
+    assert set(output_tensors) == {
+        "diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight",
+        "diffusion_model.double_blocks.0.img_attn.qkv.lora_B.weight",
+    }
+    assert torch.equal(
+        output_tensors["diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight"],
+        down,
+    )
+    assert torch.equal(
+        output_tensors["diffusion_model.double_blocks.0.img_attn.qkv.lora_B.weight"],
+        up * 0.5,
+    )
+
+
 def test_resize_does_not_invent_alpha_for_peft_pair(monkeypatch, tmp_path, resize):
     source = tmp_path / "peft_no_alpha.safetensors"
     _write_uel(

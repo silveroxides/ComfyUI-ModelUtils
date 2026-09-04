@@ -57,6 +57,14 @@ LORA_AUX_SUFFIXES = (
 CANONICAL_DOWN_SUFFIX = ".lora_A.weight"
 CANONICAL_UP_SUFFIX = ".lora_B.weight"
 
+BASE_MODEL_KEY_PREFIXES = (
+    "model.diffusion_model.", "diffusion_model.", "transformer.", "model.", "net.",
+)
+LORA_BLOCK_PREFIXES = (
+    "lora_unet_", "lora_transformer_", "lora_te1_", "lora_te2_", "lora_te_",
+    "lycoris_", "diffusion_model.", "transformer.", "unet.",
+)
+
 
 def canonical_lora_block_name(block_name: str) -> str:
     """Return the preferred generic ComfyUI diffusion-model LoRA root."""
@@ -108,6 +116,77 @@ def canonical_lora_key(block_name: str, role: str) -> str:
         "set_weight": ".set_weight",
     }
     return f"{root}{suffixes[role]}"
+
+
+def _strip_lora_prefix(value: str, prefixes) -> str:
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def build_lora_layer_map(
+    lora_infos: List[Dict], base_model_path: Optional[str]
+) -> Dict[str, List[Tuple[int, str]]]:
+    """Map parsed LoRA blocks to a reference model using existing merge rules."""
+    if not base_model_path:
+        layer_map = {}
+        for idx, info in enumerate(lora_infos):
+            for block_name in info["pairs"]:
+                layer_map.setdefault(block_name, []).append((idx, block_name))
+        return layer_map
+
+    with MemoryEfficientSafeOpen(base_model_path, low_memory=True) as base_handler:
+        base_keys = list(base_handler.keys())
+
+    normalized_base = {}
+    for base_key in base_keys:
+        normalized = _strip_lora_prefix(base_key, BASE_MODEL_KEY_PREFIXES)
+        normalized_base[normalized] = base_key
+        normalized_base[normalized.replace(".", "_")] = base_key
+
+    layer_map = {}
+    mapped = set()
+    for idx, info in enumerate(lora_infos):
+        for block_name, block_keys in info["pairs"].items():
+            core = _strip_lora_prefix(block_name, LORA_BLOCK_PREFIXES)
+            if core.endswith(".lora"):
+                core = core[:-5]
+            target = None
+            if "down" in block_keys or "up" in block_keys:
+                candidate = f"{core}.weight"
+                target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
+            elif "diff_b" in block_keys or "b_norm" in block_keys:
+                candidate = f"{core}.bias"
+                target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
+                target = normalized_base.get(core) or normalized_base.get(core.replace(".", "_"))
+                if target is None:
+                    candidate = f"{core}.weight"
+                    target = normalized_base.get(candidate) or normalized_base.get(candidate.replace(".", "_"))
+
+            if target is None:
+                continue
+            normalized_target = _strip_lora_prefix(target, BASE_MODEL_KEY_PREFIXES)
+            if ("diff_b" in block_keys or "b_norm" in block_keys) and normalized_target.endswith(".bias"):
+                output_core = normalized_target[:-5]
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")) and normalized_target.endswith(".weight"):
+                output_core = normalized_target[:-7]
+            elif any(role in block_keys for role in ("diff", "w_norm", "set_weight")):
+                output_core = normalized_target
+            else:
+                output_core = normalized_target[:-7] if normalized_target.endswith(".weight") else normalized_target
+            output_core = f"diffusion_model.{output_core}"
+            layer_map.setdefault(output_core, []).append((idx, block_name))
+            mapped.add((idx, block_name))
+
+    for idx, info in enumerate(lora_infos):
+        for block_name, block_keys in info["pairs"].items():
+            if (idx, block_name) not in mapped and any(
+                role in block_keys for role in ("diff", "diff_b", "w_norm", "b_norm", "set_weight")
+            ):
+                layer_map.setdefault(block_name, []).append((idx, block_name))
+    return layer_map
 
 
 def layer_tensor_keys(layer: Dict[str, str]) -> Dict[str, str]:
@@ -637,6 +716,7 @@ def normalize_lora_alpha_file(
     lora_path: str,
     output_filename: str,
     verbose: bool = True,
+    reference_model_path: Optional[str] = None,
 ) -> str:
     """Materialize LoRA alpha scaling and remove alpha tensors."""
     handler = MemoryEfficientSafeOpen(lora_path, low_memory=True)
@@ -647,6 +727,21 @@ def normalize_lora_alpha_file(
         metadata = (handler.metadata() or {}).copy()
         all_keys = handler.keys()
         pairs, _ = parse_lora_layers(all_keys)
+        output_keys = {}
+        mapped_blocks = {}
+        if reference_model_path:
+            layer_map = build_lora_layer_map(
+                [{"pairs": pairs}], reference_model_path
+            )
+            validate_canonical_blocks(layer_map, "LoRA Alpha Normalize")
+            mapped_blocks = {
+                source_block: output_block
+                for output_block, sources in layer_map.items()
+                for _, source_block in sources
+            }
+            for block_name, output_block in mapped_blocks.items():
+                for role, source_key in layer_tensor_keys(pairs[block_name]).items():
+                    output_keys[source_key] = canonical_lora_key(output_block, role)
 
         work_units = []
         normalized_up_keys = set()
@@ -697,7 +792,13 @@ def normalize_lora_alpha_file(
             for key in all_keys:
                 if key in all_alpha_keys or key in normalized_up_keys:
                     continue
-                write_preserved_tensor(writer, key, handler, force_raw=True)
+                write_preserved_tensor(
+                    writer,
+                    key,
+                    handler,
+                    output_key=output_keys.get(key),
+                    force_raw=True,
+                )
 
             with torch.no_grad():
                 iterator = stream_work_units(
@@ -725,7 +826,10 @@ def normalize_lora_alpha_file(
                                     .to(dtype=up.dtype)
                                     .contiguous()
                                 )
-                            writer.write_batch([(up_key, output.cpu().contiguous())])
+                            writer.write_batch([(
+                                output_keys.get(up_key, up_key),
+                                output.cpu().contiguous(),
+                            )])
                         finally:
                             del output
                             del up
@@ -737,6 +841,10 @@ def normalize_lora_alpha_file(
             print(
                 f"[LoRA Alpha Normalize] Removed {len(work_units)} alpha tensors"
             )
+            if reference_model_path:
+                print(
+                    f"[LoRA Alpha Normalize] Reference-mapped {len(mapped_blocks)} LoRA layers"
+                )
             print(f"[LoRA Alpha Normalize] Saved to {output_path}")
         return output_path
     finally:
@@ -1028,15 +1136,30 @@ class LoRANormalizeAlpha(io.ComfyNode):
                     default="normalized_lora",
                     tooltip="Output filename without extension, written under ComfyUI's LoRA directory.",
                 ),
+                io.Combo.Input(
+                    "reference_model",
+                    options=["None", *folder_paths.get_filename_list("diffusion_models")],
+                    default="None",
+                    tooltip="Optional diffusion model used to normalize flattened LoRA layer names to its exact model paths.",
+                ),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, output_filename) -> io.NodeOutput:
+    def execute(cls, lora_name, output_filename, reference_model="None") -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        normalize_lora_alpha_file(lora_path, output_filename)
+        reference_path = None
+        if reference_model != "None":
+            reference_path = folder_paths.get_full_path_or_raise(
+                "diffusion_models", reference_model
+            )
+        normalize_lora_alpha_file(
+            lora_path,
+            output_filename,
+            reference_model_path=reference_path,
+        )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
 
