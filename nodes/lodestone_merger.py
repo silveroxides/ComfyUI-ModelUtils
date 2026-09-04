@@ -236,14 +236,14 @@ def merge_lodestone_loras(lora_paths, method, device, save_dtype, output_filenam
 
 def _controls(default_filename):
     return [
-        io.Combo.Input("calc_mode", options=list(LODESTONE_METHODS), default="sum", tooltip="Dense delta-space Lodestone calculation."),
-        io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip", tooltip="Preserve LoRA 1, insert zero deltas, or abort for missing layers."),
-        io.String.Input("output_filename", default=default_filename, tooltip="Filename without extension under ComfyUI's LoRA directory."),
-        io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"], default="bf16", tooltip="Saved full-delta tensor dtype."),
-        io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda", tooltip="Dense processing device; CUDA OOM retries the layer on CPU."),
-        io.String.Input("exclude_patterns", default="", multiline=True, tooltip="Preserve matching logical layers from LoRA 1."),
-        io.String.Input("discard_patterns", default="", multiline=True, tooltip="Omit matching logical layers."),
-        io.Boolean.Input("glob_patterns", default=False, tooltip="Interpret filters as globs instead of regular expressions."),
+        io.Combo.Input("calc_mode", options=list(LODESTONE_METHODS), default="sum", tooltip="How full LoRA weight changes are combined per layer. sum adds them; mean averages them; slotnorm equalizes each input's Frobenius magnitude before averaging; normmatch adds them and scales the result to a typical input magnitude; slotnorm-normmatch performs both normalization steps."),
+        io.Combo.Input("mismatch_mode", options=["skip", "zeros", "error"], default="skip", tooltip="What to do when a layer exists in LoRA 1 but is absent from another input. skip copies LoRA 1's layer unchanged; zeros treats each missing input as a zero update; error stops without replacing an existing output file."),
+        io.String.Input("output_filename", default=default_filename, tooltip="Name of the new .safetensors file. It is saved in ComfyUI's loras folder; omit the extension."),
+        io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"], default="bf16", tooltip="Precision used to save the expanded full-weight difference tensors. FP32 is largest and most precise; FP16 is smallest; BF16 has wider numeric range than FP16."),
+        io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda", tooltip="Where each full layer is expanded and merged. CUDA is faster; if a layer runs out of VRAM, that layer is automatically retried on CPU."),
+        io.String.Input("exclude_patterns", default="", multiline=True, tooltip="Optional layer-name patterns to copy from LoRA 1 instead of merging. Enter one pattern per line; useful for protecting specific blocks."),
+        io.String.Input("discard_patterns", default="", multiline=True, tooltip="Optional layer-name patterns to leave out of the saved LoRA completely. Enter one pattern per line; discarded layers cannot affect the model."),
+        io.Boolean.Input("glob_patterns", default=False, tooltip="Choose filter syntax. Off uses regular expressions; on uses shell-style globs where * matches any text and ? matches one character."),
     ]
 
 
@@ -262,7 +262,8 @@ class LodestoneLoRATwoMerger(io.ComfyNode):
         options = folder_paths.get_filename_list("loras")
         return io.Schema(node_id="LodestoneLoRATwoMerger", display_name="Lodestone Merge LoRAs (2)",
                          category="ModelUtils/LoRA/Merge/Lodestone",
-                         inputs=[io.Combo.Input("lora_1", options=options, tooltip="First equal-prior LoRA and anchor."), io.Combo.Input("lora_2", options=options, tooltip="Second equal-prior LoRA."), *_controls("lodestone_merged_2_lora")],
+                         description="Expand two LoRAs into full per-layer weight changes, combine them with the selected Frobenius-norm method, and save a full-difference LoRA.",
+                         inputs=[io.Combo.Input("lora_1", options=options, tooltip="First LoRA to merge. It also supplies metadata and is the layer kept when Missing Layer Handling is set to skip."), io.Combo.Input("lora_2", options=options, tooltip="Second LoRA to merge. It contributes equally with LoRA 1 wherever both contain the same layer."), *_controls("lodestone_merged_2_lora")],
                          outputs=[io.AnyType.Output(display_name="output_filename")], is_output_node=True)
 
     @classmethod
@@ -276,7 +277,8 @@ class LodestoneLoRAThreeMerger(io.ComfyNode):
         options = folder_paths.get_filename_list("loras")
         return io.Schema(node_id="LodestoneLoRAThreeMerger", display_name="Lodestone Merge LoRAs (3)",
                          category="ModelUtils/LoRA/Merge/Lodestone",
-                         inputs=[io.Combo.Input("lora_1", options=options, tooltip="First equal-prior LoRA and anchor."), io.Combo.Input("lora_2", options=options, tooltip="Second equal-prior LoRA."), io.Combo.Input("lora_3", options=options, tooltip="Third equal-prior LoRA."), *_controls("lodestone_merged_3_lora")],
+                         description="Expand three LoRAs into full per-layer weight changes, combine them with the selected Frobenius-norm method, and save a full-difference LoRA.",
+                         inputs=[io.Combo.Input("lora_1", options=options, tooltip="First LoRA to merge. It supplies metadata, defines the output layer set, and is kept when Missing Layer Handling is skip."), io.Combo.Input("lora_2", options=options, tooltip="Second equal-strength LoRA contribution for every matching layer."), io.Combo.Input("lora_3", options=options, tooltip="Third equal-strength LoRA contribution for every matching layer."), *_controls("lodestone_merged_3_lora")],
                          outputs=[io.AnyType.Output(display_name="output_filename")], is_output_node=True)
 
     @classmethod
@@ -289,12 +291,12 @@ class LodestoneLoRAMultiMerger(io.ComfyNode):
     def define_schema(cls):
         options = folder_paths.get_filename_list("loras")
         optional = ["None", *options]
-        inputs = [io.Combo.Input("lora_count", options=[str(index) for index in range(2, 9)], default="2", tooltip="Number of consecutive equal-prior LoRAs."),
-                  io.Combo.Input("lora_1", options=options, tooltip="First equal-prior LoRA and anchor."), io.Combo.Input("lora_2", options=options, tooltip="Second equal-prior LoRA.")]
-        inputs.extend(io.Combo.Input(f"lora_{index}", options=optional, default="None", tooltip="Optional equal-prior LoRA used when included by LoRA Count.") for index in range(3, 9))
+        inputs = [io.Combo.Input("lora_count", options=[str(index) for index in range(2, 9)], default="2", tooltip="Number of consecutive LoRA selectors to merge, starting at LoRA 1. Every included LoRA has equal influence before the selected normalization method."),
+                  io.Combo.Input("lora_1", options=options, tooltip="First LoRA to merge. It supplies metadata, defines the output layer set, and anchors missing-layer handling."), io.Combo.Input("lora_2", options=options, tooltip="Second equal-strength LoRA contribution. LoRA Count always includes this input.")]
+        inputs.extend(io.Combo.Input(f"lora_{index}", options=optional, default="None", tooltip="Additional equal-strength LoRA contribution. Select a file for every input included by LoRA Count.") for index in range(3, 9))
         inputs.extend(_controls("lodestone_merged_multi_lora"))
         return io.Schema(node_id="LodestoneLoRAMultiMerger", display_name="Lodestone LoRA Multi-Merge",
-                         category="ModelUtils/LoRA/Merge/Lodestone", inputs=inputs,
+                         category="ModelUtils/LoRA/Merge/Lodestone", description="Expand 2-8 equal-strength LoRAs into full per-layer weight changes, combine them with Frobenius-norm-aware math, and save a full-difference LoRA.", inputs=inputs,
                          outputs=[io.AnyType.Output(display_name="output_filename")], is_output_node=True)
 
     @classmethod
