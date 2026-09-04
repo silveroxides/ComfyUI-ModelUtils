@@ -13,6 +13,11 @@ Missing-layer handling can preserve LoRA 1, include explicit zero contributors,
 or abort. Excluded layers preserve LoRA 1 and discarded layers are omitted.
 Outputs contain only canonical `.diff` tensors with alpha already normalized.
 
+`factorized_lora` output factorizes each completed merged layer immediately and
+writes canonical `lora_A` and `lora_B` tensors at the selected maximum rank. It
+never writes or retains a complete full-difference model. One-dimensional
+differences remain `.diff` tensors.
+
 Processing streams one logical layer from each input at a time and writes each
 completed layer incrementally. CUDA out-of-memory retries only the failed layer
 on CPU. The destination is replaced only after the complete output is written.

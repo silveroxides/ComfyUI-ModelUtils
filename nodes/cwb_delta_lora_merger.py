@@ -147,6 +147,29 @@ def _factor_delta(down, up, layer):
     )
 
 
+def _factorize_delta(delta, rank):
+    if delta.ndim not in (2, 4):
+        return None
+    shape = delta.shape
+    matrix = delta if delta.ndim == 2 else delta.reshape(shape[0], -1)
+    target_rank = max(1, min(int(rank), min(matrix.shape)))
+    if target_rank == min(matrix.shape):
+        if matrix.shape[0] <= matrix.shape[1]:
+            up = torch.eye(matrix.shape[0], device=matrix.device, dtype=matrix.dtype)
+            down = matrix
+        else:
+            up = matrix
+            down = torch.eye(matrix.shape[1], device=matrix.device, dtype=matrix.dtype)
+    else:
+        up, singular_values, right = torch.svd_lowrank(matrix, q=target_rank, niter=2)
+        up = up * singular_values.unsqueeze(0)
+        down = right.t()
+    if delta.ndim == 4:
+        down = down.reshape(down.shape[0], *shape[1:])
+        up = up.unsqueeze(-1).unsqueeze(-1)
+    return down, up
+
+
 def _inspect_inputs(handlers):
     infos = []
     for index, handler in enumerate(handlers):
@@ -281,7 +304,8 @@ def _to_processing_device(tensor, device):
 
 
 def _process_layer_on_device(
-    unit, loaded, settings: CWBSettings, save_dtype, device, diagnostics
+    unit, loaded, settings: CWBSettings, save_dtype, device, diagnostics,
+    output_representation, output_rank,
 ):
     deltas = []
     try:
@@ -321,7 +345,15 @@ def _process_layer_on_device(
             save_dtype,
             is_1d_diff=merged.ndim == 1,
         )
-        return merged.to(dtype=dtype, device="cpu").contiguous(), dtype
+        if output_representation == "factorized_lora":
+            factors = _factorize_delta(merged, output_rank)
+            if factors is not None:
+                down, up = factors
+                return [
+                    (canonical_lora_key(unit.core, "down"), down.to(dtype=dtype, device="cpu").contiguous()),
+                    (canonical_lora_key(unit.core, "up"), up.to(dtype=dtype, device="cpu").contiguous()),
+                ], dtype
+        return [(unit.output_key, merged.to(dtype=dtype, device="cpu").contiguous())], dtype
     finally:
         deltas.clear()
 
@@ -338,12 +370,16 @@ def _release_cuda_oom():
         torch.cuda.empty_cache()
 
 
-def _process_layer(unit, loaded, settings, save_dtype, requested_device, diagnostics):
+def _process_layer(
+    unit, loaded, settings, save_dtype, requested_device, diagnostics,
+    output_representation="full_difference", output_rank=384,
+):
     device = torch.device(requested_device)
     attempt_diagnostics = CWBDiagnostics()
     try:
         output, dtype = _process_layer_on_device(
-            unit, loaded, settings, save_dtype, device, attempt_diagnostics
+            unit, loaded, settings, save_dtype, device, attempt_diagnostics,
+            output_representation, output_rank,
         )
         diagnostics.absorb_runtime(attempt_diagnostics)
         return output, dtype, False
@@ -353,7 +389,8 @@ def _process_layer(unit, loaded, settings, save_dtype, requested_device, diagnos
         _release_cuda_oom()
         retry_diagnostics = CWBDiagnostics()
         output, dtype = _process_layer_on_device(
-            unit, loaded, settings, save_dtype, torch.device("cpu"), retry_diagnostics
+            unit, loaded, settings, save_dtype, torch.device("cpu"), retry_diagnostics,
+            output_representation, output_rank,
         )
         diagnostics.absorb_runtime(retry_diagnostics)
         return output, dtype, True
@@ -370,6 +407,8 @@ class DeltaCWBLoRAMergerLogic:
         mismatch_mode,
         output_filename,
         save_dtype,
+        output_representation,
+        output_rank,
         process_device,
         exclude_patterns,
         discard_patterns,
@@ -416,7 +455,10 @@ class DeltaCWBLoRAMergerLogic:
                 "merge_method": "delta_cwb",
                 "source_models": ",".join(source_names),
                 "alpha_normalized": "true",
-                "output_representation": "full_direct_difference",
+                "output_representation": (
+                    "factorized_lora" if output_representation == "factorized_lora"
+                    else "full_direct_difference"
+                ),
                 "cwb_consensus_type": settings.consensus_type,
                 "cwb_alignment_method": settings.alignment_method,
                 "cwb_alignment_threshold": str(settings.alignment_threshold),
@@ -442,21 +484,23 @@ class DeltaCWBLoRAMergerLogic:
                                 loaded[(source.source_index, key)] = cursors[
                                     source.source_index
                                 ].take(key)
-                        output, dtype, used_cpu = _process_layer(
+                        output_items, dtype, used_cpu = _process_layer(
                             unit,
                             loaded,
                             settings,
                             save_dtype,
                             process_device,
                             diagnostics,
+                            output_representation,
+                            output_rank,
                         )
-                        writer.write_batch([(unit.output_key, output)])
+                        writer.write_batch(output_items)
                         report.merged_layers += int(not unit.preserve_anchor)
                         report.anchor_preserved_layers += int(unit.preserve_anchor)
                         report.zero_filled_contributors += unit.zero_contributors
                         report.cuda_cpu_fallbacks += int(used_cpu)
                         report.record_dtype(dtype)
-                        del output
+                        del output_items
                     finally:
                         for source_index, key in list(loaded):
                             del loaded[(source_index, key)]
@@ -496,6 +540,8 @@ class DeltaCWBLoRAMergerLogic:
             kwargs["mismatch_mode"],
             kwargs["output_filename"],
             requested_dtype,
+            kwargs["output_representation"],
+            kwargs["output_rank"],
             kwargs["process_device"],
             kwargs["exclude_patterns"],
             kwargs["discard_patterns"],
@@ -550,6 +596,19 @@ def _fixed_inputs(count, default_filename):
             options=["fp32", "fp16", "bf16"],
             default="bf16",
             tooltip="Requested saved precision. Participating FP32 inputs preserve FP32.",
+        ),
+        io.Combo.Input(
+            "output_representation",
+            options=["full_difference", "factorized_lora"],
+            default="full_difference",
+            tooltip="Save exact full differences or factorize each merged layer directly into compact LoRA factors.",
+        ),
+        io.Int.Input(
+            "output_rank",
+            default=384,
+            min=1,
+            max=16384,
+            tooltip="Maximum rank used when Output Representation is factorized_lora.",
         ),
         io.Combo.Input(
             "process_device",

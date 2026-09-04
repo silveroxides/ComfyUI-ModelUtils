@@ -160,6 +160,8 @@ def test_streamed_merge_normalizes_alpha_once_and_supports_mixed_rank(
         "skip",
         "dense/mixed_rank",
         torch.float32,
+        "full_difference",
+        384,
         "cpu",
         "",
         "",
@@ -196,12 +198,49 @@ def test_existing_diff_and_1d_output_remain_fp32(monkeypatch, tmp_path, delta_cw
 
     filename, _ = delta_cwb.DeltaCWBLoRAMergerLogic.execute(
         [str(first), str(second)], [first.name, second.name], _settings(delta_cwb),
-        "balanced_mean", False, "skip", "one_dim", torch.float16, "cpu",
+        "balanced_mean", False, "skip", "one_dim", torch.float16,
+        "full_difference", 384, "cpu",
         "", "", False, False,
     )
     output = _read(tmp_path / "loras" / filename)[key]
     assert output.dtype == torch.float32
     torch.testing.assert_close(output, torch.tensor([2.0, 4.0]))
+
+
+def test_factorized_output_writes_compact_factors_without_dense_tensor(
+    monkeypatch, tmp_path, delta_cwb
+):
+    first = tmp_path / "factor_first.safetensors"
+    second = tmp_path / "factor_second.safetensors"
+    tensors = {
+        "diffusion_model.layer.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        "diffusion_model.layer.lora_B.weight": torch.tensor([[3.0], [6.0]]),
+    }
+    _write(first, tensors)
+    _write(second, tensors)
+    monkeypatch.setattr(delta_cwb.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(delta_cwb, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(delta_cwb, "cleanup_after_operation", lambda: None)
+
+    filename, _ = delta_cwb.DeltaCWBLoRAMergerLogic.execute(
+        [str(first), str(second)], [first.name, second.name], _settings(delta_cwb),
+        "balanced_mean", False, "skip", "factorized", torch.float32,
+        "factorized_lora", 1, "cpu", "", "", False, False,
+    )
+    output_path = tmp_path / "loras" / filename
+    output = _read(output_path)
+    assert set(output) == {
+        "diffusion_model.layer.lora_A.weight",
+        "diffusion_model.layer.lora_B.weight",
+    }
+    assert "diffusion_model.layer.diff" not in output
+    reconstructed = (
+        output["diffusion_model.layer.lora_B.weight"]
+        @ output["diffusion_model.layer.lora_A.weight"]
+    )
+    torch.testing.assert_close(reconstructed, torch.tensor([[3.0, 6.0], [6.0, 12.0]]))
+    with MemoryEfficientSafeOpen(str(output_path), low_memory=True) as handler:
+        assert handler.metadata()["output_representation"] == "factorized_lora"
 
 
 def test_atomic_writer_preserves_destination_on_cwb_failure(
@@ -250,7 +289,8 @@ def test_atomic_writer_preserves_destination_on_cwb_failure(
     with pytest.raises(RuntimeError, match="planned failure"):
         delta_cwb.DeltaCWBLoRAMergerLogic.execute(
             [str(first), str(second)], [first.name, second.name], _settings(delta_cwb),
-            "balanced_mean", False, "skip", "atomic", torch.float32, "cpu",
+            "balanced_mean", False, "skip", "atomic", torch.float32,
+            "full_difference", 384, "cpu",
             "", "", False, False,
         )
     assert destination.read_bytes() == b"existing destination"
@@ -268,7 +308,10 @@ def test_complete_layer_cuda_oom_retries_on_cpu(monkeypatch, delta_cwb):
     )
     calls = []
 
-    def process(_unit, _loaded, _settings, _dtype, device, _diagnostics):
+    def process(
+        _unit, _loaded, _settings, _dtype, device, _diagnostics,
+        _output_representation, _output_rank,
+    ):
         calls.append(device.type)
         if device.type == "cuda":
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
@@ -305,7 +348,8 @@ def test_exact_node_schema_contract(delta_cwb):
     fixed_ids = [value.id for value in schemas[0].inputs]
     assert fixed_ids == [
         "lora_1", "lora_2", "cwb_preset", "cwb_config", "mismatch_mode",
-        "output_filename", "save_dtype", "process_device", "exclude_patterns",
+        "output_filename", "save_dtype", "output_representation", "output_rank",
+        "process_device", "exclude_patterns",
         "discard_patterns", "glob_patterns", "force_clear_cache",
     ]
     multi_ids = [value.id for value in schemas[2].inputs]
@@ -313,11 +357,13 @@ def test_exact_node_schema_contract(delta_cwb):
     assert schemas[0].inputs[2].default == "balanced_mean"
     assert schemas[0].inputs[4].default == "skip"
     assert schemas[0].inputs[6].default == "bf16"
-    assert schemas[0].inputs[7].default == "cuda"
+    assert schemas[0].inputs[7].default == "full_difference"
+    assert schemas[0].inputs[8].default == 384
+    assert schemas[0].inputs[9].default == "cuda"
     assert schemas[0].inputs[-2].default is False
     assert schemas[0].inputs[-1].default is True
     assert "agreement" in schemas[0].inputs[2].tooltip
-    assert "Only a failed CUDA layer retries on CPU" in schemas[0].inputs[7].tooltip
+    assert "Only a failed CUDA layer retries on CPU" in schemas[0].inputs[9].tooltip
 
 
 def test_invalid_regex_and_unselected_multi_input_fail(delta_cwb):
