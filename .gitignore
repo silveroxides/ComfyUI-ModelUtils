@@ -176,3 +176,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# local untracked directories
+tools_local/
+references_local/
+plans_local/
+old_files_local/
+audit_local/
+old_sessions/
+
+# local untracked files
+/*.jsonl
