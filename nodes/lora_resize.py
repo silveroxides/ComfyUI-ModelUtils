@@ -6,6 +6,8 @@ dynamic methods (sv_ratio, sv_fro, sv_cumulative).
 """
 import os
 import gc
+import fnmatch
+import re
 import logging
 from collections import Counter, defaultdict
 import torch
@@ -641,13 +643,32 @@ def _compute_resize(
     return new_rank, new_alpha, stats
 
 
-def _build_resize_work_units(handler, pairs, passthrough_keys, low_bit_keys):
+def _resize_filter_inputs():
+    return [
+        io.String.Input("exclude_patterns", default="", multiline=True, tooltip="One pattern per line. Matching layer names or source/canonical tensor keys keep the whole layer at its original rank and precision, including alpha."),
+        io.String.Input("discard_patterns", default="", multiline=True, tooltip="One pattern per line. Remove the whole matching layer, including factors and alpha. Discard takes precedence over exclude."),
+        io.Boolean.Input("glob_patterns", default=False, tooltip="Use shell-style glob patterns instead of regular expressions for exclude and discard filters."),
+    ]
+
+
+def _build_resize_work_units(
+    handler, pairs, passthrough_keys, low_bit_keys,
+    exclude_patterns="", discard_patterns="", glob_patterns=False,
+):
     """Plan raw-copy and streamed work without loading tensor payloads."""
     raw_units = []
     stream_units = []
     claimed = set()
     rank_counts = Counter()
     preserved_companion_groups = 0
+    excludes, discards = [
+        [re.compile(fnmatch.translate(line.strip()) if glob_patterns else line.strip())
+         for line in text.splitlines() if line.strip()]
+        for text in (exclude_patterns, discard_patterns)
+    ]
+
+    def matches(patterns, names):
+        return any(pattern.search(name) for pattern in patterns for name in names)
 
     for block_name, block_keys in pairs.items():
         tensor_keys = layer_tensor_keys(block_keys)
@@ -664,13 +685,24 @@ def _build_resize_work_units(handler, pairs, passthrough_keys, low_bit_keys):
             if key.startswith(f"{block_name}.") and key not in claimed
         ]
 
+        group_entries = entries + related_passthrough
+        names = [block_name, canonical_lora_block_name(block_name)]
+        names.extend(name for _, key, output_key in group_entries for name in (key, output_key))
+        if matches(discards, names):
+            claimed.update(key for _, key, _ in group_entries)
+            continue
+        excluded = matches(excludes, names)
+
         if layer_has_low_bit(block_keys, low_bit_keys):
             raw_entries = entries + related_passthrough
             raw_units.append({"entries": raw_entries})
             claimed.update(key for _, key, _ in raw_entries)
             continue
 
-        if layer_has_companions(block_keys):
+        if excluded:
+            stream_units.append({"kind": "preserve", "entries": group_entries})
+            claimed.update(key for _, key, _ in group_entries)
+        elif layer_has_companions(block_keys):
             preserved_companion_groups += 1
             stream_units.append({"kind": "preserve", "entries": entries})
         elif "down" in block_keys and "up" in block_keys:
@@ -690,11 +722,16 @@ def _build_resize_work_units(handler, pairs, passthrough_keys, low_bit_keys):
     for key in passthrough_keys:
         if key in claimed:
             continue
+        if matches(discards, [key]):
+            continue
         entry = (None, key, key)
         if key in low_bit_keys:
             raw_units.append({"entries": [entry]})
         else:
-            stream_units.append({"kind": "copy", "entries": [entry]})
+            stream_units.append({
+                "kind": "preserve" if matches(excludes, [key]) else "copy",
+                "entries": [entry],
+            })
         claimed.add(key)
 
     return raw_units, stream_units, rank_counts, preserved_companion_groups
@@ -862,6 +899,9 @@ def resize_lora_file(
     verbose: bool = True,
     force_clear_cache: bool = False,
     min_rank: int = 1,
+    exclude_patterns: str = "",
+    discard_patterns: str = "",
+    glob_patterns: bool = False,
 ) -> str:
     """Resize a LoRA through one bounded UEL stream and factor-space SVD."""
     if min_rank < 1:
@@ -884,7 +924,8 @@ def resize_lora_file(
         validate_canonical_blocks(pairs, "LoRA Resize")
         raw_units, stream_units, rank_counts, preserved_companion_groups = (
             _build_resize_work_units(
-                handler, pairs, passthrough_keys, low_bit_keys
+                handler, pairs, passthrough_keys, low_bit_keys,
+                exclude_patterns, discard_patterns, glob_patterns,
             )
         )
         rank_text = _rank_summary(rank_counts)
@@ -1182,19 +1223,23 @@ class LoRAResizeFixed(io.ComfyNode):
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16", tooltip="Data type used to save resized LoRA tensors."),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
+                *_resize_filter_inputs(),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         resize_lora_file(
             lora_path, new_rank, None, None, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1221,19 +1266,23 @@ class LoRAResizeRatio(io.ComfyNode):
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16", tooltip="Data type used to save resized LoRA tensors."),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
+                *_resize_filter_inputs(),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         resize_lora_file(
             lora_path, max_rank, "sv_ratio", ratio, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1262,19 +1311,23 @@ class LoRAResizeFrobenius(io.ComfyNode):
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16", tooltip="Data type used to save resized LoRA tensors."),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
+                *_resize_filter_inputs(),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         resize_lora_file(
             lora_path, max_rank, "sv_fro", target, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
             min_rank=min_rank,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
@@ -1302,19 +1355,23 @@ class LoRAResizeCumulative(io.ComfyNode):
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16", tooltip="Data type used to save resized LoRA tensors."),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
+                *_resize_filter_inputs(),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
         resize_lora_file(
             lora_path, max_rank, "sv_cumulative", target, device, dtype, output_filename,
             force_clear_cache=force_clear_cache,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)

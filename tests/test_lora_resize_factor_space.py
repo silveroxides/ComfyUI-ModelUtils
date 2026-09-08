@@ -50,6 +50,85 @@ def _read_uel(path, async_method=None, mark_method=None):
     return result
 
 
+@pytest.mark.parametrize("glob", [False, True])
+def test_resize_filters_preserve_and_discard_whole_layers(monkeypatch, tmp_path, resize, glob):
+    source = tmp_path / "filters.safetensors"
+    tensors = {}
+    for name in ("keep", "drop", "resize"):
+        tensors[f"diffusion_model.{name}.lora_A.weight"] = torch.eye(3, dtype=torch.float16)
+        tensors[f"diffusion_model.{name}.lora_B.weight"] = torch.eye(3, dtype=torch.float16)
+        tensors[f"diffusion_model.{name}.alpha"] = torch.tensor(1.5)
+    tensors["diffusion_model.drop.extra"] = torch.ones(1)
+    tensors["standalone"] = torch.ones(1)
+    _write_uel(source, tensors)
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+    original_async = MemoryEfficientSafeOpen.async_stream
+    streamed = []
+
+    def track(self, keys, **kwargs):
+        streamed.extend(keys)
+        yield from original_async(self, keys, **kwargs)
+
+    monkeypatch.setattr(MemoryEfficientSafeOpen, "async_stream", track)
+    output = resize.resize_lora_file(
+        str(source), 1, None, None, "cpu", torch.bfloat16, "filtered", verbose=False,
+        exclude_patterns="*.keep.lora_A.weight\n*.drop.*" if glob else r"\.keep\.lora_A\.weight$" + "\n" + r"\.drop\.",
+        discard_patterns="*.drop.alpha\nstandalone" if glob else r"\.drop\.alpha$" + "\n^standalone$",
+        glob_patterns=glob,
+    )
+    assert not any(".drop." in key or key == "standalone" for key in streamed)
+    actual = _read_uel(output, original_async)
+    assert not any(".drop." in key or key == "standalone" for key in actual)
+    for key in tensors:
+        if ".keep." in key:
+            assert actual[key].dtype == tensors[key].dtype
+            assert torch.equal(actual[key], tensors[key])
+    assert actual["diffusion_model.resize.lora_A.weight"].shape[0] == 1
+
+
+@pytest.mark.parametrize("node_name,extra", [
+    ("LoRAResizeFixed", {"new_rank": 1}),
+    ("LoRAResizeRatio", {"max_rank": 1, "ratio": 2.0}),
+    ("LoRAResizeFrobenius", {"max_rank": 1, "min_rank": 1, "target": 0.9}),
+    ("LoRAResizeCumulative", {"max_rank": 1, "target": 0.9}),
+])
+def test_all_resize_nodes_forward_filters(monkeypatch, tmp_path, resize, node_name, extra):
+    node = getattr(resize, node_name)
+    controls = {item.id: item for item in node.define_schema().inputs}
+    assert controls["exclude_patterns"].default == ""
+    assert controls["discard_patterns"].default == ""
+    assert controls["glob_patterns"].default is False
+    calls = []
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize.folder_paths, "get_full_path_or_raise", lambda *args: "input")
+    monkeypatch.setattr(resize, "resize_lora_file", lambda *args, **kwargs: calls.append(kwargs))
+    node.execute(lora_name="input", output_filename="out", save_dtype="fp16", device="cpu",
+                 force_clear_cache=False, exclude_patterns="keep*", discard_patterns="drop*",
+                 glob_patterns=True, **extra)
+    assert calls[0]["exclude_patterns"] == "keep*"
+    assert calls[0]["discard_patterns"] == "drop*"
+    assert calls[0]["glob_patterns"] is True
+
+
+def test_resize_invalid_filter_fails_before_writer(monkeypatch, tmp_path, resize):
+    import re
+
+    source = tmp_path / "invalid_filter.safetensors"
+    _write_uel(source, {"layer.diff": torch.ones(2)})
+    monkeypatch.setattr(resize, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    def unexpected_writer(*args, **kwargs):
+        pytest.fail("Writer must not open for invalid patterns")
+
+    monkeypatch.setattr(resize, "atomic_uel_writer", unexpected_writer)
+    with pytest.raises(re.error):
+        resize.resize_lora_file(str(source), 1, None, None, "cpu", torch.float32,
+                                "unused", exclude_patterns="[")
+
+
 def _dense_truncated(up, down, rank):
     dense = up.float() @ down.float()
     u, s, vh = torch.linalg.svd(dense, full_matrices=False)
