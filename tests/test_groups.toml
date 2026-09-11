@@ -48,6 +48,10 @@ python_tests = [
 paths = ["nodes/lora_resize.py"]
 python_tests = ["tests/test_lora_resize_factor_space.py", "tests/test_lora_resize_min_rank.py"]
 
+[groups.merger_filters]
+paths = ["nodes/merger.py"]
+python_tests = ["tests/test_merger_filters.py"]
+
 [groups.dtype_conversion]
 paths = ["nodes/dtype_conversion.py"]
 python_tests = ["tests/test_dtype_conversion.py"]

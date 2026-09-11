@@ -354,6 +354,7 @@ def extract_dora_learned_from_files(
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
     knee_probe_offset: int = 32,
+    include_mode: bool = False,
 ) -> None:
     """
     Extract Learned DoRA from difference between two models.
@@ -380,7 +381,7 @@ def extract_dora_learned_from_files(
         work_units = [
             (key, key, key if key in keys_b else None)
             for key in weight_keys
-            if not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)
+            if (not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns))
             and not (key not in keys_b and mismatch_mode == "skip")
         ]
         pbar = comfy.utils.ProgressBar(len(work_units))
@@ -393,7 +394,7 @@ def extract_dora_learned_from_files(
             tensor_ft = None
             layer_device = device
 
-            if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
+            if (_matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)):
                 return "skipped", None
 
             if key not in keys_b:
@@ -597,7 +598,7 @@ class DoRALearnedExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -607,7 +608,7 @@ class DoRALearnedExtractFixed(io.ComfyNode):
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_dim, conv_dim,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
-            lazy_load, force_clear_cache, glob_skip_patterns
+            lazy_load, force_clear_cache, glob_skip_patterns, include_mode=include_mode
         )
 
         return io.NodeOutput(output_name)
@@ -641,7 +642,7 @@ class DoRALearnedExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, chunk_large_layers, clamp_quantile, min_diff, mismatch_mode,
-                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -651,7 +652,7 @@ class DoRALearnedExtractRatio(io.ComfyNode):
             model_a_path, model_b_path, "ratio", linear_ratio, conv_ratio,
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
 
@@ -686,7 +687,7 @@ class DoRALearnedExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, chunk_large_layers, clamp_quantile, min_diff, mismatch_mode,
-                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -696,7 +697,7 @@ class DoRALearnedExtractQuantile(io.ComfyNode):
             model_a_path, model_b_path, "quantile", linear_quantile, conv_quantile,
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
 
@@ -731,7 +732,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
     def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
                 linear_max_rank, conv_max_rank,
                 optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, chunk_large_layers, clamp_quantile, min_diff, mismatch_mode,
-                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -742,7 +743,7 @@ class DoRALearnedExtractKnee(io.ComfyNode):
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset, include_mode=include_mode
         )
 
         return io.NodeOutput(output_name)
@@ -776,7 +777,7 @@ class DoRALearnedExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, chunk_large_layers, clamp_quantile, min_diff, mismatch_mode,
-                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                output_filename, save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -786,7 +787,7 @@ class DoRALearnedExtractFrobenius(io.ComfyNode):
             model_a_path, model_b_path, "sv_fro", linear_target, conv_target,
             device, save_dtype, output_path, optimize_iters, learning_rate, optimizer, lr_schedule, lr_patience, lr_factor, lr_cooldown, early_stop_loss, early_stop_stall, early_stop_lr, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
 

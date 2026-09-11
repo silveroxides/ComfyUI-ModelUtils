@@ -11,6 +11,18 @@ A collection of ComfyUI custom nodes for inspecting, modifying, merging, and cre
 - **LoRA Extraction** – Extract LoRA adapters from model pairs using various SVD rank selection methods (Fixed, Ratio, Quantile, Knee-detection, Frobenius-norm)
 - **Diffusion Model Dtype Conversion** – Stream models to fp32, fp16, or bf16 while preserving excluded tensor dtypes
 
+## Layer filters
+
+Nodes with `exclude_patterns` or `skip_patterns` have an appended `include_mode` toggle
+(off by default). Turn it on to process only layers matching that same field,
+using the node's existing regex or glob syntax. An empty include filter selects
+nothing. Nonmatches follow the node's usual exclusion behavior: preserve the
+source/anchor layer for pattern-exclusion mergers, resize, or conversion; omit
+it from analysis or extraction. LoRA Merge to Model retains its existing skip
+semantics: nonmatching base tensors are omitted from the saved model, while
+guarded low-bit base tensors are always preserved. Its filter uses regex only.
+`discard_patterns`, where available, still takes precedence.
+
 ## Example Workflows
 
 <p align="center">

@@ -651,9 +651,10 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
         if node is cwb.CWBLoRAMultiMerger:
             assert ids[:4] == ["execution_mode", "lora_count", "lora_1", "lora_2"]
             assert schema.inputs[1].default == "2"
-            assert ids[-2:] == [
+            assert ids[-3:] == [
                 "include_1d_diffs",
                 "counterfactual_weight_sweep",
+                "include_mode",
             ]
             continue
         if node in (cwb.CWBEmbeddingSelfCoalesce, cwb.CWBEmbeddingMultiMerger):
@@ -667,10 +668,11 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
         if node.INPUT_COUNT == 3:
             assert ids[3] == "model_c"
         if node.LORA_MODE:
-            assert schema.inputs[-1].id == "include_1d_diffs"
-            assert schema.inputs[-1].default is False
+            assert schema.inputs[-2].id == "include_1d_diffs"
         else:
             assert "include_1d_diffs" not in ids
+        assert schema.inputs[-1].id == "include_mode"
+        assert schema.inputs[-1].default is False
 
 
 def test_use_case_preset_names_match_complete_settings(cwb):
@@ -1259,6 +1261,37 @@ def test_secondary_shape_conflict_skip_preserves_earliest_source(monkeypatch, tm
     )
     tensor = load_file(str(_result_path(tmp_path, "diffusion_models", result)))["secondary"]
     torch.testing.assert_close(tensor, torch.tensor([2.0, 3.0]))
+
+
+@pytest.mark.parametrize("lora_mode", [False, True])
+@pytest.mark.parametrize("patterns, glob_patterns, selected", [
+    (r"\.selected", False, True),
+    ("*.selected*", True, True),
+    ("", False, False),
+    ("no_match", False, False),
+])
+def test_include_filter_preserves_nonmatches_and_discards_first(
+    monkeypatch, tmp_path, cwb, lora_mode, patterns, glob_patterns, selected,
+):
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    for name, value in (("a", 2.0), ("b", 6.0)):
+        save_file({
+            f"diffusion_model.{layer}.diff": torch.full((2, 2), value)
+            for layer in ("selected", "other", "selected_discard")
+        }, paths[name])
+    _patch_io(monkeypatch, cwb, tmp_path, paths)
+    category = "loras" if lora_mode else "diffusion_models"
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"], category,
+        _params("include_filter", exclude_patterns=patterns, include_mode=True,
+                glob_patterns=glob_patterns, discard_patterns="*discard*" if glob_patterns else "discard",
+                power_alpha=0.0),
+        lora_mode=lora_mode,
+    )
+    tensors = load_file(str(_result_path(tmp_path, category, result)))
+    assert set(tensors) == {"diffusion_model.selected.diff", "diffusion_model.other.diff"}
+    torch.testing.assert_close(tensors["diffusion_model.selected.diff"], torch.full((2, 2), 4.0 if selected else 2.0))
+    torch.testing.assert_close(tensors["diffusion_model.other.diff"], torch.full((2, 2), 2.0))
 
 
 def test_secondary_only_filters_and_low_bit_preservation(monkeypatch, tmp_path, cwb):

@@ -781,13 +781,14 @@ class ModelAnalysisLogic:
                 params.get("exclude_patterns", ""),
                 glob_mode=glob_mode,
             )
+            include_mode = bool(params.get("include_mode", False))
             excluded_a = {
                 key for key in keys_a
-                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode)
+                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode) != include_mode
             }
             excluded_b = {
                 key for key in keys_b
-                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode)
+                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode) != include_mode
             }
             keys_a.difference_update(excluded_a)
             keys_b.difference_update(excluded_b)
@@ -1092,12 +1093,17 @@ def _common_inputs(model_type: str, *, alignment_control: bool):
             "exclude_patterns",
             default="",
             multiline=True,
-            tooltip="One pattern per line. Matching tensors are excluded from all comparison metrics and topology counts. Uses regex unless Glob Patterns is enabled.",
+            tooltip="One pattern per line. Matching tensors are excluded from all comparison metrics and topology counts, or are the only tensors analyzed when Include Mode is enabled. Uses regex unless Glob Patterns is enabled.",
         ),
         io.Boolean.Input(
             "glob_patterns",
             default=False,
-            tooltip="Interpret exclusion entries as shell-style glob patterns instead of regular expressions.",
+            tooltip="Interpret layer-filter entries as shell-style glob patterns instead of regular expressions.",
+        ),
+        io.Boolean.Input(
+            "include_mode",
+            default=False,
+            tooltip="Use Exclude Patterns as an include-only filter. Analyze only matching tensors; an empty filter selects nothing.",
         ),
     ])
     return inputs

@@ -129,6 +129,35 @@ def test_streamed_merge_writes_only_alpha_normalized_full_delta(monkeypatch, tmp
     torch.testing.assert_close(tensors["diffusion_model.layer.diff"], torch.diag(torch.tensor([1.0, 4.0])))
 
 
+@pytest.mark.parametrize("patterns, glob_patterns, selected", [
+    (r"\.selected", False, True),
+    ("*.selected*", True, True),
+    ("", False, False),
+    ("no_match", False, False),
+])
+def test_include_filter_preserves_nonmatches_and_discards_first(
+    monkeypatch, tmp_path, lodestone, patterns, glob_patterns, selected,
+):
+    paths = [tmp_path / f"{name}.safetensors" for name in ("a", "b")]
+    for path, value in zip(paths, (2.0, 6.0)):
+        _write(path, {
+            f"diffusion_model.{layer}.diff": torch.full((2, 2), value)
+            for layer in ("selected", "other", "selected_discard")
+        })
+    monkeypatch.setattr(lodestone.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(lodestone, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(lodestone, "cleanup_after_operation", lambda: None)
+    output = lodestone.merge_lodestone_loras(
+        [str(path) for path in paths], "sum", "cpu", torch.float32, "include_filter",
+        exclude_patterns=patterns, glob_patterns=glob_patterns, include_mode=True,
+        discard_patterns="*discard*" if glob_patterns else "discard", verbose=False,
+    )
+    tensors = _read(output)
+    assert set(tensors) == {"diffusion_model.selected.diff", "diffusion_model.other.diff"}
+    torch.testing.assert_close(tensors["diffusion_model.selected.diff"], torch.full((2, 2), 8.0 if selected else 2.0))
+    torch.testing.assert_close(tensors["diffusion_model.other.diff"], torch.full((2, 2), 2.0))
+
+
 def test_dedicated_nodes_do_not_modify_factor_merger_schema(lodestone):
     standard = _load_module("nodes.lora_merger")
     assert [node.define_schema().node_id for node in lodestone.LODESTONE_MERGER_NODES] == [

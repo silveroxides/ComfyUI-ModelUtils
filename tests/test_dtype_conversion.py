@@ -68,7 +68,9 @@ def test_schema_is_diffusion_model_scoped(conversion):
         "reference_model",
         "exclude_patterns",
         "output_filename",
+        "include_mode",
     ]
+    assert schema.inputs[-1].default is False
     assert schema.inputs[1].options == ["fp32", "fp16", "bf16"]
     assert [item.display_name for item in schema.outputs] == [
         "output_path",
@@ -150,6 +152,44 @@ def test_converts_floating_and_preserves_excluded_and_nonfloating(
     assert metadata == {"source": "test"}
     assert "Excluded tensors preserved: 1" in report
     assert "Non-floating tensors preserved: 1" in report
+
+
+@pytest.mark.parametrize("patterns, selected", [
+    (r"^blocks\.0\.weight$", {"blocks.0.weight"}),
+    (r"^blocks\.0\.weight$" + "\n" + r"^blocks\.0\.norm\.weight$", {"blocks.0.weight", "blocks.0.norm.weight"}),
+    ("", set()),
+    ("no_such_layer", set()),
+])
+@pytest.mark.parametrize("use_reference", [False, True])
+def test_include_filter_only_converts_matches(
+    monkeypatch, tmp_path, conversion, patterns, selected, use_reference,
+):
+    source = tmp_path / "source.safetensors"
+    reference = tmp_path / "reference.safetensors"
+    tensors = {
+        "blocks.0.weight": torch.arange(4, dtype=torch.float32),
+        "blocks.0.norm.weight": torch.ones(3, dtype=torch.float32),
+        "position_ids": torch.tensor([1, 2], dtype=torch.int64),
+    }
+    _write_uel(source, tensors)
+    _write_uel(reference, {"blocks.0.weight": tensors["blocks.0.weight"].to(torch.bfloat16)})
+    _patch_runtime(monkeypatch, tmp_path, conversion, source)
+    monkeypatch.setattr(
+        conversion.folder_paths, "get_full_path_or_raise",
+        lambda _, name: str(reference if name == "reference" else source),
+    )
+
+    output_name, _ = conversion.DiffusionModelDtypeConversion.execute(
+        source.name, "fp16", "reference" if use_reference else "None",
+        patterns, "include_converted", include_mode=True,
+    )
+    result, _ = _read_uel(tmp_path / "diffusion_models" / output_name)
+    for key, tensor in tensors.items():
+        expected_dtype = tensor.dtype
+        if key in selected:
+            expected_dtype = torch.bfloat16 if use_reference and key == "blocks.0.weight" else torch.float16
+        assert result[key].dtype == expected_dtype
+        torch.testing.assert_close(result[key].to(tensor.dtype), tensor)
 
 
 def test_uses_bounded_async_stream_and_releases_every_tensor(

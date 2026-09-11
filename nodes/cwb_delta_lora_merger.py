@@ -202,6 +202,7 @@ def _build_layer_units(
     exclude_patterns,
     discard_patterns,
     glob_patterns,
+    include_mode=False,
 ):
     units = []
     stream_keys = [[] for _ in handlers]
@@ -213,7 +214,8 @@ def _build_layer_units(
         if _matches_pattern(output_key, discard_patterns, glob_patterns):
             rejected += 1
             continue
-        preserve = _matches_pattern(output_key, exclude_patterns, glob_patterns)
+        matched = _matches_pattern(output_key, exclude_patterns, glob_patterns)
+        preserve = not matched if include_mode else matched
         candidates = []
         shapes = {}
         for index, block in sorted(mapped):
@@ -414,6 +416,7 @@ class DeltaCWBLoRAMergerLogic:
         discard_patterns,
         glob_patterns,
         force_clear_cache,
+        include_mode=False,
     ):
         prepare_for_large_operation(
             sum(estimate_model_size(path) for path in lora_paths) * 2.5,
@@ -439,6 +442,7 @@ class DeltaCWBLoRAMergerLogic:
                 compiled_excludes,
                 compiled_discards,
                 glob_patterns,
+                include_mode,
             )
             report.rejected_unsupported_layers = rejected
             cursors = [
@@ -547,6 +551,7 @@ class DeltaCWBLoRAMergerLogic:
             kwargs["discard_patterns"],
             kwargs["glob_patterns"],
             kwargs["force_clear_cache"],
+            kwargs.get("include_mode", False),
         )
         return io.NodeOutput(filename, report)
 
@@ -637,6 +642,11 @@ def _fixed_inputs(count, default_filename):
             "force_clear_cache",
             default=True,
             tooltip="Clear Python and CUDA caches before each layer to reduce retained memory.",
+        ),
+        io.Boolean.Input(
+            "include_mode",
+            default=False,
+            tooltip="Use Exclude Patterns as a whitelist instead. Only matching layers are merged; nonmatching layers are preserved from LoRA 1.",
         ),
     ])
     return inputs

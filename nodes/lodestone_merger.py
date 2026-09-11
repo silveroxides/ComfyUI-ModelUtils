@@ -92,7 +92,7 @@ def _is_cuda_oom(error):
     )
 
 
-def _build_units(layer_map, infos, handlers, mismatch_mode, exclude_patterns, discard_patterns, glob_patterns):
+def _build_units(layer_map, infos, handlers, mismatch_mode, exclude_patterns, discard_patterns, glob_patterns, include_mode=False):
     units = []
     stream_keys = [[] for _ in handlers]
     for core, mapped in layer_map.items():
@@ -101,7 +101,8 @@ def _build_units(layer_map, infos, handlers, mismatch_mode, exclude_patterns, di
         output_key = canonical_lora_key(core, "diff")
         if _matches(output_key, discard_patterns, glob_patterns):
             continue
-        preserve = _matches(output_key, exclude_patterns, glob_patterns)
+        matched = _matches(output_key, exclude_patterns, glob_patterns)
+        preserve = not matched if include_mode else matched
         sources = []
         for index, block in sorted(mapped):
             roles = infos[index]["pairs"][block]
@@ -178,7 +179,7 @@ def _process(unit, loaded, method, save_dtype, requested_device):
 
 def merge_lodestone_loras(lora_paths, method, device, save_dtype, output_filename,
                           mismatch_mode="skip", exclude_patterns="", discard_patterns="",
-                          glob_patterns=False, verbose=True):
+                          glob_patterns=False, verbose=True, include_mode=False):
     operation = "Lodestone LoRA Merge"
     prepare_for_large_operation(sum(estimate_model_size(path) for path in lora_paths) * 2.5, torch.device(device))
     handlers = [MemoryEfficientSafeOpen(path, low_memory=True) for path in lora_paths]
@@ -192,7 +193,7 @@ def merge_lodestone_loras(lora_paths, method, device, save_dtype, output_filenam
         layer_map = build_lora_layer_map(infos, None)
         validate_canonical_blocks(layer_map, operation)
         units, stream_keys = _build_units(
-            layer_map, infos, handlers, mismatch_mode, exclude_patterns, discard_patterns, glob_patterns
+            layer_map, infos, handlers, mismatch_mode, exclude_patterns, discard_patterns, glob_patterns, include_mode
         )
         cursors = [
             AsyncTensorCursor(handler, keys, pin_memory=torch.device(device).type == "cuda")
@@ -244,6 +245,7 @@ def _controls(default_filename):
         io.String.Input("exclude_patterns", default="", multiline=True, tooltip="Optional layer-name patterns to copy from LoRA 1 instead of merging. Enter one pattern per line; useful for protecting specific blocks."),
         io.String.Input("discard_patterns", default="", multiline=True, tooltip="Optional layer-name patterns to leave out of the saved LoRA completely. Enter one pattern per line; discarded layers cannot affect the model."),
         io.Boolean.Input("glob_patterns", default=False, tooltip="Choose filter syntax. Off uses regular expressions; on uses shell-style globs where * matches any text and ? matches one character."),
+        io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching layers are merged; nonmatching layers are preserved from LoRA 1."),
     ]
 
 
@@ -252,7 +254,7 @@ def _execute(kwargs, count):
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[kwargs["save_dtype"]]
     merge_lodestone_loras(paths, kwargs["calc_mode"], kwargs["process_device"], dtype,
                           kwargs["output_filename"], kwargs["mismatch_mode"],
-                          kwargs["exclude_patterns"], kwargs["discard_patterns"], kwargs["glob_patterns"])
+                          kwargs["exclude_patterns"], kwargs["discard_patterns"], kwargs["glob_patterns"], include_mode=kwargs.get("include_mode", False))
     return canonical_model_artifact_path("loras", kwargs["output_filename"])[1]
 
 

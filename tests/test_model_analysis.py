@@ -53,6 +53,8 @@ def test_five_node_schema_contract(analysis):
         assert schema.inputs[0].options == ["ANALYZE", "DOCUMENTATION ONLY"]
         assert "lazy_load" not in [item.id for item in schema.inputs]
         input_ids = [item.id for item in schema.inputs]
+        assert input_ids[-3:] == ["exclude_patterns", "glob_patterns", "include_mode"]
+        assert schema.inputs[-1].default is False
         if node in (analysis.LoRAModelAnalysis, analysis.EmbeddingModelAnalysis):
             assert input_ids[3] == "cwb_similarity_alignment"
         else:
@@ -227,7 +229,14 @@ def test_lora_cross_format_keys_compare_as_one_logical_pair(monkeypatch, tmp_pat
     assert all(len(call[1]) == 2 for call in async_calls)
 
 
-def test_excluded_lora_blocks_do_not_enter_metrics(monkeypatch, tmp_path, analysis):
+@pytest.mark.parametrize("patterns, glob_patterns, include_mode", [
+    (r"^diffusion_model\.blocks\.4\.", False, False),
+    (r"^diffusion_model\.blocks\.3\.", False, True),
+    ("diffusion_model.blocks.3.*", True, True),
+])
+def test_excluded_lora_blocks_do_not_enter_metrics(
+    monkeypatch, tmp_path, analysis, patterns, glob_patterns, include_mode,
+):
     path_a = tmp_path / "lora_a.safetensors"
     path_b = tmp_path / "lora_b.safetensors"
     tensors_a = {}
@@ -247,7 +256,7 @@ def test_excluded_lora_blocks_do_not_enter_metrics(monkeypatch, tmp_path, analys
 
     comparison, cwb_report = analysis.ModelAnalysisLogic.execute(
         "a", "b", "loras",
-        _params(exclude_patterns=r"^diffusion_model\.blocks\.4\."),
+        _params(exclude_patterns=patterns, glob_patterns=glob_patterns, include_mode=include_mode),
         lora_mode=True,
     )
 
@@ -260,6 +269,40 @@ def test_excluded_lora_blocks_do_not_enter_metrics(monkeypatch, tmp_path, analys
     assert "blocks_3_" in layerwise
     assert "blocks_4_" not in layerwise
     assert "blocks_4_" not in cwb_report
+
+
+@pytest.mark.parametrize("patterns, glob_patterns, expected_keys", [
+    (r"^blocks\.0\.", False, ["blocks.0.weight"]),
+    ("blocks.0.*", True, ["blocks.0.weight"]),
+    ("", False, []),
+    ("no_such_layer", True, []),
+])
+def test_include_filter_limits_analysis_inventory(
+    monkeypatch, tmp_path, analysis, patterns, glob_patterns, expected_keys,
+):
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    for name, value in (("a", 1.0), ("b", 2.0)):
+        save_file({
+            "blocks.0.weight": torch.full((2, 2), value),
+            "blocks.1.weight": torch.full((2, 2), value),
+            f"only_{name}.weight": torch.full((2, 2), value),
+        }, paths[name])
+    monkeypatch.setattr(analysis.folder_paths, "get_full_path", lambda _, name: paths[name])
+    monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
+    streamed = []
+    original_stream = analysis.MemoryEfficientSafeOpen.async_stream
+
+    def stream(handler, keys, *args, **kwargs):
+        streamed.extend(keys)
+        return original_stream(handler, keys, *args, **kwargs)
+
+    monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "async_stream", stream)
+    analysis.ModelAnalysisLogic.execute(
+        "a", "b", "diffusion_models",
+        _params(exclude_patterns=patterns, glob_patterns=glob_patterns, include_mode=True),
+    )
+    assert sorted(streamed) == sorted(expected_keys * 2)
 
 
 def test_embedding_similarity_alignment_is_explicit_opt_in(analysis):

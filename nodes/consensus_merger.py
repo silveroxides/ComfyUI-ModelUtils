@@ -883,6 +883,7 @@ def _cwb_merge_metadata(
         "force_clear_cache",
         "override_dtype",
         "include_1d_diffs",
+        "include_mode",
         "counterfactual_weight_sweep",
         "embedding_coalesce",
         "target_vector_count",
@@ -897,9 +898,10 @@ def _cwb_merge_metadata(
             metadata["merge_options"][key] = params[key]
     exclude_patterns = params["exclude_patterns"].split()
     discard_patterns = params["discard_patterns"].split()
-    if exclude_patterns or discard_patterns:
+    if exclude_patterns or discard_patterns or params.get("include_mode", False):
         metadata["filters"] = {
             "exclude_patterns": exclude_patterns,
+            "include_mode": params.get("include_mode", False),
             "discard_patterns": discard_patterns,
             "glob_patterns": params["glob_patterns"],
         }
@@ -1794,6 +1796,7 @@ class ConsensusMergerLogic:
         requested_dtype = _requested_dtype(params["save_dtype"])
         mismatch_mode = params["mismatch_mode"]
         glob_mode = params["glob_patterns"]
+        include_mode = params.get("include_mode", False)
         exclude = _compile_patterns(params["exclude_patterns"], glob_mode=glob_mode)
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         pbar = comfy.utils.ProgressBar(len(keys))
@@ -1834,7 +1837,8 @@ class ConsensusMergerLogic:
                     secondary_only = not primary_owned
                     preserve_index = 0 if primary_owned else source_indices[0]
                     guarded = any(key in low_bit_sets[i] for i in source_indices)
-                    excluded = _matches_any_pattern(key, exclude, glob_mode=glob_mode)
+                    matched = _matches_any_pattern(key, exclude, glob_mode=glob_mode)
+                    excluded = not matched if include_mode else matched
                     if guarded or excluded:
                         write_preserved_tensor(
                             writer,
@@ -2058,6 +2062,7 @@ class ConsensusMergerLogic:
         mismatch_mode = params["mismatch_mode"]
         include_1d = params.get("include_1d_diffs", False)
         glob_mode = params["glob_patterns"]
+        include_mode = params.get("include_mode", False)
         exclude = _compile_patterns(params["exclude_patterns"], glob_mode=glob_mode)
         discard = _compile_patterns(params["discard_patterns"], glob_mode=glob_mode)
         written = set()
@@ -2266,10 +2271,11 @@ class ConsensusMergerLogic:
                         keys is not None and has_non_alpha_low_bit(keys, low_bit_sets[index])
                         for index, _, keys in matches
                     )
-                    excluded = any(
+                    matched = any(
                         _matches_any_pattern(key, exclude, glob_mode=glob_mode)
                         for key in layer_keys
                     )
+                    excluded = not matched if include_mode else matched
                     companion_bearing = any(
                         keys is not None and layer_has_companions(keys)
                         for _, _, keys in matches
@@ -2647,6 +2653,11 @@ def _common_inputs(
             default=False,
             tooltip="Force generated tensors to save_dtype; guarded tensors and enabled 1D direct diffs are exempt.",
         ),
+        io.Boolean.Input(
+            "include_mode",
+            default=False,
+            tooltip="Use Exclude Patterns as a whitelist instead. Only matching layers are merged; nonmatching layers are preserved from the anchor.",
+        ),
     ])
     return inputs
 
@@ -2705,11 +2716,13 @@ class _CWBMergerNode(io.ComfyNode):
             cls.DEFAULT_PRESET,
         )
         if cls.LORA_MODE:
+            include_mode = inputs.pop()
             inputs.append(io.Boolean.Input(
                 "include_1d_diffs",
                 default=False,
                 tooltip="CWB-merge 1D direct diffs as FP32. Disabled preserves Model A.",
             ))
+            inputs.append(include_mode)
         return io.Schema(
             node_id=cls.NODE_ID,
             display_name=cls.DISPLAY_NAME,
@@ -2838,6 +2851,7 @@ class CWBLoRAMultiMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force generated floating factors to the requested save dtype."),
                 io.Boolean.Input("include_1d_diffs", default=False, tooltip="CWB-merge 1D direct differences as FP32 instead of preserving the anchor."),
                 io.Boolean.Input("counterfactual_weight_sweep", default=False, tooltip="Evaluate alpha, beta, similarity-threshold, DSC, and comfort-bandpass weight combinations from each already-computed consensus similarity vector and append them to the report without additional model loads or saved outputs."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching layers are merged; nonmatching layers are preserved from the anchor."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),

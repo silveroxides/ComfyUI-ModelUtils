@@ -4,6 +4,12 @@ These nodes compare two safetensors models without merging them or writing an
 output file. Separate nodes are provided for checkpoints, diffusion models,
 text encoders, LoRAs, and embeddings.
 
+`exclude_patterns` accepts one regex per line, or glob patterns when
+`glob_patterns` is enabled. By default, matches are excluded from metrics and
+topology counts. Enable `include_mode` to analyze only matches instead; an empty
+include filter selects no tensors. The same field and matching syntax are used
+in both modes.
+
 ## Outputs
 
 `comparison_report` contains conventional numerical differences and topology

@@ -88,6 +88,55 @@ def test_resize_filters_preserve_and_discard_whole_layers(monkeypatch, tmp_path,
     assert actual["diffusion_model.resize.lora_A.weight"].shape[0] == 1
 
 
+@pytest.mark.parametrize("glob", [False, True])
+def test_resize_include_mode_only_resizes_matching_layers(monkeypatch, tmp_path, resize, glob):
+    source = tmp_path / "include_filters.safetensors"
+    tensors = {}
+    for name in ("include", "discard", "skip"):
+        tensors[f"diffusion_model.{name}.lora_A.weight"] = torch.eye(3, dtype=torch.float16)
+        tensors[f"diffusion_model.{name}.lora_B.weight"] = torch.eye(3, dtype=torch.float16)
+        tensors[f"diffusion_model.{name}.alpha"] = torch.tensor(1.5)
+    tensors["standalone.include"] = torch.ones(1)
+    tensors["standalone.skip"] = torch.ones(1)
+    _write_uel(source, tensors)
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    output = resize.resize_lora_file(
+        str(source), 1, None, None, "cpu", torch.bfloat16, "included", verbose=False,
+        exclude_patterns="*include*\n*discard*\nstandalone.include" if glob else r"\.(include|discard)\." + "\n^standalone\\.include$",
+        discard_patterns="*discard*" if glob else r"\.discard\.",
+        glob_patterns=glob,
+        include_mode=True,
+    )
+
+    actual = _read_uel(output)
+    assert actual["diffusion_model.include.lora_A.weight"].shape[0] == 1
+    assert torch.equal(actual["standalone.include"], tensors["standalone.include"])
+    assert not any(".discard." in key for key in actual)
+    for key in tensors:
+        if ".skip." in key or key == "standalone.skip":
+            assert torch.equal(actual[key], tensors[key])
+
+
+def test_resize_include_mode_empty_patterns_preserves_all_tensors(monkeypatch, tmp_path, resize):
+    source = tmp_path / "empty_include.safetensors"
+    tensors = {"standalone": torch.ones(2)}
+    _write_uel(source, tensors)
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    output = resize.resize_lora_file(
+        str(source), 1, None, None, "cpu", torch.float32, "empty", verbose=False,
+        include_mode=True,
+    )
+
+    actual = _read_uel(output)
+    assert torch.equal(actual["standalone"], tensors["standalone"])
+
+
 @pytest.mark.parametrize("node_name,extra", [
     ("LoRAResizeFixed", {"new_rank": 1}),
     ("LoRAResizeRatio", {"max_rank": 1, "ratio": 2.0}),
@@ -100,16 +149,19 @@ def test_all_resize_nodes_forward_filters(monkeypatch, tmp_path, resize, node_na
     assert controls["exclude_patterns"].default == ""
     assert controls["discard_patterns"].default == ""
     assert controls["glob_patterns"].default is False
+    assert controls["include_mode"].default is False
+    assert node.define_schema().inputs[-1].id == "include_mode"
     calls = []
     monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
     monkeypatch.setattr(resize.folder_paths, "get_full_path_or_raise", lambda *args: "input")
     monkeypatch.setattr(resize, "resize_lora_file", lambda *args, **kwargs: calls.append(kwargs))
     node.execute(lora_name="input", output_filename="out", save_dtype="fp16", device="cpu",
                  force_clear_cache=False, exclude_patterns="keep*", discard_patterns="drop*",
-                 glob_patterns=True, **extra)
+                 glob_patterns=True, include_mode=True, **extra)
     assert calls[0]["exclude_patterns"] == "keep*"
     assert calls[0]["discard_patterns"] == "drop*"
     assert calls[0]["glob_patterns"] is True
+    assert calls[0]["include_mode"] is True
 
 
 def test_resize_invalid_filter_fails_before_writer(monkeypatch, tmp_path, resize):

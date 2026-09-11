@@ -186,6 +186,36 @@ def test_streamed_merge_normalizes_alpha_once_and_supports_mixed_rank(
     assert metadata["output_representation"] == "full_direct_difference"
 
 
+@pytest.mark.parametrize("patterns, glob_patterns, selected", [
+    (r"\.selected", False, True),
+    ("*.selected*", True, True),
+    ("", False, False),
+    ("no_match", False, False),
+])
+def test_include_filter_preserves_nonmatches_and_discards_first(
+    monkeypatch, tmp_path, delta_cwb, patterns, glob_patterns, selected,
+):
+    paths = [tmp_path / f"{name}.safetensors" for name in ("a", "b")]
+    for path, value in zip(paths, (2.0, 6.0)):
+        _write(path, {
+            f"diffusion_model.{layer}.diff": torch.full((2, 2), value)
+            for layer in ("selected", "other", "selected_discard")
+        })
+    monkeypatch.setattr(delta_cwb.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(delta_cwb, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(delta_cwb, "cleanup_after_operation", lambda: None)
+    filename, _ = delta_cwb.DeltaCWBLoRAMergerLogic.execute(
+        [str(path) for path in paths], [path.name for path in paths], _settings(delta_cwb),
+        "balanced_mean", False, "skip", "include_filter", torch.float32,
+        "full_difference", 384, "cpu", patterns,
+        "*discard*" if glob_patterns else "discard", glob_patterns, False, include_mode=True,
+    )
+    tensors = _read(tmp_path / "loras" / filename)
+    assert set(tensors) == {"diffusion_model.selected.diff", "diffusion_model.other.diff"}
+    torch.testing.assert_close(tensors["diffusion_model.selected.diff"], torch.full((2, 2), 4.0 if selected else 2.0))
+    torch.testing.assert_close(tensors["diffusion_model.other.diff"], torch.full((2, 2), 2.0))
+
+
 def test_existing_diff_and_1d_output_remain_fp32(monkeypatch, tmp_path, delta_cwb):
     first = tmp_path / "diff_first.safetensors"
     second = tmp_path / "diff_second.safetensors"
@@ -350,7 +380,7 @@ def test_exact_node_schema_contract(delta_cwb):
         "lora_1", "lora_2", "cwb_preset", "cwb_config", "mismatch_mode",
         "output_filename", "save_dtype", "output_representation", "output_rank",
         "process_device", "exclude_patterns",
-        "discard_patterns", "glob_patterns", "force_clear_cache",
+        "discard_patterns", "glob_patterns", "force_clear_cache", "include_mode",
     ]
     multi_ids = [value.id for value in schemas[2].inputs]
     assert multi_ids[:9] == ["lora_count", *[f"lora_{index}" for index in range(1, 9)]]
@@ -360,8 +390,8 @@ def test_exact_node_schema_contract(delta_cwb):
     assert schemas[0].inputs[7].default == "full_difference"
     assert schemas[0].inputs[8].default == 384
     assert schemas[0].inputs[9].default == "cuda"
-    assert schemas[0].inputs[-2].default is False
-    assert schemas[0].inputs[-1].default is True
+    assert schemas[0].inputs[-2].default is True
+    assert schemas[0].inputs[-1].default is False
     assert "agreement" in schemas[0].inputs[2].tooltip
     assert "Only a failed CUDA layer retries on CPU" in schemas[0].inputs[9].tooltip
 

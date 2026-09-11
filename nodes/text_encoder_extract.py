@@ -81,6 +81,7 @@ def extract_te_from_files(
     force_clear_cache: bool = True,
     glob_skip_patterns: bool = False,
     knee_probe_offset: int = 32,
+    include_mode: bool = False,
 ) -> None:
     """
     Extract LoRA/DoRA from difference between two Text Encoder models, writing incrementally to disk.
@@ -108,7 +109,7 @@ def extract_te_from_files(
         work_units = [
             (key, key, key if key in keys_b else None)
             for key in weight_keys
-            if not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)
+            if (not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns))
             and not (key not in keys_b and mismatch_mode == "skip")
         ]
         pbar = comfy.utils.ProgressBar(len(work_units))
@@ -119,7 +120,7 @@ def extract_te_from_files(
             weight_diff = None
             layer_device = device
 
-            if _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns):
+            if (_matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)):
                 return "skipped", None
 
             # Load tensors with pinned memory for CUDA
@@ -300,6 +301,7 @@ def _get_common_inputs():
         io.Boolean.Input("glob_skip_patterns", default=False,
                         tooltip="When True, skip_patterns use glob syntax (* = any sequence, ? = any char, dots are literal). "
                                 "When False (default), patterns are Python regex matched as substrings."),
+        io.Boolean.Input("include_mode", default=False, tooltip="Use Skip Patterns as a whitelist instead. Only matching layers are extracted; an empty whitelist extracts nothing."),
     ]
 
 
@@ -329,7 +331,7 @@ class TextEncoderLoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -341,7 +343,7 @@ class TextEncoderLoRAExtractFixed(io.ComfyNode):
             linear_max_rank=linear_dim, conv_max_rank=conv_dim,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers, svd_niter=svd_niter,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode
         )
         return io.NodeOutput(output_name)
 
@@ -370,7 +372,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -382,7 +384,7 @@ class TextEncoderLoRAExtractRatio(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)
@@ -412,7 +414,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -424,7 +426,7 @@ class TextEncoderLoRAExtractQuantile(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)
@@ -454,7 +456,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
     def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
                 linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -467,7 +469,7 @@ class TextEncoderLoRAExtractKnee(io.ComfyNode):
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset, include_mode=include_mode
         )
         return io.NodeOutput(output_name)
 
@@ -496,7 +498,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -508,7 +510,7 @@ class TextEncoderLoRAExtractFrobenius(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)
@@ -540,7 +542,7 @@ class TextEncoderDoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -552,7 +554,7 @@ class TextEncoderDoRAExtractFixed(io.ComfyNode):
             linear_max_rank=linear_dim, conv_max_rank=conv_dim,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers, svd_niter=svd_niter,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode
         )
         return io.NodeOutput(output_name)
 
@@ -581,7 +583,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -593,7 +595,7 @@ class TextEncoderDoRAExtractRatio(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)
@@ -623,7 +625,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -635,7 +637,7 @@ class TextEncoderDoRAExtractQuantile(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)
@@ -665,7 +667,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
     def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
                 linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -678,7 +680,7 @@ class TextEncoderDoRAExtractKnee(io.ComfyNode):
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=knee_probe_offset, include_mode=include_mode
         )
         return io.NodeOutput(output_name)
 
@@ -707,7 +709,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("text_encoders", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("text_encoders", model_b)
@@ -719,7 +721,7 @@ class TextEncoderDoRAExtractFrobenius(io.ComfyNode):
             linear_max_rank=linear_max_rank, conv_max_rank=conv_max_rank,
             clamp_quantile=clamp_quantile, min_diff=min_diff, skip_patterns_str=skip_patterns,
             mismatch_mode=mismatch_mode, chunk_large_layers=chunk_large_layers,
-            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns,
+            lazy_load=lazy_load, force_clear_cache=force_clear_cache, glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=probe_offset
         )
         return io.NodeOutput(output_name)

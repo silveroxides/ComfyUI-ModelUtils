@@ -55,6 +55,7 @@ def convert_diffusion_model_dtype(
     exclude_patterns: str,
     output_filename: str,
     reference_model: str | None = None,
+    include_mode: bool = False,
 ) -> tuple[str, str]:
     try:
         destination_dtype = TARGET_DTYPES[target_dtype]
@@ -104,7 +105,7 @@ def convert_diffusion_model_dtype(
                     key, source = batch[0]
                     original_dtypes[str(source.dtype).removeprefix("torch.")] += 1
                     output = source
-                    if _is_excluded(key, exclusions):
+                    if _is_excluded(key, exclusions) != include_mode:
                         counts["excluded"] += 1
                     elif not source.is_floating_point():
                         counts["non_floating"] += 1
@@ -175,7 +176,8 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
             description=(
                 "Streams a diffusion-model safetensors file into fp32, fp16, "
                 "or bf16. Floating tensors matching an exclusion regex retain "
-                "their original dtype; non-floating tensors are always preserved."
+                "their original dtype, or enable Include Mode to convert only matches; "
+                "non-floating tensors are always preserved."
             ),
             inputs=[
                 io.Combo.Input(
@@ -185,7 +187,7 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "target_dtype", options=["fp32", "fp16", "bf16"],
-                    tooltip="Target dtype for floating tensors not matched by an exclusion pattern.",
+                    tooltip="Target dtype for floating tensors selected by the layer filter.",
                 ),
                 io.Combo.Input(
                     "reference_model",
@@ -199,12 +201,17 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
                     multiline=True,
                     tooltip=(
                         "Optional Python regex patterns, one per line. Matching "
-                        "tensor keys retain their original dtype."
+                        "tensor keys retain their original dtype, or are the only keys "
+                        "converted when Include Mode is enabled."
                     ),
                 ),
                 io.String.Input(
                     "output_filename", default="converted_model",
                     tooltip="Output filename without extension, written under ComfyUI's diffusion-model directory.",
+                ),
+                io.Boolean.Input(
+                    "include_mode", default=False,
+                    tooltip="Use Exclude Patterns as an include-only filter. Only matching tensors are converted; an empty filter converts nothing. Nonmatches retain their original dtype.",
                 ),
             ],
             outputs=[
@@ -222,6 +229,7 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
         reference_model: str,
         exclude_patterns: str,
         output_filename: str,
+        include_mode: bool = False,
     ) -> io.NodeOutput:
         output_path, report = convert_diffusion_model_dtype(
             model_name,
@@ -229,5 +237,6 @@ class DiffusionModelDtypeConversion(io.ComfyNode):
             exclude_patterns,
             output_filename,
             reference_model,
+            include_mode,
         )
         return io.NodeOutput(output_path, report)

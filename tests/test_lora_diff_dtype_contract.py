@@ -417,18 +417,68 @@ def test_merge_to_model_report_lists_skipped_tensor_and_pattern(
     assert "[SKIPPED BY PATTERN] (1)" in report
 
 
+@pytest.mark.parametrize("patterns, selected", [
+    (r"selected\.weight$", True),
+    ("", False),
+    ("no_match", False),
+])
+def test_merge_to_model_include_filter_limits_stream_and_output(
+    monkeypatch, tmp_path, modules, patterns, selected,
+):
+    resize, _ = modules
+    _patch_output(monkeypatch, resize, tmp_path)
+    base = tmp_path / "include_base.safetensors"
+    adapter = tmp_path / "include_adapter.safetensors"
+    save_file({
+        f"model.diffusion_model.{name}.weight": torch.zeros((2, 2))
+        for name in ("selected", "other")
+    }, str(base))
+    save_file({
+        f"diffusion_model.{name}.{factor}": torch.ones(shape)
+        for name in ("selected", "other")
+        for factor, shape in (("lora_A.weight", (1, 2)), ("lora_B.weight", (2, 1)))
+    }, str(adapter))
+    planned_keys = []
+    real_stream = resize.stream_work_units
+
+    def capture_units(handlers, units, **kwargs):
+        units = list(units)
+        planned_keys.extend(key for _, entries in units for keys in entries.values() for key in keys)
+        return real_stream(handlers, units, **kwargs)
+
+    monkeypatch.setattr(resize, "stream_work_units", capture_units)
+    path, report = resize.merge_loras_to_model(
+        [str(adapter)], [1.0], str(base), "cpu", torch.float32,
+        "include_result", skip_patterns_str=patterns, verbose=False,
+        return_report=True, include_mode=True,
+    )
+    tensors = load_file(path)
+    assert set(tensors) == ({"model.diffusion_model.selected.weight"} if selected else set())
+    if selected:
+        torch.testing.assert_close(tensors["model.diffusion_model.selected.weight"], torch.ones((2, 2)))
+        assert len(planned_keys) == 3
+        assert all("selected" in key for key in planned_keys)
+    else:
+        assert planned_keys == []
+    assert "no include pattern matched" in report
+
+
+@pytest.mark.parametrize("include_mode", [False, True])
 def test_merge_to_model_node_returns_path_blank_line_report(
-    monkeypatch, modules
+    monkeypatch, modules, include_mode,
 ):
     resize, _ = modules
     monkeypatch.setattr(
         resize.folder_paths, "get_full_path_or_raise",
         lambda category, name: f"{category}/{name}",
     )
-    monkeypatch.setattr(
-        resize, "merge_loras_to_model",
-        lambda **kwargs: ("saved/model.safetensors", "SUCCESS\nDETAILS"),
-    )
+    received = {}
+
+    def merge(**kwargs):
+        received.update(kwargs)
+        return "saved/model.safetensors", "SUCCESS\nDETAILS"
+
+    monkeypatch.setattr(resize, "merge_loras_to_model", merge)
 
     result = resize.LoRAMergeToModel.execute(
         "base.safetensors", "1",
@@ -436,9 +486,11 @@ def test_merge_to_model_node_returns_path_blank_line_report(
         "None", 1.0, "None", 1.0, "None", 1.0,
         "None", 1.0, "None", 1.0, "None", 1.0, "None", 1.0,
         "", "merged", "fp32", "cpu", True, False, False,
+        include_mode=include_mode,
     )
 
     assert result.result == ("merged.safetensors", "SUCCESS\nDETAILS")
+    assert received["include_mode"] is include_mode
 
 
 def test_mixed_parser_scans_every_key_and_retains_unpaired(modules):
@@ -486,7 +538,10 @@ def test_include_1d_switches_are_appended_and_default_off(modules, generic_modul
 
     for node_class in node_classes:
         final_input = node_class.define_schema().inputs[-1]
-        assert final_input.id == "include_1d_diffs"
+        expected = "include_mode" if node_class in {
+            generic.LoRATwoMerger, generic.LoRAThreeMerger, resize.LoRAMergeToModel
+        } else "include_1d_diffs"
+        assert final_input.id == expected
         assert final_input.default is False
 
     outputs = resize.LoRAMergeToModel.define_schema().outputs

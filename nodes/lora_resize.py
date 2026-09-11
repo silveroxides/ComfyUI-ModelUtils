@@ -648,12 +648,14 @@ def _resize_filter_inputs():
         io.String.Input("exclude_patterns", default="", multiline=True, tooltip="One pattern per line. Matching layer names or source/canonical tensor keys keep the whole layer at its original rank and precision, including alpha."),
         io.String.Input("discard_patterns", default="", multiline=True, tooltip="One pattern per line. Remove the whole matching layer, including factors and alpha. Discard takes precedence over exclude."),
         io.Boolean.Input("glob_patterns", default=False, tooltip="Use shell-style glob patterns instead of regular expressions for exclude and discard filters."),
+        io.Boolean.Input("include_mode", default=False, tooltip="Treat exclude patterns as an include list. Matching layers are resized; nonmatching layers are preserved unchanged. Discard patterns still remove matching layers."),
     ]
 
 
 def _build_resize_work_units(
     handler, pairs, passthrough_keys, low_bit_keys,
     exclude_patterns="", discard_patterns="", glob_patterns=False,
+    include_mode=False,
 ):
     """Plan raw-copy and streamed work without loading tensor payloads."""
     raw_units = []
@@ -691,7 +693,8 @@ def _build_resize_work_units(
         if matches(discards, names):
             claimed.update(key for _, key, _ in group_entries)
             continue
-        excluded = matches(excludes, names)
+        matched = matches(excludes, names)
+        preserve = matched != include_mode
 
         if layer_has_low_bit(block_keys, low_bit_keys):
             raw_entries = entries + related_passthrough
@@ -699,7 +702,7 @@ def _build_resize_work_units(
             claimed.update(key for _, key, _ in raw_entries)
             continue
 
-        if excluded:
+        if preserve:
             stream_units.append({"kind": "preserve", "entries": group_entries})
             claimed.update(key for _, key, _ in group_entries)
         elif layer_has_companions(block_keys):
@@ -725,11 +728,12 @@ def _build_resize_work_units(
         if matches(discards, [key]):
             continue
         entry = (None, key, key)
+        matched = matches(excludes, [key])
         if key in low_bit_keys:
             raw_units.append({"entries": [entry]})
         else:
             stream_units.append({
-                "kind": "preserve" if matches(excludes, [key]) else "copy",
+                "kind": "preserve" if matched != include_mode else "copy",
                 "entries": [entry],
             })
         claimed.add(key)
@@ -902,6 +906,7 @@ def resize_lora_file(
     exclude_patterns: str = "",
     discard_patterns: str = "",
     glob_patterns: bool = False,
+    include_mode: bool = False,
 ) -> str:
     """Resize a LoRA through one bounded UEL stream and factor-space SVD."""
     if min_rank < 1:
@@ -925,7 +930,7 @@ def resize_lora_file(
         raw_units, stream_units, rank_counts, preserved_companion_groups = (
             _build_resize_work_units(
                 handler, pairs, passthrough_keys, low_bit_keys,
-                exclude_patterns, discard_patterns, glob_patterns,
+                exclude_patterns, discard_patterns, glob_patterns, include_mode,
             )
         )
         rank_text = _rank_summary(rank_counts)
@@ -948,6 +953,9 @@ def resize_lora_file(
         )
         metadata["ss_network_dim"] = "Dynamic"
         metadata["ss_network_alpha"] = "Dynamic"
+        metadata["modelutils_resize_filter_mode"] = (
+            "include" if include_mode else "exclude"
+        )
 
         output_path, _ = canonical_model_artifact_path("loras", output_filename)
 
@@ -1230,7 +1238,7 @@ class LoRAResizeFixed(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1240,6 +1248,7 @@ class LoRAResizeFixed(io.ComfyNode):
             exclude_patterns=exclude_patterns,
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
+            include_mode=include_mode,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1273,7 +1282,7 @@ class LoRAResizeRatio(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1283,6 +1292,7 @@ class LoRAResizeRatio(io.ComfyNode):
             exclude_patterns=exclude_patterns,
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
+            include_mode=include_mode,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1318,7 +1328,7 @@ class LoRAResizeFrobenius(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1328,6 +1338,7 @@ class LoRAResizeFrobenius(io.ComfyNode):
             exclude_patterns=exclude_patterns,
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
+            include_mode=include_mode,
             min_rank=min_rank,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
@@ -1362,7 +1373,7 @@ class LoRAResizeCumulative(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1372,6 +1383,7 @@ class LoRAResizeCumulative(io.ComfyNode):
             exclude_patterns=exclude_patterns,
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
+            include_mode=include_mode,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1396,6 +1408,7 @@ def merge_loras_to_model(
     force_clear_cache: bool = False,
     include_1d_diffs: bool = False,
     return_report: bool = False,
+    include_mode: bool = False,
 ) -> str | tuple[str, str]:
     """
     Merge multiple LoRAs into a base model and save the result directly.
@@ -1416,6 +1429,7 @@ def merge_loras_to_model(
         lazy_load: Low memory mode: load tensors from disk on demand
         force_clear_cache: Clear CUDA cache after each layer
         return_report: Return the path and merge report instead of only the path
+        include_mode: Use skip_patterns_str to select matching base keys instead
 
     Returns:
         Path to saved merged model, optionally paired with the merge report
@@ -1664,7 +1678,7 @@ def merge_loras_to_model(
             if planned_base_key.endswith(".weight"):
                 core = extract_core_layer_base(planned_base_key)
                 planned_low_rank = lora_lookup.get(core.replace(".", "_"), [])
-            skipped = any(pattern.search(planned_base_key) for pattern in skip_patterns)
+            skipped = any(pattern.search(planned_base_key) for pattern in skip_patterns) != include_mode
             entries = {}
             if planned_base_key not in base_low_bit_keys and not skipped:
                 entries[-1] = [planned_base_key]
@@ -1745,20 +1759,21 @@ def merge_loras_to_model(
                         (pattern.pattern for pattern in skip_patterns if pattern.search(base_key)),
                         None,
                     )
-                    if skip_pattern is not None:
+                    if (skip_pattern is not None) != include_mode:
+                        skip_reason = "no include pattern matched" if include_mode else f"pattern={skip_pattern}"
                         stats["skipped"] += 1
                         base_outcomes["OMITTED BY SKIP PATTERN"].append(
-                            f"{base_key}: pattern={skip_pattern}"
+                            f"{base_key}: {skip_reason}"
                         )
                         for info, block_name, _, direct_key, _ in direct_contributions:
                             record_group_event(
                                 info, block_name, "skipped", base_key,
-                                f"target omitted by pattern {skip_pattern}; source={direct_key}",
+                                f"target omitted: {skip_reason}; source={direct_key}",
                             )
                         for info, block_name, block_keys in low_rank_contributions:
                             record_group_event(
                                 info, block_name, "skipped", base_key,
-                                f"target omitted by pattern {skip_pattern}; sources="
+                                f"target omitted: {skip_reason}; sources="
                                 + ", ".join(sorted(layer_tensor_keys(block_keys).values())),
                             )
                         pbar.update(1)
@@ -2220,7 +2235,7 @@ class LoRAMergeToModel(io.ComfyNode):
                               tooltip="Weight strength for LoRA 8"),
                 # Settings
                 io.String.Input("skip_patterns", default="", multiline=True,
-                               tooltip="Regex patterns for layers to skip"),
+                               tooltip="Regex patterns for base tensor keys to omit, or to include when Include Mode is enabled. Guarded low-bit base tensors are always preserved."),
                 io.String.Input("output_filename", default="merged_model", tooltip="Output filename without extension, written under ComfyUI's diffusion-model directory."),
                 io.Combo.Input("save_dtype", options=["fp16", "bf16", "fp32"], default="fp16", tooltip="Data type used to save the model after applying the LoRA."),
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer LoRA application; CUDA out-of-memory retries the affected layer on CPU."),
@@ -2228,6 +2243,8 @@ class LoRAMergeToModel(io.ComfyNode):
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Apply 1D direct-diff tensors as FP32. Disabled preserves prior behavior."),
+                io.Boolean.Input("include_mode", default=False,
+                                 tooltip="Use Skip Patterns as an include-only filter. Only matching base tensors are processed and saved; an empty filter selects nothing. Guarded low-bit base tensors remain preserved."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -2241,7 +2258,7 @@ class LoRAMergeToModel(io.ComfyNode):
                 lora_1, weight_1, lora_2, weight_2, lora_3, weight_3, lora_4, weight_4,
                 lora_5, weight_5, lora_6, weight_6, lora_7, weight_7, lora_8, weight_8,
                 skip_patterns, output_filename, save_dtype, device, lazy_load, force_clear_cache,
-                include_1d_diffs) -> io.NodeOutput:
+                include_1d_diffs, include_mode=False) -> io.NodeOutput:
 
         # Build LoRA list based on count
         count = int(lora_count)
@@ -2270,6 +2287,7 @@ class LoRAMergeToModel(io.ComfyNode):
             force_clear_cache=force_clear_cache,
             include_1d_diffs=include_1d_diffs,
             return_report=True,
+            include_mode=include_mode,
         )
         _, output_name = canonical_model_artifact_path("diffusion_models", output_filename)
         return io.NodeOutput(output_name, report)

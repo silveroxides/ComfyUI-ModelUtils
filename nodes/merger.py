@@ -128,6 +128,7 @@ class MergerLogic:
 
         # Compile filter patterns
         glob_mode = recipe_params.get('glob_patterns', False)
+        include_mode = recipe_params.get('include_mode', False)
         exclude_patterns = _compile_patterns(recipe_params.get('exclude_patterns', ''), glob_mode=glob_mode)
         discard_patterns = _compile_patterns(recipe_params.get('discard_patterns', ''), glob_mode=glob_mode)
 
@@ -216,7 +217,11 @@ class MergerLogic:
                     model_type == "loras"
                     and len(primary_handler.get_shape(key)) == 1
                     and not include_1d_diffs
-                ) or _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                ) or (
+                    not _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                    if include_mode else
+                    _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                )
                 requested_names = [primary_model_name]
                 if not preserve_a:
                     requested_names.extend(
@@ -297,7 +302,11 @@ class MergerLogic:
                 del cpu_tensor
 
                 # Check exclude patterns - use Model A only, no merge
-                if preserve_model_a_1d or _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode):
+                if preserve_model_a_1d or (
+                    not _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                    if include_mode else
+                    _matches_any_pattern(key, exclude_patterns, glob_mode=glob_mode)
+                ):
                     t = tensor_a.detach().to(target_dtype).cpu()
 
                     writer.write_batch([(key, t)])
@@ -418,6 +427,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -430,7 +440,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -443,6 +453,7 @@ class CheckpointTwoMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
@@ -484,6 +495,7 @@ class ModelTwoMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -496,7 +508,7 @@ class ModelTwoMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -509,6 +521,7 @@ class ModelTwoMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
@@ -550,6 +563,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -562,7 +576,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -575,6 +589,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
@@ -618,6 +633,7 @@ class LoRATwoMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -631,7 +647,7 @@ class LoRATwoMerger(io.ComfyNode):
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
                 glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool,
-                include_1d_diffs: bool) -> io.NodeOutput:
+                include_1d_diffs: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -644,6 +660,7 @@ class LoRATwoMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
             "include_1d_diffs": include_1d_diffs,
         }
@@ -686,6 +703,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -698,7 +716,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_2_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -711,6 +729,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b}
@@ -755,6 +774,7 @@ class CheckpointThreeMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -767,7 +787,7 @@ class CheckpointThreeMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -780,6 +800,7 @@ class CheckpointThreeMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
@@ -822,6 +843,7 @@ class ModelThreeMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -834,7 +856,7 @@ class ModelThreeMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -847,6 +869,7 @@ class ModelThreeMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
@@ -889,6 +912,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -901,7 +925,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -914,6 +938,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}
@@ -958,6 +983,7 @@ class LoRAThreeMerger(io.ComfyNode):
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -971,7 +997,7 @@ class LoRAThreeMerger(io.ComfyNode):
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
                 glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool,
-                include_1d_diffs: bool) -> io.NodeOutput:
+                include_1d_diffs: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -984,6 +1010,7 @@ class LoRAThreeMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
             "include_1d_diffs": include_1d_diffs,
         }
@@ -1027,6 +1054,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
                 io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_filename"),
@@ -1039,7 +1067,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
                 calc_mode: str, mismatch_mode: str, alignment_mode: str, alpha: float, beta: float,
                 gamma: float, delta: float, epsilon: float, zeta: float, seed: int, output_filename: str, save_dtype: str,
                 process_device: str, exclude_patterns: str, discard_patterns: str,
-                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool) -> io.NodeOutput:
+                glob_patterns: bool, lazy_load: bool, force_clear_cache: bool, override_dtype: bool, include_mode: bool = False) -> io.NodeOutput:
         doc = load_documentation_from_file('merger_3_model_modes.md')
         if execution_mode == "DOCUMENTATION ONLY":
             return io.NodeOutput("Documentation mode active. No merge performed.", doc)
@@ -1052,6 +1080,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
             "device": process_device, "dtype": torch.float32,
             "exclude_patterns": exclude_patterns, "discard_patterns": discard_patterns,
             "glob_patterns": glob_patterns,
+            "include_mode": include_mode,
             "lazy_load": lazy_load, "force_clear_cache": force_clear_cache,
         }
         model_names = {"model_a": model_a, "model_b": model_b, "model_c": model_c}

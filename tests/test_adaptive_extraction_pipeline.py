@@ -217,3 +217,38 @@ def test_lora_extraction_uses_only_async_uel_and_releases_sources(monkeypatch, t
             "diffusion_model.layer.lora_A.weight",
             "diffusion_model.layer.lora_B.weight",
         ]
+
+
+@pytest.mark.parametrize("module_name, function_name, extra", [
+    ("nodes.lora_extract_svd", "extract_lora_from_files", {"include_1d_diffs": False}),
+    ("nodes.dora_extract_wd", "extract_dora_from_files", {}),
+    ("nodes.dora_learned_wd", "extract_dora_learned_from_files", {"optimize_iters": 0}),
+    ("nodes.text_encoder_extract", "extract_te_from_files", {"is_dora": False}),
+    ("nodes.text_encoder_extract", "extract_te_from_files", {"is_dora": True}),
+])
+def test_extraction_include_mode_selects_only_matching_layers(monkeypatch, tmp_path, module_name, function_name, extra):
+    module = _load_module(module_name)
+    first, second = tmp_path / "first.safetensors", tmp_path / "second.safetensors"
+    match, other = "model.encoder.match.weight", "model.encoder.other.weight"
+    _write_uel(first, {match: torch.eye(2), other: torch.eye(2)})
+    _write_uel(second, {match: torch.zeros(2, 2), other: torch.zeros(2, 2)})
+    monkeypatch.setattr(module, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(module, "cleanup_after_operation", lambda: None)
+    common = dict(linear_max_rank=1, conv_max_rank=1, force_clear_cache=False,
+                  skip_patterns_str="match", include_mode=True, **extra)
+    selected = tmp_path / "selected.safetensors"
+    getattr(module, function_name)(str(first), str(second), "fixed", 1, 1, "cpu", "fp32", str(selected), **common)
+    with MemoryEfficientSafeOpen(str(selected), low_memory=True) as result:
+        keys = list(result.keys())
+        assert keys
+        assert all("match" in key for key in keys)
+    empty = tmp_path / "empty.safetensors"
+    common["skip_patterns_str"] = ""
+    getattr(module, function_name)(str(first), str(second), "fixed", 1, 1, "cpu", "fp32", str(empty), **common)
+    with MemoryEfficientSafeOpen(str(empty), low_memory=True) as result:
+        assert list(result.keys()) == []
+    globbed = tmp_path / "globbed.safetensors"
+    common.update(skip_patterns_str="*.match.weight", glob_skip_patterns=True)
+    getattr(module, function_name)(str(first), str(second), "fixed", 1, 1, "cpu", "fp32", str(globbed), **common)
+    with MemoryEfficientSafeOpen(str(globbed), low_memory=True) as result:
+        assert list(result.keys()) == keys
