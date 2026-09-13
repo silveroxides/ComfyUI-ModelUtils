@@ -68,3 +68,65 @@ def test_include_filter_controls_preflight_and_streaming(monkeypatch, tmp_path, 
     globbed = _run(monkeypatch, tmp_path, merger, operations, _params("globbed", patterns="*.weight", include=True, glob=True))
     assert globbed["match.weight"].item() == 4.0
     assert globbed["other.weight"].item() == 6.0
+
+
+def test_layer_parameters_apply_per_layer_without_leakage(monkeypatch, tmp_path, modules):
+    merger, operations = modules
+
+    def resolve(_payload, operation, layers, defaults, *, node_name):
+        assert operation == "merge:Weight-Sum"
+        assert node_name == "checkpoints Weight-Sum merger"
+        assert set(layers) == {"match.weight", "other.weight"}
+        assert defaults["alpha"] == 0.5
+        return {"match.weight": {"alpha": 0.0}, "other.weight": {"alpha": 1.0}}
+
+    monkeypatch.setattr(merger, "resolve_layer_parameters", resolve)
+    result = _run(monkeypatch, tmp_path, merger, operations, _params("per_layer"))
+    assert result["match.weight"].item() == 2.0
+    assert result["other.weight"].item() == 8.0
+
+
+def test_parsed_layer_parameters_change_only_matching_output(monkeypatch, tmp_path, modules):
+    merger, operations = modules
+    layer_parameters = _module("nodes.layer_parameters")
+    params = _params("parsed")
+    params["layer_parameters"] = layer_parameters.parse_rules("(match\\.weight) alpha:0\n")
+    result = _run(monkeypatch, tmp_path, merger, operations, params)
+    assert result["match.weight"].item() == 2.0
+    assert result["other.weight"].item() == 6.0
+
+
+def test_layer_parameter_failure_precedes_writer_and_streaming(monkeypatch, tmp_path, modules):
+    merger, operations = modules
+    monkeypatch.setattr(
+        merger,
+        "resolve_layer_parameters",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unmatched rule line 1")),
+    )
+    params = _params("must_not_exist")
+    with pytest.raises(ValueError, match="unmatched rule"):
+        _run(monkeypatch, tmp_path, merger, operations, params)
+    assert not (tmp_path / "checkpoints" / "must_not_exist.safetensors").exists()
+
+
+def test_lora_factor_group_uses_one_normalized_layer_name(monkeypatch, tmp_path, modules):
+    merger, operations = modules
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    tensors = {
+        "diffusion_model.layer.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+        "diffusion_model.layer.lora_B.weight": torch.tensor([[1.0], [2.0]]),
+    }
+    save_file({**tensors, "diffusion_model.layer.alpha": torch.tensor(1.0)}, paths["a"])
+    save_file(tensors, paths["b"])
+    monkeypatch.setattr(merger.folder_paths, "get_full_path", lambda _kind, name: paths.get(name))
+    monkeypatch.setattr(merger.folder_paths, "get_folder_paths", lambda _kind: [str(tmp_path)])
+    monkeypatch.setattr(merger.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(merger, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(merger, "cleanup_after_operation", lambda: None)
+    params = _params("lora_group")
+    params.update({"model_a": "a", "model_b": "b", "layer_parameters": _module("nodes.layer_parameters").parse_rules("(diffusion_model\\.layer) alpha:0\n")})
+    merger.MergerLogic.execute_merge({"model_a": "a", "model_b": "b"}, "Weight-Sum", operations.TWO_MODEL_MODES, params, "loras")
+    result = load_file(str(tmp_path / "loras" / "lora_group.safetensors"))
+    assert "diffusion_model.layer.lora_A.weight" in result
+    assert "diffusion_model.layer.lora_B.weight" in result
+    assert not any(key.endswith(".alpha") for key in result)

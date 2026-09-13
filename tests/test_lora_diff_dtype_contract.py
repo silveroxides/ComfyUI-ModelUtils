@@ -537,7 +537,7 @@ def test_include_1d_switches_are_appended_and_default_off(modules, generic_modul
     ]
 
     for node_class in node_classes:
-        final_input = node_class.define_schema().inputs[-1]
+        final_input = [item for item in node_class.define_schema().inputs if item.id != "layer_parameters"][-1]
         expected = "include_mode" if node_class in {
             generic.LoRATwoMerger, generic.LoRAThreeMerger, resize.LoRAMergeToModel
         } else "include_1d_diffs"

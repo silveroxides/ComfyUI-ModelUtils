@@ -150,7 +150,7 @@ def test_all_resize_nodes_forward_filters(monkeypatch, tmp_path, resize, node_na
     assert controls["discard_patterns"].default == ""
     assert controls["glob_patterns"].default is False
     assert controls["include_mode"].default is False
-    assert node.define_schema().inputs[-1].id == "include_mode"
+    assert [item.id for item in node.define_schema().inputs if item.id != "layer_parameters"][-1] == "include_mode"
     calls = []
     monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
     monkeypatch.setattr(resize.folder_paths, "get_full_path_or_raise", lambda *args: "input")

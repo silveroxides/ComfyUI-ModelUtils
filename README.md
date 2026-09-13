@@ -25,6 +25,20 @@ guarded low-bit base tensors are always preserved. Its filter uses regex only.
 
 ## Example Workflows
 
+### Per-layer parameters
+
+Connect **Layer Parameter Configuration** to `layer_parameters` on standard
+two/three-input mergers, extraction nodes, or LoRA resize nodes. For example,
+fixed extraction accepts `(blocks\.4[589]\.attn\.qkv_proj) a:64 b:32 c:0.99 d:0`.
+Short aliases and full names, with whitespace or comma separators, are supported.
+The configurator's documentation output lists every method's bindings and bounds.
+
+Only explicitly assigned values override the receiving node; other settings and
+existing filters still apply. Overlapping rules and rules matching no target
+layer fail before streaming or writing. LoRA patterns target the existing
+normalized logical layer names, not individual factor/alpha suffixes.
+
+
 <p align="center">
   <img src="assets/GetMetaAndkeys.png" width="400" alt="Get Meta and Keys">
   <br>

@@ -61,11 +61,13 @@ from .nodes.model_info_nodes import (
 
 from .nodes.lora_rename import AnimaLoraRename
 from .nodes.dtype_conversion import DiffusionModelDtypeConversion
+from .nodes.layer_parameters import LayerParameterConfiguration
 
 class ModelUtilsExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            LayerParameterConfiguration,
             # MetaKeys
             ModelMetaKeys, TextEncoderMetaKeys, LoRAMetaKeys,
             CheckpointMetaKeys, EmbeddingMetaKeys,

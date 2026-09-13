@@ -22,6 +22,7 @@ from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinn
 from .uel_io import atomic_uel_writer, stream_work_units
 from .artifact_paths import canonical_model_artifact_path
 from .lora_alpha import lora_alpha_scale, normalize_lora_pair
+from .layer_parameters import parameter_input, resolve_layer_parameters
 from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
 
@@ -655,7 +656,7 @@ def _resize_filter_inputs():
 def _build_resize_work_units(
     handler, pairs, passthrough_keys, low_bit_keys,
     exclude_patterns="", discard_patterns="", glob_patterns=False,
-    include_mode=False,
+    include_mode=False, layer_parameters=None,
 ):
     """Plan raw-copy and streamed work without loading tensor payloads."""
     raw_units = []
@@ -712,6 +713,9 @@ def _build_resize_work_units(
             stream_units.append({
                 "kind": "resize",
                 "entries": entries,
+                "resize_parameters": (layer_parameters or {}).get(
+                    canonical_lora_block_name(block_name)
+                ),
                 "alpha_output": (
                     canonical_lora_key(block_name, "alpha")
                     if "alpha" in block_keys
@@ -907,12 +911,34 @@ def resize_lora_file(
     discard_patterns: str = "",
     glob_patterns: bool = False,
     include_mode: bool = False,
+    layer_parameters=None,
 ) -> str:
     """Resize a LoRA through one bounded UEL stream and factor-space SVD."""
     if min_rank < 1:
         raise ValueError("min_rank must be at least 1")
     if min_rank > new_rank:
         raise ValueError("min_rank cannot exceed max rank")
+
+    parameter_profiles = {
+        None: ("resize:fixed", {"new_rank": new_rank}),
+        "sv_ratio": (
+            "resize:ratio", {"max_rank": new_rank, "ratio": dynamic_param}
+        ),
+        "sv_fro": (
+            "resize:frobenius", {
+                "max_rank": new_rank,
+                "min_rank": min_rank,
+                "target": dynamic_param,
+            },
+        ),
+        "sv_cumulative": (
+            "resize:cumulative", {"max_rank": new_rank, "target": dynamic_param}
+        ),
+    }
+    try:
+        parameter_profile, parameter_defaults = parameter_profiles[dynamic_method]
+    except KeyError as error:
+        raise ValueError(f"Unsupported resize method: {dynamic_method}") from error
 
     lora_size_gb = estimate_model_size(lora_path)
     prepare_for_large_operation(lora_size_gb, torch.device(device))
@@ -927,10 +953,18 @@ def resize_lora_file(
         format_info = detect_lora_format(all_keys)
         pairs, passthrough_keys = parse_lora_layers(all_keys)
         validate_canonical_blocks(pairs, "LoRA Resize")
+        resolved_layer_parameters = resolve_layer_parameters(
+            layer_parameters,
+            parameter_profile,
+            (canonical_lora_block_name(block_name) for block_name in pairs),
+            parameter_defaults,
+            node_name="LoRA Resize",
+        )
         raw_units, stream_units, rank_counts, preserved_companion_groups = (
             _build_resize_work_units(
                 handler, pairs, passthrough_keys, low_bit_keys,
                 exclude_patterns, discard_patterns, glob_patterns, include_mode,
+                resolved_layer_parameters,
             )
         )
         rank_text = _rank_summary(rank_counts)
@@ -1051,14 +1085,36 @@ def resize_lora_file(
                                 else:
                                     scale = 1.0
 
+                                resize_parameters = unit["resize_parameters"]
+                                if resize_parameters is None:
+                                    layer_max_rank = new_rank
+                                    layer_dynamic_param = dynamic_param
+                                    layer_min_rank = min_rank
+                                elif dynamic_method is None:
+                                    layer_max_rank = resize_parameters["new_rank"]
+                                    layer_dynamic_param = None
+                                    layer_min_rank = 1
+                                elif dynamic_method == "sv_ratio":
+                                    layer_max_rank = resize_parameters["max_rank"]
+                                    layer_dynamic_param = resize_parameters["ratio"]
+                                    layer_min_rank = 1
+                                elif dynamic_method == "sv_fro":
+                                    layer_max_rank = resize_parameters["max_rank"]
+                                    layer_dynamic_param = resize_parameters["target"]
+                                    layer_min_rank = resize_parameters["min_rank"]
+                                else:
+                                    layer_max_rank = resize_parameters["max_rank"]
+                                    layer_dynamic_param = resize_parameters["target"]
+                                    layer_min_rank = 1
+
                                 result = _resize_lora_factors(
                                     loaded[down_key],
                                     loaded[up_key],
-                                    new_rank,
+                                    layer_max_rank,
                                     dynamic_method,
-                                    dynamic_param,
+                                    layer_dynamic_param,
                                     scale,
-                                    min_rank,
+                                    layer_min_rank,
                                     device,
                                 )
                                 fro_list.append(result["fro_retained"])
@@ -1232,13 +1288,14 @@ class LoRAResizeFixed(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
                 *_resize_filter_inputs(),
+                parameter_input("resize:fixed"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
+    def execute(cls, lora_name, new_rank, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False, layer_parameters=None) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1249,6 +1306,7 @@ class LoRAResizeFixed(io.ComfyNode):
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
             include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1276,13 +1334,14 @@ class LoRAResizeRatio(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
                 *_resize_filter_inputs(),
+                parameter_input("resize:ratio"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, ratio, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False, layer_parameters=None) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1293,6 +1352,7 @@ class LoRAResizeRatio(io.ComfyNode):
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
             include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1322,13 +1382,14 @@ class LoRAResizeFrobenius(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
                 *_resize_filter_inputs(),
+                parameter_input("resize:frobenius"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, min_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False, layer_parameters=None) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1340,6 +1401,7 @@ class LoRAResizeFrobenius(io.ComfyNode):
             glob_patterns=glob_patterns,
             include_mode=include_mode,
             min_rank=min_rank,
+            layer_parameters=layer_parameters,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)
@@ -1367,13 +1429,14 @@ class LoRAResizeCumulative(io.ComfyNode):
                 io.Combo.Input("device", options=["cuda", "cpu"], default="cuda", tooltip="Device used for per-layer resize arithmetic; CUDA out-of-memory retries the affected layer on CPU."),
                 io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer (slower but saves VRAM)"),
                 *_resize_filter_inputs(),
+                parameter_input("resize:cumulative"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False) -> io.NodeOutput:
+    def execute(cls, lora_name, max_rank, target, output_filename, save_dtype, device, force_clear_cache, exclude_patterns="", discard_patterns="", glob_patterns=False, include_mode=False, layer_parameters=None) -> io.NodeOutput:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[save_dtype]
 
@@ -1384,6 +1447,7 @@ class LoRAResizeCumulative(io.ComfyNode):
             discard_patterns=discard_patterns,
             glob_patterns=glob_patterns,
             include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)

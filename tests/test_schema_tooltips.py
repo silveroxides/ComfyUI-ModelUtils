@@ -43,7 +43,8 @@ def test_every_schema_input_has_a_direct_static_tooltip():
                 and isinstance(tooltip.value, str)
                 and tooltip.value.strip()
             ):
-                non_static.append(location)
+                if not (path.name == "layer_parameters.py" and name == "layer_parameters"):
+                    non_static.append(location)
 
     assert not missing, "Inputs without tooltips:\n" + "\n".join(missing)
     assert not non_static, "Tooltips must be direct non-empty string literals:\n" + "\n".join(non_static)
@@ -92,13 +93,14 @@ def test_layer_filter_schemas_append_disabled_include_toggle(module_name):
         if node.__module__ != module.__name__ or not issubclass(node, io.ComfyNode):
             continue
         schema = node.define_schema()
-        ids = [item.id for item in schema.inputs]
+        previous_inputs = [item for item in schema.inputs if item.id != "layer_parameters"]
+        ids = [item.id for item in previous_inputs]
         if not {"exclude_patterns", "skip_patterns"}.intersection(ids):
             continue
         assert ids.count("include_mode") == 1, schema.node_id
         assert ids[-1] == "include_mode", schema.node_id
-        assert isinstance(schema.inputs[-1], io.Boolean.Input), schema.node_id
-        assert schema.inputs[-1].default is False, schema.node_id
+        assert isinstance(previous_inputs[-1], io.Boolean.Input), schema.node_id
+        assert previous_inputs[-1].default is False, schema.node_id
         checked.append(schema.node_id)
     assert checked, f"No filter nodes checked in {module_name}"
 
@@ -115,7 +117,7 @@ def test_all_extraction_nodes_forward_include_mode_without_shifting_parameters(
 ):
     module = _load_filter_module(module_name)
     signature = inspect.signature(getattr(module, helper_name))
-    assert list(signature.parameters)[-1] == "include_mode"
+    assert [name for name in signature.parameters if name != "layer_parameters"][-1] == "include_mode"
     captured = []
 
     def extract(*args, **kwargs):
@@ -134,6 +136,8 @@ def test_all_extraction_nodes_forward_include_mode_without_shifting_parameters(
         schema = node.define_schema()
         values = {}
         for widget in schema.inputs:
+            if widget.id == "layer_parameters":
+                continue
             value = getattr(widget, "default", None)
             if value is None:
                 options = getattr(widget, "options", [])

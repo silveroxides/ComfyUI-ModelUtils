@@ -22,6 +22,7 @@ from .uel_io import atomic_uel_writer
 from .artifact_paths import canonical_model_artifact_path
 from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
 from .extraction_stream import dora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
+from .layer_parameters import parameter_input, resolve_layer_parameters
 
 
 
@@ -398,6 +399,7 @@ def _extract_chunked_layer(
     device: str,
     max_rank: int = None,
     knee_probe_offset: int = 32,
+    clamp_quantile: float = 0.99,
 ) -> tuple:
     """Extract LoRA from fused layer by chunking."""
     out_dim, in_dim = weight_diff.shape
@@ -412,6 +414,7 @@ def _extract_chunked_layer(
         try:
             result, mode_str = _svd_extract_linear(
                 chunk, mode, mode_param, device, max_rank,
+                clamp_quantile,
                 knee_probe_offset=knee_probe_offset,
             )
             if mode_str == "full":
@@ -498,6 +501,7 @@ def extract_dora_from_files(
     glob_skip_patterns: bool = False,
     knee_probe_offset: int = 32,
     include_mode: bool = False,
+    layer_parameters=None,
 ) -> None:
     """
     Extract LoRA from difference between two models, writing incrementally to disk.
@@ -541,6 +545,33 @@ def extract_dora_from_files(
         keys_a = set(handler_a.keys())
         keys_b = set(handler_b.keys())
         weight_keys = sorted(k for k in keys_a if k.endswith(".weight"))
+        if mode == "fixed":
+            profile = "extract:fixed"
+            defaults = {"linear_dim": linear_param, "conv_dim": conv_param,
+                        "linear_max_rank": linear_max_rank, "conv_max_rank": conv_max_rank,
+                        "clamp_quantile": clamp_quantile, "min_diff": min_diff}
+        elif mode == "ratio":
+            profile = "extract:ratio"
+            defaults = {"linear_ratio": linear_param, "conv_ratio": conv_param,
+                        "clamp_quantile": clamp_quantile, "min_diff": min_diff,
+                        "linear_max_rank": linear_max_rank, "conv_max_rank": conv_max_rank}
+        elif mode == "quantile":
+            profile = "extract:quantile"
+            defaults = {"linear_quantile": linear_param, "conv_quantile": conv_param,
+                        "clamp_quantile": clamp_quantile, "min_diff": min_diff,
+                        "linear_max_rank": linear_max_rank, "conv_max_rank": conv_max_rank}
+        elif mode == "sv_fro":
+            profile = "extract:frobenius"
+            defaults = {"linear_target": linear_param, "conv_target": conv_param,
+                        "clamp_quantile": clamp_quantile, "min_diff": min_diff,
+                        "linear_max_rank": linear_max_rank, "conv_max_rank": conv_max_rank}
+        else:
+            profile = "extract:knee"
+            defaults = {"linear_max_rank": linear_max_rank, "conv_max_rank": conv_max_rank,
+                        "clamp_quantile": clamp_quantile, "min_diff": min_diff}
+        resolved_parameters = resolve_layer_parameters(
+            layer_parameters, profile, weight_keys, defaults, node_name="DoRA Extract"
+        )
         work_units = [
             (key, key, key if key in keys_b else None)
             for key in weight_keys
@@ -551,6 +582,26 @@ def extract_dora_from_files(
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         def _process_layer(key, cpu_a, cpu_b):
+            values = resolved_parameters.get(key, defaults)
+            if mode == "fixed":
+                layer_linear_param = values["linear_dim"]
+                layer_conv_param = values["conv_dim"]
+                layer_linear_max_rank = values["linear_max_rank"]
+                layer_conv_max_rank = values["conv_max_rank"]
+            elif mode == "ratio":
+                layer_linear_param, layer_conv_param = values["linear_ratio"], values["conv_ratio"]
+                layer_linear_max_rank, layer_conv_max_rank = values["linear_max_rank"], values["conv_max_rank"]
+            elif mode == "quantile":
+                layer_linear_param, layer_conv_param = values["linear_quantile"], values["conv_quantile"]
+                layer_linear_max_rank, layer_conv_max_rank = values["linear_max_rank"], values["conv_max_rank"]
+            elif mode == "sv_fro":
+                layer_linear_param, layer_conv_param = values["linear_target"], values["conv_target"]
+                layer_linear_max_rank, layer_conv_max_rank = values["linear_max_rank"], values["conv_max_rank"]
+            else:
+                layer_linear_param, layer_conv_param = linear_param, conv_param
+                layer_linear_max_rank, layer_conv_max_rank = values["linear_max_rank"], values["conv_max_rank"]
+            layer_clamp_quantile = values["clamp_quantile"]
+            layer_min_diff = values["min_diff"]
             lora_name = _format_lora_key(key)
             weight_diff = None
             layer_device = device
@@ -589,7 +640,7 @@ def extract_dora_from_files(
                 raise RuntimeError(f"No extraction tensor was produced for {key}")
 
             # Skip small differences
-            if min_diff > 0 and weight_diff.abs().max() < min_diff:
+            if layer_min_diff > 0 and weight_diff.abs().max() < layer_min_diff:
                 del weight_diff
                 return "skipped", None
 
@@ -605,14 +656,14 @@ def extract_dora_from_files(
             try:
                 if is_conv:
                     result, mode_str = retry_cuda_oom_on_cpu(
-                        lambda: _svd_extract_conv(svd_weight, mode, conv_param, layer_device, conv_max_rank, clamp_quantile, knee_probe_offset),
-                        lambda: _svd_extract_conv(svd_weight.cpu(), mode, conv_param, "cpu", conv_max_rank, clamp_quantile, knee_probe_offset),
+                        lambda: _svd_extract_conv(svd_weight, mode, layer_conv_param, layer_device, layer_conv_max_rank, layer_clamp_quantile, knee_probe_offset),
+                        lambda: _svd_extract_conv(svd_weight.cpu(), mode, layer_conv_param, "cpu", layer_conv_max_rank, layer_clamp_quantile, knee_probe_offset),
                         layer_device,
                     )
                 else:
                     result, mode_str = retry_cuda_oom_on_cpu(
-                        lambda: _svd_extract_linear(svd_weight, mode, linear_param, layer_device, linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
-                        lambda: _svd_extract_linear(svd_weight.cpu(), mode, linear_param, "cpu", linear_max_rank, clamp_quantile, svd_niter, knee_probe_offset),
+                        lambda: _svd_extract_linear(svd_weight, mode, layer_linear_param, layer_device, layer_linear_max_rank, layer_clamp_quantile, svd_niter, knee_probe_offset),
+                        lambda: _svd_extract_linear(svd_weight.cpu(), mode, layer_linear_param, "cpu", layer_linear_max_rank, layer_clamp_quantile, svd_niter, knee_probe_offset),
                         layer_device,
                     )
             except Exception as e:
@@ -622,8 +673,8 @@ def extract_dora_from_files(
                     if num_chunks > 1:
                         print(f"[DoRA Extract] Chunked: {key} ({num_chunks} chunks)")
                         lora_up, lora_down, rank = _extract_chunked_layer(
-                            weight_diff, num_chunks, mode, linear_param, layer_device,
-                            linear_max_rank, knee_probe_offset
+                            weight_diff, num_chunks, mode, layer_linear_param, layer_device,
+                            layer_linear_max_rank, knee_probe_offset, layer_clamp_quantile,
                         )
                         if lora_up is not None:
                             layer_results[f"{lora_name}.lora_up.weight"] = lora_up.to(save_torch_dtype).cpu().contiguous()
@@ -797,6 +848,7 @@ class DoRAExtractFixed(io.ComfyNode):
                 io.Int.Input("svd_niter", default=2, min=0, max=10,
                             tooltip="SVD power iterations (higher = more accurate but slower)"),
                 *_get_common_inputs(),
+                parameter_input("extract:fixed"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
@@ -805,7 +857,7 @@ class DoRAExtractFixed(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_dim, conv_dim, svd_niter, chunk_large_layers,
                 clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False, layer_parameters=None) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -815,7 +867,8 @@ class DoRAExtractFixed(io.ComfyNode):
             model_a_path, model_b_path, "fixed", linear_dim, conv_dim,
             device, save_dtype, output_path, linear_dim, conv_dim,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers, svd_niter,
-            lazy_load, force_clear_cache, glob_skip_patterns, include_mode=include_mode
+            lazy_load, force_clear_cache, glob_skip_patterns, include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
 
         return io.NodeOutput(output_name)
@@ -844,6 +897,7 @@ class DoRAExtractRatio(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
+                parameter_input("extract:ratio"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
@@ -852,7 +906,7 @@ class DoRAExtractRatio(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_ratio, conv_ratio, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False, layer_parameters=None) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -863,7 +917,8 @@ class DoRAExtractRatio(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
 
         return io.NodeOutput(output_name)
@@ -892,6 +947,7 @@ class DoRAExtractQuantile(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
+                parameter_input("extract:quantile"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
@@ -900,7 +956,7 @@ class DoRAExtractQuantile(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_quantile, conv_quantile, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False, layer_parameters=None) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -911,7 +967,8 @@ class DoRAExtractQuantile(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
 
         return io.NodeOutput(output_name)
@@ -938,6 +995,7 @@ class DoRAExtractKnee(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
+                parameter_input("extract:knee"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
@@ -947,7 +1005,7 @@ class DoRAExtractKnee(io.ComfyNode):
     def execute(cls, model_a, model_b, knee_method, knee_probe_offset,
                 linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False, layer_parameters=None) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -960,6 +1018,7 @@ class DoRAExtractKnee(io.ComfyNode):
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
             glob_skip_patterns=glob_skip_patterns, include_mode=include_mode,
             knee_probe_offset=knee_probe_offset,
+            layer_parameters=layer_parameters,
         )
 
         return io.NodeOutput(output_name)
@@ -988,6 +1047,7 @@ class DoRAExtractFrobenius(io.ComfyNode):
                 io.Int.Input("conv_max_rank", default=128, min=1, max=16384,
                             tooltip="Maximum rank for conv layers"),
                 *_get_common_inputs(),
+                parameter_input("extract:frobenius"),
             ],
             outputs=[io.AnyType.Output(display_name="output_path")],
             is_output_node=True,
@@ -996,7 +1056,7 @@ class DoRAExtractFrobenius(io.ComfyNode):
     @classmethod
     def execute(cls, model_a, model_b, linear_target, conv_target, probe_offset, linear_max_rank, conv_max_rank,
                 chunk_large_layers, clamp_quantile, min_diff, mismatch_mode, output_filename,
-                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False) -> io.NodeOutput:
+                save_dtype, device, skip_patterns, glob_skip_patterns, lazy_load, force_clear_cache, include_mode=False, layer_parameters=None) -> io.NodeOutput:
 
         model_a_path = folder_paths.get_full_path_or_raise("diffusion_models", model_a)
         model_b_path = folder_paths.get_full_path_or_raise("diffusion_models", model_b)
@@ -1007,7 +1067,8 @@ class DoRAExtractFrobenius(io.ComfyNode):
             device, save_dtype, output_path, linear_max_rank, conv_max_rank,
             clamp_quantile, min_diff, skip_patterns, mismatch_mode, chunk_large_layers,
             lazy_load=lazy_load, force_clear_cache=force_clear_cache,
-            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode
+            glob_skip_patterns=glob_skip_patterns, knee_probe_offset=probe_offset, include_mode=include_mode,
+            layer_parameters=layer_parameters,
         )
 
         return io.NodeOutput(output_name)
