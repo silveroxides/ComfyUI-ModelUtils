@@ -38,6 +38,20 @@ from .lora_extract_svd import (
 
 MIN_SV = 1e-6
 
+
+class AdapterErrorCapture(logging.Handler):
+    """Observe errors ComfyUI logs and swallows for one adapter target."""
+
+    def __init__(self, target_key):
+        super().__init__(level=logging.ERROR)
+        self.target_key = target_key
+        self.messages = []
+
+    def emit(self, record):
+        message = record.getMessage()
+        if message.startswith("ERROR ") and self.target_key in message:
+            self.messages.append(message)
+
 LORA_PAIR_SUFFIXES = (
     (".lora_A.default.weight", ".lora_B.default.weight", ".alpha", "peft"),
     (".lora_down.weight", ".lora_up.weight", ".alpha", "comfy"),
@@ -1697,19 +1711,6 @@ def merge_loras_to_model(
                 f"  target {event['target']}: {event['reason']}" for event in events
             )
             return f"L{info['index'] + 1}::{block_name}\n{sources}\n{details}"
-
-        class AdapterErrorCapture(logging.Handler):
-            """Observe errors ComfyUI logs and swallows for one adapter target."""
-
-            def __init__(self, target_key):
-                super().__init__(level=logging.ERROR)
-                self.target_key = target_key
-                self.messages = []
-
-            def emit(self, record):
-                message = record.getMessage()
-                if message.startswith("ERROR ") and self.target_key in message:
-                    self.messages.append(message)
 
         stats = {
             "merged": 0,

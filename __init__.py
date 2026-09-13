@@ -62,6 +62,7 @@ from .nodes.model_info_nodes import (
 from .nodes.lora_rename import AnimaLoraRename
 from .nodes.dtype_conversion import DiffusionModelDtypeConversion
 from .nodes.layer_parameters import LayerParameterConfiguration
+from .nodes.lora_model_analysis import LoRAOnModelAnalysis
 
 class ModelUtilsExtension(ComfyExtension):
     @override
@@ -91,6 +92,7 @@ class ModelUtilsExtension(ComfyExtension):
             *LODESTONE_MERGER_NODES,
             # Two-Model Analysis
             *MODEL_ANALYSIS_NODES,
+            LoRAOnModelAnalysis,
             # LoRA Extraction
             LoRAExtractFixed, LoRAExtractRatio, LoRAExtractQuantile,
             LoRAExtractKnee, LoRAExtractFrobenius,

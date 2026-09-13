@@ -26,6 +26,10 @@ python_tests = [
 paths = ["nodes/model_analysis.py", "run_model_analysis_api_workflow.py"]
 python_tests = ["tests/test_model_analysis.py", "tests/test_model_analysis_api_runner.py"]
 
+[groups.lora_model_analysis]
+paths = ["nodes/lora_model_analysis.py", "nodes/lora_resize.py", "nodes/model_analysis.py"]
+python_tests = ["tests/test_lora_model_analysis.py"]
+
 [groups.adaptive_extraction]
 paths = [
   "nodes/adaptive_svd.py", "nodes/dora_extract_wd.py", "nodes/dora_learned_wd.py",
