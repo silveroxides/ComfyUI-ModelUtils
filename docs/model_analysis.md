@@ -13,9 +13,17 @@ in both modes.
 ## Outputs
 
 `comparison_report` contains conventional numerical differences and topology
-findings. `cwb_report` separately contains diagnostics derived from the
+findings. Both reports use Markdown headings and tables. `cwb_report` separately contains diagnostics derived from the
 similarity, alignment, and consensus stages of Consensus-Weighted Blending.
 `documentation` contains this reference.
+
+Two CSV-text outputs follow the existing three outputs, preserving their socket
+positions: `layerwise_metrics_csv` and `layerwise_cwb_csv`. Connect them to a
+text-saving node and use a `.csv` filename; analysis itself writes no files.
+The CSV rows follow the same key order and displayed numeric precision as the
+layerwise Markdown tables. Dtypes A/B, cosine mean/min/max, and A/B affinities
+have separate columns. Undefined values remain `N/A`; an empty analysis produces
+headers without data rows. Documentation-only mode returns empty CSV strings.
 
 The reports begin with a global summary, followed by inferred blockwise values
 and one entry for every comparable tensor. Block names are approximated from

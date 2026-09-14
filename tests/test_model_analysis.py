@@ -1,4 +1,6 @@
 import importlib
+import csv
+from io import StringIO
 import math
 import sys
 import types
@@ -67,15 +69,17 @@ def test_five_node_schema_contract(analysis):
         } & set(input_ids)
         assert [item.display_name for item in schema.outputs] == [
             "comparison_report", "cwb_report", "documentation",
+            "layerwise_metrics_csv", "layerwise_cwb_csv",
         ]
 
 
-def test_documentation_mode_has_three_separate_outputs(analysis):
+def test_documentation_mode_preserves_reports_and_returns_empty_csv(analysis):
     result = analysis.DiffusionModelAnalysis.execute(execution_mode="DOCUMENTATION ONLY")
-    assert len(result.result) == 3
+    assert len(result.result) == 5
     assert "No comparison performed" in result[0]
     assert "No CWB analysis performed" in result[1]
     assert result[2].startswith("# Two-Model Similarity Analysis")
+    assert result[3] == result[4] == ""
 
 
 def test_raw_metrics_have_independent_expected_values(analysis):
@@ -125,16 +129,17 @@ def test_zero_constant_and_nonfinite_metrics_are_explicit(analysis):
 
 
 def test_end_to_end_reports_and_topology_classification(monkeypatch, tmp_path, analysis):
+    tensor_key = 'model.blocks.0.weight|"quoted",\nname'
     path_a = tmp_path / "a.safetensors"
     path_b = tmp_path / "b.safetensors"
     save_file({
-        "model.blocks.0.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        tensor_key: torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         "only_a": torch.ones(1),
         "shape": torch.ones(2),
         "integer": torch.tensor([1, 2], dtype=torch.int64),
     }, str(path_a), metadata={"source": "a"})
     save_file({
-        "model.blocks.0.weight": torch.tensor([[1.0, 0.0], [5.0, 4.0]]),
+        tensor_key: torch.tensor([[1.0, 0.0], [5.0, 4.0]]),
         "only_b": torch.ones(1),
         "shape": torch.ones(3),
         "integer": torch.tensor([1, 3], dtype=torch.int64),
@@ -159,12 +164,29 @@ def test_end_to_end_reports_and_topology_classification(monkeypatch, tmp_path, a
     monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "mark_processed", track_processed)
     monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "async_stream", track_async_stream)
 
-    comparison, cwb_report = analysis.ModelAnalysisLogic.execute(
-        "a", "b", "diffusion_models", _params()
+    result = analysis.DiffusionModelAnalysis.execute(
+        model_a="a", model_b="b", execution_mode="ANALYZE", **_params()
     )
-    assert "Comparable floating tensors: 1" in comparison
-    assert "mae: 1" in comparison
-    assert "mse: 2" in comparison
+    comparison, cwb_report, documentation, metrics_csv, cwb_csv = result.result
+    assert documentation.startswith("# Two-Model Similarity Analysis")
+    assert comparison.startswith("# MODEL COMPARISON SUMMARY\n\n")
+    assert "| Comparable floating tensors | 1 |" in comparison
+    assert "| mae | 1 |" in comparison
+    assert "| mse | 2 |" in comparison
+    assert '| model.blocks.0.weight\\|"quoted",<br>name |' in comparison
+    assert "| --- | --- |" in comparison
+    metrics_rows = list(csv.DictReader(StringIO(metrics_csv)))
+    cwb_rows = list(csv.DictReader(StringIO(cwb_csv)))
+    assert len(metrics_rows) == len(cwb_rows) == 1
+    assert metrics_rows[0]["key"] == cwb_rows[0]["key"] == tensor_key
+    assert float(metrics_rows[0]["MAE"]) == 1
+    assert float(metrics_rows[0]["RMSE"]) == pytest.approx(math.sqrt(2), rel=1e-5)
+    assert metrics_rows[0]["dtype_A"] == metrics_rows[0]["dtype_B"] == "torch.float32"
+    assert cwb_rows[0]["matched"] == "N/A"
+    assert float(cwb_rows[0]["pair_cos_min"]) <= float(cwb_rows[0]["pair_cos_mean"]) <= float(cwb_rows[0]["pair_cos_max"])
+    top_rows = comparison.split("## TOP SCALAR WEIGHT DIFFERENCES\n\n", 1)[1].split("\n\n", 1)[0].splitlines()[2:]
+    assert len(top_rows) == 3
+    assert [float(row.rsplit(" | ", 4)[2]) for row in top_rows] == [2, 2, 0]
     assert "[A ONLY] (1)" in comparison
     assert "[B ONLY] (1)" in comparison
     assert "[SHAPE MISMATCH] (1)" in comparison
@@ -175,7 +197,7 @@ def test_end_to_end_reports_and_topology_classification(monkeypatch, tmp_path, a
     assert "PRESET-IMPLIED CONTRIBUTIONS" not in cwb_report
     assert "Average contribution" not in cwb_report
     assert len(processed) == 4
-    assert {key for _, key in processed} == {"model.blocks.0.weight", "integer"}
+    assert {key for _, key in processed} == {tensor_key, "integer"}
     assert len(async_calls) == 4
     assert all(len(call[1]) == 1 for call in async_calls)
     assert all(call[2]["batch_size"] == 1 for call in async_calls)
@@ -214,15 +236,17 @@ def test_lora_cross_format_keys_compare_as_one_logical_pair(monkeypatch, tmp_pat
     monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "mark_processed", track_processed)
     monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "async_stream", track_async_stream)
 
-    comparison, cwb_report = analysis.ModelAnalysisLogic.execute(
+    comparison, cwb_report, metrics_csv, cwb_csv = analysis.ModelAnalysisLogic.execute(
         "a", "b", "loras", _params(), lora_mode=True,
     )
-    assert "Comparable floating tensors: 2" in comparison
+    assert "| Comparable floating tensors | 2 |" in comparison
     assert "[A ONLY] (0)" in comparison
     assert "[B ONLY] (0)" in comparison
     assert "foo.down |" in comparison
     assert "foo.up |" in comparison
-    assert "foo.[down+up] |" in cwb_report
+    assert "foo.\\[down+up\\] |" in cwb_report
+    assert [row["key"] for row in csv.DictReader(StringIO(metrics_csv))] == ["foo.down", "foo.up"]
+    assert [row["key"] for row in csv.DictReader(StringIO(cwb_csv))] == ["foo.[down+up]"]
     assert len(processed) == 4
     assert len({entry for entry in processed}) == 4
     assert len(async_calls) == 2
@@ -254,21 +278,23 @@ def test_excluded_lora_blocks_do_not_enter_metrics(
     monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
     monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
 
-    comparison, cwb_report = analysis.ModelAnalysisLogic.execute(
+    comparison, cwb_report, metrics_csv, cwb_csv = analysis.ModelAnalysisLogic.execute(
         "a", "b", "loras",
         _params(exclude_patterns=patterns, glob_patterns=glob_patterns, include_mode=include_mode),
         lora_mode=True,
     )
 
-    assert "Comparable floating tensors: 2" in comparison
-    assert "Excluded A tensors: 2" in comparison
-    assert "Excluded B tensors: 2" in comparison
+    assert "| Comparable floating tensors | 2 |" in comparison
+    assert "| Excluded A tensors | 2 |" in comparison
+    assert "| Excluded B tensors | 2 |" in comparison
     layerwise = comparison.split("LAYERWISE TENSOR METRICS", 1)[1].split(
         "TOP SCALAR WEIGHT DIFFERENCES", 1
     )[0]
-    assert "blocks_3_" in layerwise
-    assert "blocks_4_" not in layerwise
-    assert "blocks_4_" not in cwb_report
+    assert "blocks\\_3\\_" in layerwise
+    assert "blocks\\_4\\_" not in layerwise
+    assert "blocks\\_4\\_" not in cwb_report
+    assert all("blocks_3_" in row["key"] for row in csv.DictReader(StringIO(metrics_csv)))
+    assert all("blocks_3_" in row["key"] for row in csv.DictReader(StringIO(cwb_csv)))
 
 
 @pytest.mark.parametrize("patterns, glob_patterns, expected_keys", [

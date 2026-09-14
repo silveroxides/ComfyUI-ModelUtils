@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import gc
 import heapq
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from io import StringIO
 
 import comfy.utils
 import folder_paths
@@ -580,14 +582,61 @@ def _average_layer_metrics(layer_stats: dict[str, RawStats]) -> dict[str, float 
     return result
 
 
-def _metadata_lines(metadata_a: dict | None, metadata_b: dict | None) -> list[str]:
-    a = metadata_a or {}
-    b = metadata_b or {}
-    keys = sorted(set(a) | set(b))
-    differences = [key for key in keys if a.get(key) != b.get(key)]
-    lines = [f"Metadata keys: A={len(a)}, B={len(b)}, differing={len(differences)}"]
-    lines.extend(f"- {key}" for key in differences)
-    return lines
+def _markdown_cell(value) -> str:
+    text = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for character in ("\\", "|", "`", "*", "_", "[", "]"):
+        text = text.replace(character, "\\" + character)
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+def _markdown_table(headers, rows) -> str:
+    lines = [
+        "| " + " | ".join(_markdown_cell(value) for value in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend("| " + " | ".join(_markdown_cell(value) for value in row) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _csv_table(headers, rows) -> str:
+    output = StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def _comparison_layerwise(records):
+    headers = [
+        "key", "shape", "dtype_A", "dtype_B", "MAE", "RMSE", "max_abs",
+        "relative_L2", "cosine", "pearson", "exact", "sign", "norm_B/A",
+    ]
+    rows = []
+    for record in sorted(records, key=lambda item: item.key):
+        metric = _metrics(record.raw)
+        rows.append([
+            record.key, _shape_text(record.shape), record.dtype_a, record.dtype_b,
+            *(_fmt(metric[name]) for name in (
+                "mae", "rmse", "max", "relative_l2", "cosine", "pearson", "exact", "sign", "norm_ratio",
+            )),
+        ])
+    return headers, rows
+
+
+def _cwb_table_data(entries, key_label="key"):
+    headers = [
+        key_label, "pair_cos_mean", "pair_cos_min", "pair_cos_max",
+        "mean_aff_A", "mean_aff_B", "median_aff_A", "median_aff_B",
+        "matched", "alignment", "gain",
+    ]
+    rows = []
+    for key, stats in sorted(entries, key=lambda item: item[0]):
+        values = stats.values()
+        rows.append([key, *(_fmt(values[name]) for name in (
+            "pair_mean", "pair_min", "pair_max", "mean_aff_a", "mean_aff_b",
+            "median_aff_a", "median_aff_b", "matched", "alignment", "alignment_gain",
+        ))])
+    return headers, rows
 
 
 def _render_comparison(
@@ -606,86 +655,83 @@ def _render_comparison(
 ) -> str:
     weighted = _metrics(global_raw)
     layer_average = _average_layer_metrics(layer_stats)
-    lines = [
-        "MODEL COMPARISON SUMMARY",
-        f"Type: {model_type}",
-        f"Model A: {model_a}",
-        f"Model B: {model_b}",
-        f"Comparable floating tensors: {len(records)}",
-        f"Comparable parameters: {global_raw.total}",
-        f"A-only keys: {len(inventory['a_only'])}",
-        f"B-only keys: {len(inventory['b_only'])}",
-        f"Shape mismatches: {len(inventory['shape'])}",
-        f"Non-floating shared tensors: {len(inventory['nonfloat'])}",
-        f"Unsupported low-bit tensors: {len(inventory['low_bit'])}",
-        f"Excluded A tensors: {len(inventory['excluded_a'])}",
-        f"Excluded B tensors: {len(inventory['excluded_b'])}",
-        f"CUDA OOM CPU fallbacks: {len(fallback_keys)}",
-        "",
-        "PARAMETER-WEIGHTED GLOBAL METRICS",
+    sections = [
+        "# MODEL COMPARISON SUMMARY",
+        _markdown_table(["Field", "Value"], [
+            ("Type", model_type), ("Model A", model_a), ("Model B", model_b),
+            ("Comparable floating tensors", len(records)),
+            ("Comparable parameters", global_raw.total),
+            ("A-only keys", len(inventory["a_only"])),
+            ("B-only keys", len(inventory["b_only"])),
+            ("Shape mismatches", len(inventory["shape"])),
+            ("Non-floating shared tensors", len(inventory["nonfloat"])),
+            ("Unsupported low-bit tensors", len(inventory["low_bit"])),
+            ("Excluded A tensors", len(inventory["excluded_a"])),
+            ("Excluded B tensors", len(inventory["excluded_b"])),
+            ("CUDA OOM CPU fallbacks", len(fallback_keys)),
+        ]),
+        "## PARAMETER-WEIGHTED GLOBAL METRICS",
+        _markdown_table(["Metric", "Value"], [(name, _fmt(weighted[name])) for name in (
+            "mae", "mse", "rmse", "max", "relative_l2", "cosine", "pearson", "exact", "sign", "norm_ratio", "coverage",
+        )]),
+        "## EQUAL-LAYER AVERAGES",
+        _markdown_table(["Metric", "Value"], [(name, _fmt(value)) for name, value in layer_average.items()]),
+        "## MOST DIVERGENT TENSORS",
     ]
-    for name in ("mae", "mse", "rmse", "max", "relative_l2", "cosine", "pearson", "exact", "sign", "norm_ratio", "coverage"):
-        lines.append(f"{name}: {_fmt(weighted[name])}")
-    lines.extend(["", "EQUAL-LAYER AVERAGES"])
-    for name, value in layer_average.items():
-        lines.append(f"{name}: {_fmt(value)}")
-
     metrics_by_record = [(record, _metrics(record.raw)) for record in records]
-    lines.extend(["", "MOST DIVERGENT TENSORS", "By relative L2:"])
-    for record, metric in sorted(metrics_by_record, key=lambda item: item[1]["relative_l2"] or -1.0, reverse=True)[:10]:
-        lines.append(f"- {record.key}: {_fmt(metric['relative_l2'])}")
-    lines.append("By MAE:")
-    for record, metric in sorted(metrics_by_record, key=lambda item: item[1]["mae"] or -1.0, reverse=True)[:10]:
-        lines.append(f"- {record.key}: {_fmt(metric['mae'])}")
-    lines.append("By lowest cosine:")
-    cosine_records = [(record, metric) for record, metric in metrics_by_record if metric["cosine"] is not None]
-    for record, metric in sorted(cosine_records, key=lambda item: item[1]["cosine"])[:10]:
-        lines.append(f"- {record.key}: {_fmt(metric['cosine'])}")
-
-    lines.extend(["", "INFERRED BLOCKWISE METRICS", "block | params | MAE | RMSE | relative_L2 | cosine"])
+    for title, metric_name, descending in (
+        ("By relative L2", "relative_l2", True),
+        ("By MAE", "mae", True),
+        ("By lowest cosine", "cosine", False),
+    ):
+        ranked = sorted(
+            ((record, metric) for record, metric in metrics_by_record if metric[metric_name] is not None),
+            key=lambda item: item[1][metric_name], reverse=descending,
+        )[:10]
+        sections.extend([
+            "### " + title,
+            _markdown_table(["Rank", "Tensor", metric_name], [
+                (index, record.key, _fmt(metric[metric_name]))
+                for index, (record, metric) in enumerate(ranked, 1)
+            ]),
+        ])
+    block_rows = []
     for block in sorted(block_stats):
         raw = block_stats[block]
         metric = _metrics(raw)
-        lines.append(
-            f"{block} | {raw.total} | {_fmt(metric['mae'])} | {_fmt(metric['rmse'])} | "
-            f"{_fmt(metric['relative_l2'])} | {_fmt(metric['cosine'])}"
-        )
-
-    lines.extend(["", "LAYERWISE TENSOR METRICS", "key | shape | dtype A/B | MAE | RMSE | max_abs | relative_L2 | cosine | pearson | exact | sign | norm_B/A"])
-    for record, metric in sorted(metrics_by_record, key=lambda item: item[0].key):
-        lines.append(
-            f"{record.key} | {_shape_text(record.shape)} | {record.dtype_a}/{record.dtype_b} | "
-            f"{_fmt(metric['mae'])} | {_fmt(metric['rmse'])} | {_fmt(metric['max'])} | "
-            f"{_fmt(metric['relative_l2'])} | {_fmt(metric['cosine'])} | {_fmt(metric['pearson'])} | "
-            f"{_fmt(metric['exact'])} | {_fmt(metric['sign'])} | {_fmt(metric['norm_ratio'])}"
-        )
-
-    lines.extend(["", "TOP SCALAR WEIGHT DIFFERENCES"])
-    for value, key, flat_index, a_value, b_value, shape in sorted(top_weights, reverse=True):
-        lines.append(
-            f"- {key}{_coordinate(shape, flat_index)}: |delta|={_fmt(value)}, "
-            f"A={_fmt(a_value)}, B={_fmt(b_value)}"
-        )
-    if not top_weights:
-        lines.append("- None")
-
-    lines.extend(["", "TOPOLOGY AND DATA FINDINGS"])
+        block_rows.append([block, raw.total, *(_fmt(metric[name]) for name in ("mae", "rmse", "relative_l2", "cosine"))])
+    sections.extend([
+        "## INFERRED BLOCKWISE METRICS",
+        _markdown_table(["block", "params", "MAE", "RMSE", "relative_L2", "cosine"], block_rows),
+        "## LAYERWISE TENSOR METRICS",
+        _markdown_table(*_comparison_layerwise(records)),
+        "## TOP SCALAR WEIGHT DIFFERENCES",
+        _markdown_table(["Rank", "Tensor", "Coordinate", "|delta|", "A", "B"], [
+            (index, key, _coordinate(shape, flat_index), _fmt(value), _fmt(a_value), _fmt(b_value))
+            for index, (value, key, flat_index, a_value, b_value, shape) in enumerate(sorted(top_weights, reverse=True), 1)
+        ]) if top_weights else "None.",
+        "## TOPOLOGY AND DATA FINDINGS",
+    ])
     for label, name in (
         ("A ONLY", "a_only"), ("B ONLY", "b_only"), ("SHAPE MISMATCH", "shape"),
         ("NON-FLOATING", "nonfloat"), ("LOW-BIT UNSUPPORTED", "low_bit"),
         ("EXCLUDED A", "excluded_a"), ("EXCLUDED B", "excluded_b"),
     ):
-        lines.append(f"[{label}] ({len(inventory[name])})")
-        lines.extend(f"- {value}" for value in inventory[name])
-        if not inventory[name]:
-            lines.append("- None")
-    lines.append(f"[CUDA OOM -> CPU] ({len(fallback_keys)})")
-    lines.extend(f"- {key}" for key in fallback_keys)
-    if not fallback_keys:
-        lines.append("- None")
-    lines.extend(["", "METADATA"])
-    lines.extend(_metadata_lines(metadata_a, metadata_b))
-    return "\n".join(lines)
+        sections.extend([
+            f"### [{label}] ({len(inventory[name])})",
+            _markdown_table(["Key / finding"], [(value,) for value in inventory[name]]) if inventory[name] else "None.",
+        ])
+    sections.extend([
+        f"### [CUDA OOM -> CPU] ({len(fallback_keys)})",
+        _markdown_table(["Key"], [(key,) for key in fallback_keys]) if fallback_keys else "None.",
+        "## METADATA",
+    ])
+    a, b = metadata_a or {}, metadata_b or {}
+    differences = [key for key in sorted(set(a) | set(b)) if a.get(key) != b.get(key)]
+    sections.append(_markdown_table(["Metadata keys A", "Metadata keys B", "Differing keys"], [(len(a), len(b), len(differences))]))
+    if differences:
+        sections.append(_markdown_table(["Differing metadata key"], [(key,) for key in differences]))
+    return "\n\n".join(sections) + "\n"
 
 
 def _render_cwb(
@@ -700,49 +746,32 @@ def _render_cwb(
     for record in records:
         global_cwb.add(record.cwb)
     values = global_cwb.values()
-    lines = [
-        "CWB-DERIVED SIMILARITY SUMMARY",
-        f"Model A: {model_a}",
-        f"Model B: {model_b}",
-        f"Alignment scope: {alignment_scope}",
-        "Boundary: CWB similarity, alignment, and consensus diagnostics only.",
-        "Excluded: merge weighting, contribution calculation, vector reconstitution, norm rescaling, and output writing.",
-        "",
-        "GLOBAL CWB-DERIVED DIAGNOSTICS",
-        f"Pairwise row cosine mean/min/max: {_fmt(values['pair_mean'])} / {_fmt(values['pair_min'])} / {_fmt(values['pair_max'])}",
-        f"Mean-consensus affinity A/B: {_fmt(values['mean_aff_a'])} / {_fmt(values['mean_aff_b'])}",
-        f"Median-consensus affinity A/B: {_fmt(values['median_aff_a'])} / {_fmt(values['median_aff_b'])}",
-        f"Greedy alignment coverage: {_fmt(values['matched'])}",
-        f"Greedy matched cosine mean/min/max: {_fmt(values['alignment'])} / {_fmt(values['alignment_min'])} / {_fmt(values['alignment_max'])}",
-        f"Greedy improvement over index alignment: {_fmt(values['alignment_gain'])}",
-        "",
-        "INFERRED BLOCKWISE CWB DIAGNOSTICS",
-        "block | pair_cos mean/min/max | mean_aff_A/B | median_aff_A/B | matched | alignment | gain",
+    sections = [
+        "# CWB-DERIVED SIMILARITY SUMMARY",
+        _markdown_table(["Field", "Value"], [
+            ("Model A", model_a), ("Model B", model_b), ("Alignment scope", alignment_scope),
+            ("Boundary", "CWB similarity, alignment, and consensus diagnostics only."),
+            ("Excluded", "merge weighting, contribution calculation, vector reconstitution, norm rescaling, and output writing."),
+        ]),
+        "## GLOBAL CWB-DERIVED DIAGNOSTICS",
+        _markdown_table(["Metric", "Value"], [
+            ("Pairwise row cosine mean/min/max", " / ".join(_fmt(values[name]) for name in ("pair_mean", "pair_min", "pair_max"))),
+            ("Mean-consensus affinity A/B", " / ".join(_fmt(values[name]) for name in ("mean_aff_a", "mean_aff_b"))),
+            ("Median-consensus affinity A/B", " / ".join(_fmt(values[name]) for name in ("median_aff_a", "median_aff_b"))),
+            ("Greedy alignment coverage", _fmt(values["matched"])),
+            ("Greedy matched cosine mean/min/max", " / ".join(_fmt(values[name]) for name in ("alignment", "alignment_min", "alignment_max"))),
+            ("Greedy improvement over index alignment", _fmt(values["alignment_gain"])),
+        ]),
+        "## INFERRED BLOCKWISE CWB DIAGNOSTICS",
+        _markdown_table(*_cwb_table_data(block_cwb.items(), "block")),
+        "## LAYERWISE CWB DIAGNOSTICS",
+        _markdown_table(*_cwb_table_data((record.key, record.cwb) for record in records)),
+        "## CUDA OOM CPU FALLBACKS",
+        f"Count: {len(fallback_keys)}",
     ]
-    for block in sorted(block_cwb):
-        entry = block_cwb[block].values()
-        lines.append(
-            f"{block} | {_fmt(entry['pair_mean'])}/{_fmt(entry['pair_min'])}/{_fmt(entry['pair_max'])} | "
-            f"{_fmt(entry['mean_aff_a'])}/{_fmt(entry['mean_aff_b'])} | "
-            f"{_fmt(entry['median_aff_a'])}/{_fmt(entry['median_aff_b'])} | "
-            f"{_fmt(entry['matched'])} | {_fmt(entry['alignment'])} | {_fmt(entry['alignment_gain'])}"
-        )
-    lines.extend([
-        "", "LAYERWISE CWB DIAGNOSTICS",
-        "key | pair_cos mean/min/max | mean_aff_A/B | median_aff_A/B | matched | alignment | gain",
-    ])
-    for record in sorted(records, key=lambda value: value.key):
-        entry = record.cwb.values()
-        lines.append(
-            f"{record.key} | {_fmt(entry['pair_mean'])}/{_fmt(entry['pair_min'])}/{_fmt(entry['pair_max'])} | "
-            f"{_fmt(entry['mean_aff_a'])}/{_fmt(entry['mean_aff_b'])} | "
-            f"{_fmt(entry['median_aff_a'])}/{_fmt(entry['median_aff_b'])} | "
-            f"{_fmt(entry['matched'])} | {_fmt(entry['alignment'])} | {_fmt(entry['alignment_gain'])}"
-        )
-    lines.append("")
-    lines.append(f"CUDA OOM CPU fallbacks: {len(fallback_keys)}")
-    lines.extend(f"- {key}" for key in fallback_keys)
-    return "\n".join(lines)
+    if fallback_keys:
+        sections.append(_markdown_table(["Key"], [(key,) for key in fallback_keys]))
+    return "\n\n".join(sections) + "\n"
 
 
 class ModelAnalysisLogic:
@@ -756,7 +785,7 @@ class ModelAnalysisLogic:
         *,
         embedding_alignment: bool = False,
         lora_mode: bool = False,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str, str]:
         paths = []
         for name in (model_a, model_b):
             path = folder_paths.get_full_path(model_type, name)
@@ -1037,7 +1066,9 @@ class ModelAnalysisLogic:
                     if embedding_alignment else "fixed tensor rows (index only)"
                 ),
             )
-            return comparison, cwb_report
+            layerwise_metrics_csv = _csv_table(*_comparison_layerwise(records))
+            layerwise_cwb_csv = _csv_table(*_cwb_table_data((record.key, record.cwb) for record in cwb_records))
+            return comparison, cwb_report, layerwise_metrics_csv, layerwise_cwb_csv
         finally:
             for handler in handlers:
                 handler.__exit__(None, None, None)
@@ -1122,7 +1153,7 @@ class _ModelAnalysisNode(io.ComfyNode):
             node_id=cls.NODE_ID,
             display_name=cls.DISPLAY_NAME,
             category="ModelUtils/Analysis",
-            description="Compare two model files without merging them and return separate standard-metric and CWB-diagnostic reports.",
+            description="Compare two model files without merging them. Return Markdown reports and separate layerwise CSV text.",
             inputs=_common_inputs(
                 cls.MODEL_TYPE,
                 alignment_control=cls.EMBEDDING_ALIGNMENT or cls.LORA_MODE,
@@ -1131,6 +1162,8 @@ class _ModelAnalysisNode(io.ComfyNode):
                 io.String.Output(display_name="comparison_report"),
                 io.String.Output(display_name="cwb_report"),
                 io.String.Output(display_name="documentation"),
+                io.String.Output(display_name="layerwise_metrics_csv", tooltip="CSV text for every comparable tensor; save as .csv with a text-saving node."),
+                io.String.Output(display_name="layerwise_cwb_csv", tooltip="CSV text for layerwise CWB diagnostics, with grouped metrics in separate columns."),
             ],
             is_experimental=True,
         )
@@ -1143,13 +1176,15 @@ class _ModelAnalysisNode(io.ComfyNode):
                 "Documentation mode active. No comparison performed.",
                 "Documentation mode active. No CWB analysis performed.",
                 documentation,
+                "",
+                "",
             )
-        comparison, cwb_report = ModelAnalysisLogic.execute(
+        comparison, cwb_report, metrics_csv, cwb_csv = ModelAnalysisLogic.execute(
             kwargs["model_a"], kwargs["model_b"], cls.MODEL_TYPE, kwargs,
             embedding_alignment=cls.EMBEDDING_ALIGNMENT,
             lora_mode=cls.LORA_MODE,
         )
-        return io.NodeOutput(comparison, cwb_report, documentation)
+        return io.NodeOutput(comparison, cwb_report, documentation, metrics_csv, cwb_csv)
 
 
 class CheckpointModelAnalysis(_ModelAnalysisNode):
