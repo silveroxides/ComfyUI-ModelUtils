@@ -436,3 +436,152 @@ def test_merge_to_model_preserves_low_bit_base_and_skips_low_bit_adapter_layer(
     assert "diffusion_model.guarded.lora_down.weight" in report
     assert "torch.int8" in report
     assert "model.diffusion_model.base_quant.weight" in report
+
+
+def test_merge_to_model_dequantizes_base_and_omits_sidecars(monkeypatch, tmp_path, modules):
+    resize = modules["resize"]
+    _patch_output(monkeypatch, resize, tmp_path)
+    base = tmp_path / "quantized_base.safetensors"
+    adapter = tmp_path / "quantized_adapter.safetensors"
+    quant = torch.tensor(list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8)
+    prefix = "model.diffusion_model.layer"
+    save_file({
+        f"{prefix}.weight": torch.ones((2, 2), dtype=torch.int8),
+        f"{prefix}.weight_scale": torch.tensor(2.0),
+        f"{prefix}.comfy_quant": quant,
+    }, str(base))
+    save_file({"diffusion_model.layer.diff": torch.ones((2, 2))}, str(adapter))
+
+    output = resize.merge_loras_to_model(
+        [str(adapter)], [1.0], str(base), "cpu", torch.float16,
+        "dequantized_merge", verbose=False,
+    )
+    result = load_file(output)
+    assert list(result) == [f"{prefix}.weight"]
+    torch.testing.assert_close(result[f"{prefix}.weight"].float(), torch.full((2, 2), 3.0))
+
+
+def test_diffusion_decoder_matches_core_quantized_tensor(tmp_path, modules):
+    from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor, get_layout_class
+
+    path = tmp_path / "core_int8.safetensors"
+    key = "layer.weight"
+    qdata = torch.tensor([[1, -2], [3, 4]], dtype=torch.int8)
+    scale = torch.tensor(0.5)
+    save_file({
+        key: qdata,
+        "layer.weight_scale": scale,
+        "layer.comfy_quant": torch.tensor(
+            list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+        ),
+    }, str(path))
+    handler = modules["resize"].MemoryEfficientSafeOpen(str(path), low_memory=True)
+    try:
+        decoder = modules["guard"].DiffusionQuantization(handler, str(path), "Core comparison")
+        keys = decoder.required_keys(key)
+        assert set(keys) == {key, "layer.weight_scale", "layer.comfy_quant"}
+        assert decoder.data_keys == (key,)
+        stream = handler.async_stream(keys, batch_size=1, prefetch_batches=1, pin_memory=False)
+        tensors = {}
+        try:
+            for expected in keys:
+                batch = next(stream)
+                assert len(batch) == 1 and batch[0][0] == expected
+                tensors[expected] = batch[0][1]
+            actual = decoder.decode(key, tensors, torch.float32)
+        finally:
+            for source_key in tensors:
+                handler.mark_processed(source_key)
+            stream.close()
+
+        layout_name = QUANT_ALGOS["int8_tensorwise"]["comfy_tensor_layout"]
+        layout = get_layout_class(layout_name)
+        expected = QuantizedTensor(
+            qdata, layout_name,
+            layout.Params(scale=scale, orig_dtype=torch.float32, orig_shape=(2, 2)),
+        ).dequantize()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, qdata.float() * scale)
+    finally:
+        handler.__exit__(None, None, None)
+
+
+def test_padded_shape_comes_from_core_meta_architecture(monkeypatch, modules):
+    import comfy.model_detection
+
+    class HeaderOnly:
+        def keys(self):
+            return ["model.layer.weight", "model.layer.weight_scale", "model.layer.weight_scale_2"]
+
+        def metadata(self):
+            return {"_quantization_metadata": json.dumps({"layers": {"model.layer": {"format": "nvfp4"}}})}
+
+        def get_shape(self, key):
+            return {"model.layer.weight": (16, 8), "model.layer.weight_scale": (16, 1), "model.layer.weight_scale_2": ()}[key]
+
+        def get_dtype(self, key):
+            return torch.uint8 if key == "model.layer.weight" else torch.float32
+
+    class Config:
+        def get_model(self, state, prefix, device):
+            assert device == torch.device("meta")
+            assert all(tensor.device.type == "meta" for tensor in state.values())
+            model = torch.nn.Module()
+            model.diffusion_model = torch.nn.Module()
+            model.diffusion_model.layer = torch.nn.Module()
+            model.diffusion_model.layer._orig_shape = (3, 5)
+            return model
+
+    monkeypatch.setattr(comfy.model_detection, "model_config_from_unet", lambda *args, **kwargs: Config())
+    decoder = modules["guard"].DiffusionQuantization(HeaderOnly(), "header-only", "Shape test")
+    assert decoder.logical_shape("model.layer.weight") == (3, 5)
+
+
+def test_nvfp4_stream_decode_matches_core_full_dequantization(monkeypatch, tmp_path, modules):
+    import comfy.model_detection
+    from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor, get_layout_class
+
+    layout_name = QUANT_ALGOS["nvfp4"]["comfy_tensor_layout"]
+    layout = get_layout_class(layout_name)
+    original = torch.arange(15, dtype=torch.float16).reshape(3, 5) / 10
+    qdata, params = layout.quantize(original)
+    path = tmp_path / "nvfp4.safetensors"
+    metadata = {"_quantization_metadata": json.dumps({"layers": {"model.layer": {"format": "nvfp4"}}})}
+    save_file({
+        "model.layer.weight": qdata,
+        "model.layer.weight_scale": params.block_scale,
+        "model.layer.weight_scale_2": params.scale,
+    }, str(path), metadata=metadata)
+
+    class Config:
+        def get_model(self, state, prefix, device):
+            model = torch.nn.Module()
+            model.diffusion_model = torch.nn.Module()
+            model.diffusion_model.layer = torch.nn.Module()
+            model.diffusion_model.layer._orig_shape = tuple(original.shape)
+            return model
+
+    monkeypatch.setattr(comfy.model_detection, "model_config_from_unet", lambda *args, **kwargs: Config())
+    handler = modules["resize"].MemoryEfficientSafeOpen(str(path), low_memory=True)
+    try:
+        decoder = modules["guard"].DiffusionQuantization(handler, str(path), "NVFP4 test")
+        key = "model.layer.weight"
+        assert decoder.logical_shape(key) == tuple(original.shape)
+        keys = decoder.required_keys(key)
+        stream = handler.async_stream(keys, batch_size=1, prefetch_batches=1, pin_memory=False)
+        tensors = {}
+        try:
+            for source_key in keys:
+                batch = next(stream)
+                assert len(batch) == 1 and batch[0][0] == source_key
+                tensors[source_key] = batch[0][1]
+            actual = decoder.decode(key, tensors, torch.float16)
+        finally:
+            for source_key in tensors:
+                handler.mark_processed(source_key)
+            stream.close()
+        expected = QuantizedTensor(qdata, layout_name, params).dequantize()
+        torch.testing.assert_close(actual, expected)
+        assert actual.shape == original.shape
+    finally:
+        handler.__exit__(None, None, None)

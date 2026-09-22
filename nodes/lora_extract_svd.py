@@ -20,7 +20,7 @@ from .device_utils import (
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
 from .artifact_paths import canonical_model_artifact_path
-from .quantization_guard import inspect_low_bit_input
+from .quantization_guard import DiffusionQuantization
 from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
 from .extraction_stream import lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 from .layer_parameters import parameter_input, resolve_layer_parameters
@@ -546,17 +546,23 @@ def extract_lora_from_files(
     handler_b = MemoryEfficientSafeOpen(model_b_path, low_memory=lazy_load)
 
     try:
-        low_bit_a = inspect_low_bit_input(handler_a, f"Model A ({model_a_path})", "LoRA Extract")
-        low_bit_b = inspect_low_bit_input(handler_b, f"Model B ({model_b_path})", "LoRA Extract")
-        keys_a = set(handler_a.keys())
-        keys_b = set(handler_b.keys())
+        quantization_a = DiffusionQuantization(
+            handler_a, model_a_path, f"Model A ({model_a_path})"
+        )
+        quantization_b = DiffusionQuantization(
+            handler_b, model_b_path, f"Model B ({model_b_path})"
+        )
+        low_bit_a = set(quantization_a.isolated_low_bit_keys)
+        low_bit_b = set(quantization_b.isolated_low_bit_keys)
+        keys_a = set(quantization_a.data_keys)
+        keys_b = set(quantization_b.data_keys)
         direct_diff_suffixes = (".scale", ".lin")
         parameter_layers = sorted(
             k for k in keys_a
             if k.endswith(".weight")
             or (
                 include_1d_diffs
-                and (len(handler_a.get_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
+                and (len(quantization_a.logical_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
             )
         )
         extraction_keys = [
@@ -566,7 +572,7 @@ def extract_lora_from_files(
             and (k.endswith(".weight")
             or (
                 include_1d_diffs
-                and (len(handler_a.get_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
+                and (len(quantization_a.logical_shape(k)) == 1 or k.endswith(direct_diff_suffixes))
             ))
         ]
         extraction_keys.sort()
@@ -667,9 +673,9 @@ def extract_lora_from_files(
             if (_matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)):
                 return "skipped", None
 
-            source_dtypes = [handler_a.get_dtype(key)]
+            source_dtypes = [quantization_a.logical_dtype(key, save_torch_dtype)]
             if key in keys_b:
-                source_dtypes.append(handler_b.get_dtype(key))
+                source_dtypes.append(quantization_b.logical_dtype(key, save_torch_dtype))
             layer_save_dtype = (
                 torch.float32 if torch.float32 in source_dtypes else save_torch_dtype
             )
@@ -775,9 +781,16 @@ def extract_lora_from_files(
 
         writer_context = atomic_uel_writer(output_path)
         writer = writer_context.__enter__()
+        stream = None
         try:
             stream = paired_async_tensors(
-                handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda")
+                handler_a,
+                handler_b,
+                work_units,
+                pin_memory=str(device).startswith("cuda"),
+                quantization_a=quantization_a,
+                quantization_b=quantization_b,
+                compute_dtype=torch.float32,
             )
             for key, cpu_a, cpu_b in tqdm(stream, total=len(work_units), desc="Extracting LoRA", unit="layers"):
                 status, layer_sd = _process_layer(key, cpu_a, cpu_b)
@@ -794,9 +807,13 @@ def extract_lora_from_files(
                 pbar.update(1)
             stats["skipped"] += len(extraction_keys) - len(work_units)
         except BaseException as exc:
+            if stream is not None:
+                stream.close()
             writer_context.__exit__(type(exc), exc, exc.__traceback__)
             raise
         else:
+            if stream is not None:
+                stream.close()
             writer_context.__exit__(None, None, None)
 
         print(f"[LoRA Extract] Done: {stats['extracted']} extracted, {stats['chunked']} chunked, "

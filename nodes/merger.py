@@ -13,7 +13,7 @@ from .device_utils import (
 )
 
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
-from .quantization_guard import inspect_low_bit_input, write_preserved_tensor
+from .quantization_guard import DiffusionQuantization, inspect_low_bit_input, write_preserved_tensor
 from .lora_resize import canonical_lora_block_name, is_direct_diff_key, layer_tensor_keys, parse_lora_layers
 from .layer_parameters import parameter_input, resolve_layer_parameters
 from .uel_io import atomic_uel_writer, stream_work_units
@@ -98,16 +98,32 @@ class MergerLogic:
             prepare_for_large_operation(total_size_gb * 1.2, torch.device(process_device))
 
         handlers = {}
+        handler_paths = {}
         for name in model_names.values():
             if name and name != "None":
                 path = folder_paths.get_full_path(model_type, name)
                 if not path:
                     raise FileNotFoundError(f"Model '{name}' not found.")
                 handlers[name] = MemoryEfficientSafeOpen(path, low_memory=True)
+                handler_paths[name] = path
 
         primary_handler = handlers[primary_model_name]
-        all_keys = primary_handler.keys()
-        metadata = primary_handler.metadata()
+        diffusion_quantizers = {}
+        if model_type == "diffusion_models":
+            try:
+                diffusion_quantizers = {
+                    name: DiffusionQuantization(handler, handler_paths[name], f"Model '{name}'")
+                    for name, handler in handlers.items()
+                }
+            except Exception:
+                for handler in handlers.values():
+                    handler.__exit__(None, None, None)
+                raise
+            all_keys = diffusion_quantizers[primary_model_name].data_keys
+            metadata = diffusion_quantizers[primary_model_name].output_metadata()
+        else:
+            all_keys = primary_handler.keys()
+            metadata = primary_handler.metadata()
 
         low_bit_keys_by_name = {}
         if model_type == "loras":
@@ -137,7 +153,10 @@ class MergerLogic:
         primary_keys = set(all_keys)
         for name, handler in handlers.items():
             if name != primary_model_name:
-                secondary_keys = set(handler.keys())
+                secondary_keys = set(
+                    diffusion_quantizers[name].data_keys
+                    if name in diffusion_quantizers else handler.keys()
+                )
                 missing = primary_keys - secondary_keys
                 extra = secondary_keys - primary_keys
                 if missing:
@@ -255,8 +274,16 @@ class MergerLogic:
                         if label != "A"
                     )
                 for name in dict.fromkeys(requested_names):
-                    if name in handlers and key in handlers[name].keys():
-                        entries[name] = [key]
+                    if name in handlers and key in (
+                        diffusion_quantizers[name].data_keys
+                        if name in diffusion_quantizers else handlers[name].keys()
+                    ):
+                        required = (
+                            diffusion_quantizers[name].required_keys(key)
+                            if name in diffusion_quantizers and key in diffusion_quantizers[name].quantized_keys
+                            else [key]
+                        )
+                        entries[name] = list(dict.fromkeys([key, *required]))
                         alpha_info = alpha_normalization.get(name, {}).get(key)
                         if alpha_info is not None:
                             entries[name].append(alpha_info[0])
@@ -302,14 +329,37 @@ class MergerLogic:
                     if scale != 1.0:
                         loaded[(name, key)] = loaded[(name, key)] * scale
 
+                if diffusion_quantizers:
+                    for name, quantizer in diffusion_quantizers.items():
+                        if key in quantizer.quantized_keys and (name, key) in loaded:
+                            tensors = {
+                                source_key: loaded[(name, source_key)]
+                                for source_key in dict.fromkeys([key, *quantizer.required_keys(key)])
+                            }
+                            loaded[(name, key)] = quantizer.decode(
+                                key, tensors, process_dtype, device="cpu"
+                            )
+
                 # Pre-load Model A's tensor with pinned memory for CUDA
                 cpu_tensor = loaded[(primary_model_name, key)]
 
                 # Determine original dtypes across all active models for this key
-                original_dtypes = [primary_handler.get_dtype(key)]
+                original_dtypes = [
+                    diffusion_quantizers[primary_model_name].logical_dtype(key, process_dtype)
+                    if primary_model_name in diffusion_quantizers
+                    and key in diffusion_quantizers[primary_model_name].quantized_keys
+                    else primary_handler.get_dtype(key)
+                ]
                 for name, handler in handlers.items():
-                    if name != primary_model_name and key in handler.keys():
-                        original_dtypes.append(handler.get_dtype(key))
+                    if name != primary_model_name and key in (
+                        diffusion_quantizers[name].data_keys
+                        if name in diffusion_quantizers else handler.keys()
+                    ):
+                        original_dtypes.append(
+                            diffusion_quantizers[name].logical_dtype(key, process_dtype)
+                            if name in diffusion_quantizers and key in diffusion_quantizers[name].quantized_keys
+                            else handler.get_dtype(key)
+                        )
 
                 target_dtype = determine_target_dtype(original_dtypes, save_torch_dtype, override_dtype)
                 preserve_model_a_1d = model_type == "loras" and cpu_tensor.ndim == 1 and not include_1d_diffs

@@ -1,6 +1,7 @@
 import csv
 import importlib
 from io import StringIO
+import json
 import logging
 from pathlib import Path
 import sys
@@ -65,6 +66,21 @@ def test_reports_actual_applied_delta_without_saving(monkeypatch, tmp_path, anal
     assert "original versus LoRA-patched" in cwb
     assert {path: path.read_bytes() for path in paths.values()} == before
     assert set(tmp_path.iterdir()) == set(paths.values())
+
+
+def test_quantized_base_is_dequantized_and_sidecars_are_not_analyzed(monkeypatch, tmp_path, analysis):
+    prefix = "model.diffusion_model.layer"
+    quant = torch.tensor(list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8)
+    setup(monkeypatch, tmp_path, analysis, pair(), {
+        f"{prefix}.weight": torch.ones((2, 2), dtype=torch.int8),
+        f"{prefix}.weight_scale": torch.tensor(2.0),
+        f"{prefix}.comfy_quant": quant,
+    })
+    comparison, _, metrics_csv, _ = analysis.analyze_lora_on_model("adapter", "base", params())
+    rows = list(csv.DictReader(StringIO(metrics_csv)))
+    assert [row["key"] for row in rows] == [f"{prefix}.weight"]
+    assert float(rows[0]["mae"]) == pytest.approx(2.25)
+    assert "weight_scale" not in comparison
 
 
 @pytest.mark.parametrize("suffixes", [(".lora_down.weight", ".lora_up.weight"), (".lora_A.default.weight", ".lora_B.default.weight"), (".lora_A", ".lora_B")])

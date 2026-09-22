@@ -1,6 +1,7 @@
 import importlib
 import csv
 from io import StringIO
+import json
 import math
 import sys
 import types
@@ -329,6 +330,51 @@ def test_include_filter_limits_analysis_inventory(
         _params(exclude_patterns=patterns, glob_patterns=glob_patterns, include_mode=True),
     )
     assert sorted(streamed) == sorted(expected_keys * 2)
+
+
+def test_diffusion_analysis_decodes_int8_tensorwise_and_skips_sidecars(
+    monkeypatch, tmp_path, analysis,
+):
+    prefix = "model.diffusion_model.layer"
+    quant = torch.tensor(list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8)
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    save_file({
+        f"{prefix}.weight": torch.tensor([1, 2], dtype=torch.int8),
+        f"{prefix}.weight_scale": torch.tensor(2.0),
+        f"{prefix}.comfy_quant": quant,
+        "dense.weight": torch.tensor([2.0, 4.0]),
+    }, paths["a"])
+    save_file({
+        f"{prefix}.weight": torch.tensor([3, 6], dtype=torch.int8),
+        f"{prefix}.weight_scale": torch.tensor(2.0),
+        f"{prefix}.comfy_quant": quant,
+        "dense.weight": torch.tensor([4.0, 8.0]),
+    }, paths["b"])
+    monkeypatch.setattr(analysis.folder_paths, "get_full_path", lambda _, name: paths[name])
+    monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
+    streamed = []
+    original_stream = analysis.MemoryEfficientSafeOpen.async_stream
+
+    def track_stream(handler, keys, *args, **kwargs):
+        streamed.append((handler.filename, tuple(keys)))
+        return original_stream(handler, keys, *args, **kwargs)
+
+    monkeypatch.setattr(analysis.MemoryEfficientSafeOpen, "async_stream", track_stream)
+    _, _, metrics_csv, _ = analysis.ModelAnalysisLogic.execute(
+        "a", "b", "diffusion_models", _params(),
+    )
+
+    rows = {row["key"]: row for row in csv.DictReader(StringIO(metrics_csv))}
+    assert set(rows) == {f"{prefix}.weight", "dense.weight"}
+    assert float(rows[f"{prefix}.weight"]["MAE"]) == pytest.approx(6.0)
+    assert float(rows["dense.weight"]["MAE"]) == pytest.approx(3.0)
+    for path, keys in streamed:
+        if path.endswith("a.safetensors") or path.endswith("b.safetensors"):
+            if f"{prefix}.weight" in keys:
+                assert f"{prefix}.weight_scale" in keys
+                assert f"{prefix}.comfy_quant" in keys
+    assert sum(f"{prefix}.weight" in keys or "dense.weight" in keys for _, keys in streamed) == 4
 
 
 def test_embedding_similarity_alignment_is_explicit_opt_in(analysis):

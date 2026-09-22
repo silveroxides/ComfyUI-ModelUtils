@@ -122,6 +122,48 @@ def test_paired_stream_is_bounded_ordered_and_releases_once():
     assert all(stream.closed for stream in handler_a.streams + handler_b.streams)
 
 
+def test_paired_stream_decodes_quantized_logical_keys_per_work_unit():
+    streaming = _load_module("nodes.extraction_stream")
+    handler_a = _FakeHandler({
+        "layer1.code": torch.tensor(2),
+        "layer1.scale": torch.tensor(3),
+        "layer2.code": torch.tensor(4),
+        "layer2.scale": torch.tensor(5),
+    })
+    handler_b = _FakeHandler({"layer1": torch.tensor(1), "layer2": torch.tensor(2)})
+
+    class _Quantization:
+        quantized_keys = {"layer1", "layer2"}
+
+        def required_keys(self, key):
+            return (f"{key}.code", f"{key}.scale")
+
+        def decode(self, key, tensors, compute_dtype, device="cpu"):
+            assert set(tensors) == {f"{key}.code", f"{key}.scale"}
+            return tensors[f"{key}.code"] * tensors[f"{key}.scale"]
+
+    quantization = _Quantization()
+    observed = list(streaming.paired_async_tensors(
+        handler_a,
+        handler_b,
+        [("layer1", "layer1", "layer1"), ("layer2", "layer2", "layer2")],
+        pin_memory=False,
+        quantization_a=quantization,
+    ))
+
+    assert [(key, tensor_a.item(), tensor_b.item()) for key, tensor_a, tensor_b in observed] == [
+        ("layer1", 6, 1),
+        ("layer2", 20, 2),
+    ]
+    assert handler_a.calls[0][0] == (
+        "layer1.code", "layer1.scale", "layer2.code", "layer2.scale"
+    )
+    assert Counter(handler_a.marked) == Counter({
+        "layer1.code": 1, "layer1.scale": 1, "layer2.code": 1, "layer2.scale": 1,
+    })
+    assert all(stream.closed for stream in handler_a.streams + handler_b.streams)
+
+
 def test_cuda_oom_compute_retries_on_cpu(monkeypatch):
     streaming = _load_module("nodes.extraction_stream")
     monkeypatch.setattr(streaming, "release_cuda_oom", lambda: None)

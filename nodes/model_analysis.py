@@ -29,7 +29,7 @@ from .device_utils import (
 )
 from .merger import _compile_patterns, _matches_any_pattern, load_documentation_from_file
 from .lora_resize import layer_tensor_keys, parse_lora_layers, validate_canonical_blocks
-from .quantization_guard import inspect_low_bit_input
+from .quantization_guard import DiffusionQuantization, inspect_low_bit_input
 
 
 FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
@@ -573,6 +573,47 @@ def _load_paired_unit(handlers, units, *, pin_memory: bool):
     return loaded
 
 
+def _load_diffusion_pair(handlers, keys_a, keys_b, *, pin_memory: bool):
+    """Load one diffusion layer and its quantization sidecars from each input."""
+    streams = []
+    tensors = [{}, {}]
+
+    def collect(stream, expected_keys, result):
+        for expected_key in expected_keys:
+            batch = next(stream)
+            for key, tensor in batch:
+                result[key] = tensor
+            if len(batch) != 1:
+                raise RuntimeError("Asynchronous diffusion analysis expected one tensor per batch.")
+            key, _ = batch[0]
+            if key != expected_key:
+                raise RuntimeError("Asynchronous diffusion analysis returned tensors out of order.")
+
+    try:
+        for handler, keys in zip(handlers, (keys_a, keys_b)):
+            streams.append(handler.async_stream(
+                keys,
+                batch_size=1,
+                prefetch_batches=1,
+                pin_memory=pin_memory,
+            ))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_a = executor.submit(collect, streams[0], keys_a, tensors[0])
+            future_b = executor.submit(collect, streams[1], keys_b, tensors[1])
+            future_a.result()
+            future_b.result()
+        return tensors
+    except BaseException:
+        for handler, loaded in zip(handlers, tensors):
+            for key in loaded:
+                handler.mark_processed(key)
+            loaded.clear()
+        raise
+    finally:
+        for stream in streams:
+            stream.close()
+
+
 def _average_layer_metrics(layer_stats: dict[str, RawStats]) -> dict[str, float | None]:
     metrics = [_metrics(raw) for raw in layer_stats.values()]
     result = {}
@@ -798,13 +839,26 @@ class ModelAnalysisLogic:
 
         handlers = [MemoryEfficientSafeOpen(path, low_memory=True) for path in paths]
         try:
-            low_bit = [
-                inspect_low_bit_input(handler, f"Input {index + 1} ({path})", "Model Analysis")
-                for index, (handler, path) in enumerate(zip(handlers, paths))
-            ]
+            diffusion_quantizers = []
+            if model_type == "diffusion_models":
+                diffusion_quantizers = [
+                    DiffusionQuantization(handler, path, f"Input {index + 1} ({path})")
+                    for index, (handler, path) in enumerate(zip(handlers, paths))
+                ]
+            if diffusion_quantizers:
+                low_bit = [quantizer.isolated_low_bit_keys for quantizer in diffusion_quantizers]
+            else:
+                low_bit = [
+                    inspect_low_bit_input(handler, f"Input {index + 1} ({path})", "Model Analysis")
+                    for index, (handler, path) in enumerate(zip(handlers, paths))
+                ]
             similarity_alignment = bool(params.get("cwb_similarity_alignment", False))
-            keys_a = set(handlers[0].keys())
-            keys_b = set(handlers[1].keys())
+            keys_a = set(
+                diffusion_quantizers[0].data_keys if diffusion_quantizers else handlers[0].keys()
+            )
+            keys_b = set(
+                diffusion_quantizers[1].data_keys if diffusion_quantizers else handlers[1].keys()
+            )
             glob_mode = bool(params.get("glob_patterns", False))
             excluded_patterns = _compile_patterns(
                 params.get("exclude_patterns", ""),
@@ -940,15 +994,34 @@ class ModelAnalysisLogic:
                     inventory["low_bit"].append(f"{key}: A={key_a}, B={key_b}")
                     skipped_units += 1
                     continue
-                shape_a = tuple(handlers[0].get_shape(key_a))
-                shape_b = tuple(handlers[1].get_shape(key_b))
+                shape_a = tuple(
+                    diffusion_quantizers[0].logical_shape(key_a)
+                    if diffusion_quantizers and key_a in diffusion_quantizers[0].quantized_keys
+                    else handlers[0].get_shape(key_a)
+                )
+                shape_b = tuple(
+                    diffusion_quantizers[1].logical_shape(key_b)
+                    if diffusion_quantizers and key_b in diffusion_quantizers[1].quantized_keys
+                    else handlers[1].get_shape(key_b)
+                )
                 if shape_a != shape_b:
                     inventory["shape"].append(f"{key}: A={shape_a}, B={shape_b}")
                     skipped_units += 1
                     continue
                 ready_units.append((
                     key, key_a, key_b, shape_a,
-                    handlers[0].get_dtype(key_a), handlers[1].get_dtype(key_b),
+                    diffusion_quantizers[0].logical_dtype(key_a, torch.float32)
+                    if diffusion_quantizers and key_a in diffusion_quantizers[0].quantized_keys
+                    else handlers[0].get_dtype(key_a),
+                    diffusion_quantizers[1].logical_dtype(key_b, torch.float32)
+                    if diffusion_quantizers and key_b in diffusion_quantizers[1].quantized_keys
+                    else handlers[1].get_dtype(key_b),
+                    list(dict.fromkeys([key_a, *(diffusion_quantizers[0].required_keys(key_a)
+                                                  if diffusion_quantizers and key_a in diffusion_quantizers[0].quantized_keys
+                                                  else [])])),
+                    list(dict.fromkeys([key_b, *(diffusion_quantizers[1].required_keys(key_b)
+                                                  if diffusion_quantizers and key_b in diffusion_quantizers[1].quantized_keys
+                                                  else [])])),
                 ))
             progress = comfy.utils.ProgressBar(len(units) + len(lora_pairs))
             if skipped_units:
@@ -956,13 +1029,33 @@ class ModelAnalysisLogic:
 
             with torch.no_grad():
                 iterator = tqdm(ready_units, desc="Analyzing model tensors", unit="tensors")
-                for key, key_a, key_b, shape_a, dtype_a, dtype_b in iterator:
-                    loaded = _load_paired_unit(
-                        handlers, [(key, key_a, key_b)],
-                        pin_memory=str(params["process_device"]).startswith("cuda"),
-                    )
-                    _, _, _, tensor_a, tensor_b = loaded[0]
+                for key, key_a, key_b, shape_a, dtype_a, dtype_b, required_a, required_b in iterator:
+                    loaded = None
+                    paired = None
+                    tensor_a = tensor_b = None
+                    if diffusion_quantizers:
+                        loaded = _load_diffusion_pair(
+                            handlers, required_a, required_b,
+                            pin_memory=str(params["process_device"]).startswith("cuda"),
+                        )
+                    else:
+                        paired = _load_paired_unit(
+                            handlers, [(key, key_a, key_b)],
+                            pin_memory=str(params["process_device"]).startswith("cuda"),
+                        )
                     try:
+                        if diffusion_quantizers:
+                            if key_a in diffusion_quantizers[0].quantized_keys:
+                                loaded[0][key_a] = diffusion_quantizers[0].decode(
+                                    key_a, loaded[0], torch.float32, device="cpu"
+                                )
+                            if key_b in diffusion_quantizers[1].quantized_keys:
+                                loaded[1][key_b] = diffusion_quantizers[1].decode(
+                                    key_b, loaded[1], torch.float32, device="cpu"
+                                )
+                            tensor_a, tensor_b = loaded[0][key_a], loaded[1][key_b]
+                        else:
+                            _, _, _, tensor_a, tensor_b = paired[0]
                         if not _is_float_dtype(dtype_a) or not _is_float_dtype(dtype_b):
                             equal = torch.equal(tensor_a, tensor_b)
                             inventory["nonfloat"].append(
@@ -980,9 +1073,17 @@ class ModelAnalysisLogic:
                             fallback_keys.append(key)
                     finally:
                         del tensor_a, tensor_b
-                        loaded.clear()
-                        handlers[0].mark_processed(key_a)
-                        handlers[1].mark_processed(key_b)
+                        if loaded is not None:
+                            loaded[0].clear()
+                            loaded[1].clear()
+                            for source_key in required_a:
+                                handlers[0].mark_processed(source_key)
+                            for source_key in required_b:
+                                handlers[1].mark_processed(source_key)
+                        else:
+                            paired.clear()
+                            handlers[0].mark_processed(key_a)
+                            handlers[1].mark_processed(key_b)
                         clear_after_unit()
                         progress.update(1)
 

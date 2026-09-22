@@ -1,10 +1,12 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 
@@ -130,3 +132,47 @@ def test_lora_factor_group_uses_one_normalized_layer_name(monkeypatch, tmp_path,
     assert "diffusion_model.layer.lora_A.weight" in result
     assert "diffusion_model.layer.lora_B.weight" in result
     assert not any(key.endswith(".alpha") for key in result)
+
+
+def test_diffusion_merge_decodes_tensorwise_quantization_and_drops_sidecars(
+    monkeypatch, tmp_path, modules,
+):
+    merger, operations = modules
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    quant = torch.tensor(list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8)
+    save_file({
+        "model.diffusion_model.quant.weight": torch.tensor([1, 2], dtype=torch.int8),
+        "model.diffusion_model.quant.weight_scale": torch.tensor(2.0),
+        "model.diffusion_model.quant.comfy_quant": quant,
+        "dense.weight": torch.tensor([2.0, 4.0]),
+    }, paths["a"])
+    save_file({
+        "model.diffusion_model.quant.weight": torch.tensor([3, 6], dtype=torch.int8),
+        "model.diffusion_model.quant.weight_scale": torch.tensor(2.0),
+        "model.diffusion_model.quant.comfy_quant": quant,
+        "dense.weight": torch.tensor([6.0, 8.0]),
+    }, paths["b"])
+
+    monkeypatch.setattr(merger.folder_paths, "get_full_path", lambda _kind, name: paths.get(name))
+    monkeypatch.setattr(merger.folder_paths, "get_folder_paths", lambda _kind: [str(tmp_path)])
+    monkeypatch.setattr(merger.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(merger, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(merger, "cleanup_after_operation", lambda: None)
+    params = _params("quantized_merge")
+    params.update({"model_a": "a", "model_b": "b"})
+
+    merger.MergerLogic.execute_merge(
+        {"model_a": "a", "model_b": "b"}, "Weight-Sum",
+        operations.TWO_MODEL_MODES, params, "diffusion_models",
+    )
+
+    output_path = tmp_path / "diffusion_models" / "quantized_merge.safetensors"
+    result = load_file(str(output_path))
+    key = "model.diffusion_model.quant.weight"
+    assert set(result) == {key, "dense.weight"}
+    assert result[key].tolist() == pytest.approx([4.0, 8.0])
+    assert result[key].dtype == torch.float32
+    assert result["dense.weight"].tolist() == pytest.approx([4.0, 6.0])
+    with safe_open(str(output_path), framework="pt", device="cpu") as output:
+        metadata = output.metadata()
+    assert metadata in (None, {})

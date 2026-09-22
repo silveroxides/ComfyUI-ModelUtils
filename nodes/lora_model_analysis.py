@@ -25,15 +25,15 @@ from .model_analysis import (
     _compute_pair_on_device, _fmt, _is_cuda_oom, _is_float_dtype, _layer_name,
     _metrics, _release_cuda_oom, _render_comparison, _render_cwb,
 )
-from .quantization_guard import inspect_low_bit_input
+from .quantization_guard import DiffusionQuantization, inspect_low_bit_input
 from .uel_io import stream_work_units
 
 
-def _plan_application(base, lora, base_path, params):
+def _plan_application(base, lora, base_path, params, base_quant):
     pairs, passthrough = parse_lora_layers(lora.keys())
     validate_canonical_blocks(pairs, "LoRA-on-model analysis")
     layer_map = build_lora_layer_map([{"pairs": pairs}], base_path)
-    targets = {canonical_lora_block_name(key): key for key in base.keys()}
+    targets = {canonical_lora_block_name(key): key for key in base_quant.data_keys}
     patches = {}
     mapped = set()
     unmapped_targets = []
@@ -59,10 +59,10 @@ def _plan_application(base, lora, base_path, params):
     inventory = {name: [] for name in ("a_only", "b_only", "shape", "nonfloat", "low_bit", "excluded_a", "excluded_b")}
     unmatched = sorted(set(pairs) - mapped) + unmapped_targets
     patterns = _compile_patterns(params.get("exclude_patterns", ""), glob_mode=params.get("glob_patterns", False))
-    low_base = inspect_low_bit_input(base, "Base diffusion model", "LoRA-on-model analysis")
+    low_base = base_quant.isolated_low_bit_keys
     low_lora = inspect_low_bit_input(lora, "LoRA", "LoRA-on-model analysis")
     units = []
-    for key in sorted(base.keys()):
+    for key in sorted(base_quant.data_keys):
         if _matches_any_pattern(key, patterns, glob_mode=params.get("glob_patterns", False)) != params.get("include_mode", False):
             inventory["excluded_a"].append(key)
             inventory["excluded_b"].append(key)
@@ -76,10 +76,10 @@ def _plan_application(base, lora, base_path, params):
         if key in low_base or any(source in low_lora and source not in alpha_keys for source in source_keys):
             inventory["low_bit"].append(key)
             continue
-        if not _is_float_dtype(base.get_dtype(key)):
+        if not _is_float_dtype(base_quant.logical_dtype(key, torch.float32)):
             inventory["nonfloat"].append(key)
             continue
-        entries = {0: [key]}
+        entries = {0: base_quant.required_keys(key)}
         if source_keys:
             entries[1] = source_keys
         units.append((key, entries))
@@ -170,15 +170,22 @@ def analyze_lora_on_model(model_a, model_b, params):
     layer_stats, block_stats, block_cwb = {}, {}, {}
     try:
         with MemoryEfficientSafeOpen(base_path, low_memory=True) as base, MemoryEfficientSafeOpen(lora_path, low_memory=True) as lora:
-            units, patches, inventory, unmatched, passthrough = _plan_application(base, lora, base_path, params)
+            base_quant = DiffusionQuantization(base, base_path, "Base diffusion model")
+            units, patches, inventory, unmatched, passthrough = _plan_application(base, lora, base_path, params, base_quant)
             device = params["process_device"]
             top_limit = params["top_weight_differences"]
             with closing(stream_work_units({0: base, 1: lora}, units, pin_memory=str(device).startswith("cuda"))) as stream:
                 for key, loaded in stream:
                     try:
+                        if key in base_quant.quantized_keys:
+                            loaded[(0, key)] = base_quant.decode(
+                                key,
+                                {source_key: loaded[(0, source_key)] for source_key in base_quant.required_keys(key)},
+                                torch.float32,
+                            )
                         raw, cwb, top, fallback = _analyze_unit(key, loaded, patches.get(key, []), strength, device, top_limit)
-                        shape = tuple(base.get_shape(key))
-                        records.append(TensorRecord(key, shape, str(base.get_dtype(key)), str(torch.float32), raw, cwb, fallback))
+                        shape = base_quant.logical_shape(key)
+                        records.append(TensorRecord(key, shape, str(base_quant.logical_dtype(key, torch.float32)), str(torch.float32), raw, cwb, fallback))
                         global_raw.add(raw)
                         layer_stats.setdefault(_layer_name(key), RawStats()).add(raw)
                         block_stats.setdefault(_block_name(key), RawStats()).add(raw)

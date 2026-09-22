@@ -109,24 +109,69 @@ def dora_difference(cpu_a, cpu_b, device, *, keep_sources=False):
         return (*compute(cpu_a.float(), cpu_b_float), "cpu")
 
 
-def paired_async_tensors(handler_a, handler_b, work_units, *, pin_memory: bool):
-    """Yield ordered A/B source tensors and release them after each work unit."""
-    keys_a = [unit[1] for unit in work_units if unit[1] is not None]
-    keys_b = [unit[2] for unit in work_units if unit[2] is not None]
+def paired_async_tensors(
+    handler_a,
+    handler_b,
+    work_units,
+    *,
+    pin_memory: bool,
+    quantization_a=None,
+    quantization_b=None,
+    compute_dtype=torch.float32,
+):
+    """Yield logical A/B tensors and release their source keys per work unit."""
+    def source_keys(quantization, logical_key):
+        if logical_key is None:
+            return ()
+        return tuple(
+            quantization.required_keys(logical_key)
+            if quantization is not None
+            else (logical_key,)
+        )
+
+    required_a = [source_keys(quantization_a, unit[1]) for unit in work_units]
+    required_b = [source_keys(quantization_b, unit[2]) for unit in work_units]
+    keys_a = [key for keys in required_a for key in keys]
+    keys_b = [key for keys in required_b for key in keys]
     cursor_a = AsyncTensorCursor(handler_a, keys_a, pin_memory=pin_memory)
     cursor_b = AsyncTensorCursor(handler_b, keys_b, pin_memory=pin_memory)
     try:
-        for logical_key, key_a, key_b in work_units:
-            tensor_a = cursor_a.take(key_a) if key_a is not None else None
-            tensor_b = cursor_b.take(key_b) if key_b is not None else None
+        for (logical_key, key_a, key_b), keys_for_a, keys_for_b in zip(
+            work_units, required_a, required_b
+        ):
+            tensors_a = {}
+            tensors_b = {}
+            consumed_a = []
+            consumed_b = []
+            tensor_a = tensor_b = None
             try:
+                for source_key in keys_for_a:
+                    tensors_a[source_key] = cursor_a.take(source_key)
+                    consumed_a.append(source_key)
+                for source_key in keys_for_b:
+                    tensors_b[source_key] = cursor_b.take(source_key)
+                    consumed_b.append(source_key)
+                tensor_a = (
+                    quantization_a.decode(
+                        key_a, tensors_a, compute_dtype, device="cpu"
+                    )
+                    if quantization_a is not None and key_a in quantization_a.quantized_keys
+                    else tensors_a.get(key_a)
+                )
+                tensor_b = (
+                    quantization_b.decode(
+                        key_b, tensors_b, compute_dtype, device="cpu"
+                    )
+                    if quantization_b is not None and key_b in quantization_b.quantized_keys
+                    else tensors_b.get(key_b)
+                )
                 yield logical_key, tensor_a, tensor_b
             finally:
-                del tensor_a, tensor_b
-                if key_a is not None:
-                    cursor_a.release(key_a)
-                if key_b is not None:
-                    cursor_b.release(key_b)
+                del tensor_a, tensor_b, tensors_a, tensors_b
+                for source_key in consumed_a:
+                    cursor_a.release(source_key)
+                for source_key in consumed_b:
+                    cursor_b.release(source_key)
         cursor_a.finish()
         cursor_b.finish()
     finally:

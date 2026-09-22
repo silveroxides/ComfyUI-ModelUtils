@@ -23,7 +23,7 @@ from .uel_io import atomic_uel_writer, stream_work_units
 from .artifact_paths import canonical_model_artifact_path
 from .lora_alpha import lora_alpha_scale, normalize_lora_pair
 from .layer_parameters import parameter_input, resolve_layer_parameters
-from .quantization_guard import inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
+from .quantization_guard import DiffusionQuantization, inspect_low_bit_input, layer_has_low_bit, write_preserved_tensor
 from typing import Optional, Dict, Tuple, List
 
 
@@ -1528,9 +1528,10 @@ def merge_loras_to_model(
 
 
     try:
-        base_low_bit_keys = inspect_low_bit_input(
-            base_handler, f"Base model ({base_model_path})", "LoRA Merge To Model"
+        base_quant = DiffusionQuantization(
+            base_handler, base_model_path, "LoRA Merge To Model base model"
         )
+        base_low_bit_keys = base_quant.isolated_low_bit_keys
         lora_low_bit_keys = [
             inspect_low_bit_input(
                 handler, f"LoRA {i + 1} ({lora_paths[i]})", "LoRA Merge To Model"
@@ -1597,7 +1598,7 @@ def merge_loras_to_model(
             return result.replace(".", "_")
 
 
-        base_keys = list(base_handler.keys())
+        base_keys = list(base_quant.data_keys)
         base_aliases = set()
         for key in base_keys:
             normalized = key
@@ -1668,7 +1669,7 @@ def merge_loras_to_model(
         skip_patterns = _compile_patterns(skip_patterns_str)
 
         # Preserve metadata from base model
-        base_metadata = base_handler.metadata().copy() if base_handler.metadata() else {}
+        base_metadata = base_quant.output_metadata()
         base_metadata["merge_comment"] = f"Merged {len(lora_paths)} LoRAs with weights: {lora_weights}"
 
         # Build output path before loop
@@ -1746,7 +1747,7 @@ def merge_loras_to_model(
             skipped = any(pattern.search(planned_base_key) for pattern in skip_patterns) != include_mode
             entries = {}
             if planned_base_key not in base_low_bit_keys and not skipped:
-                entries[-1] = [planned_base_key]
+                entries[-1] = base_quant.required_keys(planned_base_key)
                 for info, _, _, direct_key, block_keys in planned_direct:
                     if not layer_has_low_bit(block_keys, info["low_bit_keys"]):
                         entries.setdefault(info["index"], []).append(direct_key)
@@ -1845,7 +1846,14 @@ def merge_loras_to_model(
                         continue
 
                     # Load base weight only after guarded and skipped keys are classified.
-                    cpu_base = loaded[(-1, base_key)]
+                    cpu_base = (
+                        base_quant.decode(
+                            base_key,
+                            {source_key: loaded[(-1, source_key)] for source_key in base_quant.required_keys(base_key)},
+                            torch.float32,
+                        )
+                        if base_key in base_quant.quantized_keys else loaded[(-1, base_key)]
+                    )
 
                     if direct_contributions or low_rank_contributions:
                         if device == 'cuda':
@@ -1854,7 +1862,7 @@ def merge_loras_to_model(
                             base_weight = cpu_base.to(device=device, dtype=torch.float32)
                         del cpu_base
 
-                        source_dtypes = [base_handler.get_dtype(base_key)]
+                        source_dtypes = [base_quant.logical_dtype(base_key, save_dtype)]
                         applied_1d_diff = False
                         applied = False
 
@@ -2069,7 +2077,7 @@ def merge_loras_to_model(
                             )
                     else:
                         target_dtype = select_output_dtype(
-                            [base_handler.get_dtype(base_key)],
+                            [base_quant.logical_dtype(base_key, save_dtype)],
                             save_dtype,
                         )
                         writer.write(base_key, cpu_base.to(target_dtype).contiguous())
