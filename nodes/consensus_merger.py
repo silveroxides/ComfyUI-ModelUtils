@@ -39,6 +39,8 @@ from .merger import (
     load_documentation_from_file,
 )
 from .quantization_guard import (
+    DiffusionQuantization,
+    diffusion_key_map,
     inspect_low_bit_input,
     write_preserved_tensor,
 )
@@ -1716,14 +1718,31 @@ class ConsensusMergerLogic:
                 boundary_path, low_memory=params["lazy_load"]
             )
         try:
-            low_bit_sets = [
-                inspect_low_bit_input(
-                    handler,
-                    f"Input {index + 1} ({path})",
-                    "CWB Merge",
-                )
-                for index, (handler, path) in enumerate(zip(handlers, paths))
-            ]
+            diffusion_quantizers = []
+            diffusion_maps = []
+            if model_type == "diffusion_models":
+                diffusion_quantizers = [
+                    DiffusionQuantization(handler, path, f"CWB input {index + 1}")
+                    for index, (handler, path) in enumerate(zip(handlers, paths))
+                ]
+                diffusion_maps = [
+                    diffusion_key_map(quantizer.data_keys, f"CWB input {index + 1}")
+                    for index, quantizer in enumerate(diffusion_quantizers)
+                ]
+                low_bit_sets = [
+                    {logical for logical, physical in mapping.items()
+                     if physical in quantizer.isolated_low_bit_keys}
+                    for mapping, quantizer in zip(diffusion_maps, diffusion_quantizers)
+                ]
+            else:
+                low_bit_sets = [
+                    inspect_low_bit_input(
+                        handler,
+                        f"Input {index + 1} ({path})",
+                        "CWB Merge",
+                    )
+                    for index, (handler, path) in enumerate(zip(handlers, paths))
+                ]
             settings = resolve_cwb_settings(
                 params["cwb_preset"],
                 _presets_for(
@@ -1746,6 +1765,8 @@ class ConsensusMergerLogic:
                     embedding_union=embedding_union,
                     boundary_handler=boundary_handler,
                     source_models=model_names,
+                    diffusion_quantizers=diffusion_quantizers,
+                    diffusion_maps=diffusion_maps,
                 )
             if params.get("_return_cwb_report"):
                 report = diagnostics.render(
@@ -1786,11 +1807,17 @@ class ConsensusMergerLogic:
         embedding_union,
         boundary_handler=None,
         source_models,
+        diffusion_quantizers,
+        diffusion_maps,
     ):
         primary = handlers[0]
         keys = set()
-        for handler in handlers:
-            keys.update(handler.keys())
+        if diffusion_maps:
+            for mapping in diffusion_maps:
+                keys.update(mapping)
+        else:
+            for handler in handlers:
+                keys.update(handler.keys())
         keys = sorted(keys)
         output_path = cls._output_path(model_type, params["output_filename"])
         requested_dtype = _requested_dtype(params["save_dtype"])
@@ -1804,23 +1831,73 @@ class ConsensusMergerLogic:
         secondary_only_merged = 0
 
         handler_map = dict(enumerate(handlers))
+        def source_indices_for(key):
+            return [
+                i for i, handler in enumerate(handlers)
+                if key in (diffusion_maps[i] if diffusion_maps else handler.keys())
+            ]
+
+        def physical_key(index, key):
+            return diffusion_maps[index][key] if diffusion_maps else key
+
+        def source_dtype(index, key):
+            source_key = physical_key(index, key)
+            return (
+                diffusion_quantizers[index].logical_dtype(source_key, requested_dtype)
+                if diffusion_maps else handlers[index].get_dtype(source_key)
+            )
+
+        def matches(key, patterns):
+            aliases = [key]
+            if diffusion_maps:
+                aliases.extend(mapping[key] for mapping in diffusion_maps if key in mapping)
+            return any(
+                _matches_any_pattern(alias, patterns, glob_mode=glob_mode)
+                for alias in aliases
+            )
+
         work_units = []
         for key in keys:
-            source_indices = [i for i, handler in enumerate(handlers) if key in handler.keys()]
-            discarded = _matches_any_pattern(key, discard, glob_mode=glob_mode)
+            source_indices = source_indices_for(key)
+            discarded = matches(key, discard)
             guarded = any(key in low_bit_sets[i] for i in source_indices)
-            entries = {} if discarded or guarded else {
-                i: [key] for i in source_indices
-            }
+            if discarded:
+                entries = {}
+            elif guarded:
+                preserve_index = 0 if 0 in source_indices else source_indices[0]
+                source_key = physical_key(preserve_index, key)
+                entries = (
+                    {preserve_index: diffusion_quantizers[preserve_index].required_keys(source_key)}
+                    if diffusion_maps and source_key in diffusion_quantizers[preserve_index].quantized_keys
+                    else {}
+                )
+            else:
+                entries = {
+                    i: (diffusion_quantizers[i].required_keys(physical_key(i, key))
+                        if diffusion_maps else [key]) for i in source_indices
+                }
             work_units.append((key, entries))
 
-        output_metadata = (primary.metadata() or {}).copy()
+        output_metadata = (
+            diffusion_quantizers[0].output_metadata()
+            if diffusion_maps else (primary.metadata() or {}).copy()
+        )
         output_metadata["cwb.merge"] = _cwb_merge_metadata(
             source_models,
             params,
             settings,
             operation="cwb_embedding_merge" if embedding_union else "cwb_tensor_merge",
         )
+        def preserve_tensor(writer, index, key, loaded, *, force_raw=False):
+            source_key = physical_key(index, key)
+            if diffusion_maps and source_key in diffusion_quantizers[index].quantized_keys:
+                writer.write(key, loaded[(index, key)].to(requested_dtype).cpu().contiguous())
+            else:
+                write_preserved_tensor(
+                    writer, source_key, handlers[index], output_key=key,
+                    force_raw=force_raw, tensor=loaded.get((index, key)),
+                )
+
         with atomic_uel_writer(output_path, output_metadata) as writer, torch.no_grad(), closing(
             stream_work_units(
                 handler_map, work_units,
@@ -1829,49 +1906,52 @@ class ConsensusMergerLogic:
         ) as streamed:
             for key, loaded in tqdm(streamed, total=len(work_units), desc="CWB merging tensors", unit="tensors"):
                     _clear_previous_layer(params)
-                    if _matches_any_pattern(key, discard, glob_mode=glob_mode):
+                    if matches(key, discard):
                         pbar.update(1)
                         continue
-                    source_indices = [i for i, handler in enumerate(handlers) if key in handler.keys()]
-                    primary_owned = key in primary.keys()
+                    source_indices = source_indices_for(key)
+                    primary_owned = key in (diffusion_maps[0] if diffusion_maps else primary.keys())
                     secondary_only = not primary_owned
                     preserve_index = 0 if primary_owned else source_indices[0]
                     guarded = any(key in low_bit_sets[i] for i in source_indices)
-                    matched = _matches_any_pattern(key, exclude, glob_mode=glob_mode)
+                    if diffusion_maps:
+                        for index in source_indices:
+                            source_key = physical_key(index, key)
+                            if (index, source_key) not in loaded:
+                                continue
+                            if source_key in diffusion_quantizers[index].quantized_keys:
+                                parts = {
+                                    part: loaded[(index, part)]
+                                    for part in diffusion_quantizers[index].required_keys(source_key)
+                                }
+                                loaded[(index, key)] = diffusion_quantizers[index].decode(
+                                    source_key, parts, torch.float32, device="cpu",
+                                )
+                            else:
+                                loaded[(index, key)] = loaded[(index, source_key)]
+                    matched = matches(key, exclude)
                     excluded = not matched if include_mode else matched
                     if guarded or excluded:
-                        write_preserved_tensor(
-                            writer,
-                            key,
-                            handlers[preserve_index],
-                            force_raw=guarded,
-                            tensor=loaded.get((preserve_index, key)),
-                        )
+                        preserve_tensor(writer, preserve_index, key, loaded, force_raw=guarded)
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
                     if secondary_only and len(source_indices) == 1:
-                        write_preserved_tensor(
-                            writer, key, handlers[preserve_index],
-                            tensor=loaded[(preserve_index, key)],
-                        )
+                        preserve_tensor(writer, preserve_index, key, loaded)
                         secondary_only_copied += 1
                         pbar.update(1)
                         continue
 
-                    source_dtypes = [handlers[i].get_dtype(key) for i in source_indices]
+                    source_dtypes = [source_dtype(i, key) for i in source_indices]
                     if not all(_is_float_dtype(dtype) for dtype in source_dtypes):
                         logging.warning(
                             "[CWB Merge] Preserving non-floating tensor '%s' from input %d.",
                             key,
                             preserve_index + 1,
                         )
-                        write_preserved_tensor(
-                            writer, key, handlers[preserve_index],
-                            tensor=loaded[(preserve_index, key)],
-                        )
+                        preserve_tensor(writer, preserve_index, key, loaded)
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)
@@ -1881,9 +1961,7 @@ class ConsensusMergerLogic:
                         if mismatch_mode == "error":
                             raise ValueError(f"Tensor '{key}' is missing from a CWB input.")
                         if mismatch_mode == "skip":
-                            write_preserved_tensor(
-                                writer, key, primary, tensor=loaded[(0, key)]
-                            )
+                            preserve_tensor(writer, 0, key, loaded)
                             pbar.update(1)
                             continue
 
@@ -1972,13 +2050,10 @@ class ConsensusMergerLogic:
                         if source_index == reference_source:
                             reference_index = len(tensors)
                         tensors.append(aligned)
-                        actual_dtypes.append(handler.get_dtype(key))
+                        actual_dtypes.append(source_dtype(source_index, key))
 
                     if preserve_for_mismatch:
-                        write_preserved_tensor(
-                            writer, key, handlers[preserve_index],
-                            tensor=loaded[(preserve_index, key)],
-                        )
+                        preserve_tensor(writer, preserve_index, key, loaded)
                         if secondary_only:
                             secondary_only_copied += 1
                         pbar.update(1)

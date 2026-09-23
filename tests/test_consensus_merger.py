@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -1194,6 +1195,78 @@ def test_three_input_streaming_merge(monkeypatch, tmp_path, cwb):
     torch.testing.assert_close(tensor, torch.tensor([[3.0, 0.0]]))
 
 
+@pytest.mark.parametrize("model_count", [2, 3])
+@pytest.mark.parametrize("prefixed_input", ["a", "b"])
+def test_diffusion_cwb_matches_prefixed_quantized_and_bare_layers(
+    monkeypatch, tmp_path, cwb, model_count, prefixed_input,
+):
+    names = ["a", "b", "c"][:model_count]
+    paths = {}
+    for index, name in enumerate(names):
+        path = tmp_path / f"mixed_{name}.safetensors"
+        key = f"{'model.diffusion_model.' if name == prefixed_input else ''}layer.weight"
+        values = torch.tensor([2.0, 4.0]) * (index + 1)
+        if name == prefixed_input:
+            stem = key[:-len(".weight")]
+            save_file({
+                key: values.to(torch.int8),
+                f"{stem}.weight_scale": torch.tensor(1.0),
+                f"{stem}.comfy_quant": torch.tensor(
+                    list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+                ),
+            }, str(path))
+        else:
+            save_file({key: values}, str(path))
+        paths[name] = str(path)
+    _patch_io(monkeypatch, cwb, tmp_path, paths)
+    result = cwb.ConsensusMergerLogic.execute(
+        names, "diffusion_models", _params("mixed_cwb")
+    )
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
+    assert list(tensors) == ["layer.weight"]
+    torch.testing.assert_close(tensors["layer.weight"].float(), torch.tensor([2.0, 4.0]) * (model_count + 1) / 2)
+
+
+def test_diffusion_cwb_excluded_quantized_layer_is_saved_dense(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "excluded_quant_a.safetensors"
+    b = tmp_path / "excluded_quant_b.safetensors"
+    save_file({
+        "model.diffusion_model.layer.weight": torch.tensor([1, 2], dtype=torch.int8),
+        "model.diffusion_model.layer.weight_scale": torch.tensor(2.0),
+        "model.diffusion_model.layer.comfy_quant": torch.tensor(
+            list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+        ),
+    }, str(a))
+    save_file({"layer.weight": torch.tensor([9.0, 9.0])}, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"], "diffusion_models", _params("excluded_quant", include_mode=True),
+    )
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
+    assert list(tensors) == ["layer.weight"]
+    torch.testing.assert_close(tensors["layer.weight"].float(), torch.tensor([2.0, 4.0]))
+
+
+def test_diffusion_cwb_guarded_quantized_primary_is_saved_dense(monkeypatch, tmp_path, cwb):
+    a = tmp_path / "guarded_quant_a.safetensors"
+    b = tmp_path / "guarded_quant_b.safetensors"
+    save_file({
+        "model.diffusion_model.layer.weight": torch.tensor([1, 2], dtype=torch.int8),
+        "model.diffusion_model.layer.weight_scale": torch.tensor(2.0),
+        "model.diffusion_model.layer.comfy_quant": torch.tensor(
+            list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+        ),
+    }, str(a))
+    save_file({"layer.weight": torch.tensor([9, 9], dtype=torch.uint8)}, str(b))
+    _patch_io(monkeypatch, cwb, tmp_path, {"a": str(a), "b": str(b)})
+    result = cwb.ConsensusMergerLogic.execute(
+        ["a", "b"], "diffusion_models", _params("guarded_quant"),
+    )
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", result)))
+    assert list(tensors) == ["layer.weight"]
+    torch.testing.assert_close(tensors["layer.weight"].float(), torch.tensor([2.0, 4.0]))
+
+
 def test_two_input_preserves_secondary_only_tensor_exactly(monkeypatch, tmp_path, cwb):
     a = tmp_path / "secondary_a.safetensors"
     b = tmp_path / "secondary_b.safetensors"
@@ -1289,9 +1362,10 @@ def test_include_filter_preserves_nonmatches_and_discards_first(
         lora_mode=lora_mode,
     )
     tensors = load_file(str(_result_path(tmp_path, category, result)))
-    assert set(tensors) == {"diffusion_model.selected.diff", "diffusion_model.other.diff"}
-    torch.testing.assert_close(tensors["diffusion_model.selected.diff"], torch.full((2, 2), 4.0 if selected else 2.0))
-    torch.testing.assert_close(tensors["diffusion_model.other.diff"], torch.full((2, 2), 2.0))
+    prefix = "diffusion_model." if lora_mode else ""
+    assert set(tensors) == {f"{prefix}selected.diff", f"{prefix}other.diff"}
+    torch.testing.assert_close(tensors[f"{prefix}selected.diff"], torch.full((2, 2), 4.0 if selected else 2.0))
+    torch.testing.assert_close(tensors[f"{prefix}other.diff"], torch.full((2, 2), 2.0))
 
 
 def test_secondary_only_filters_and_low_bit_preservation(monkeypatch, tmp_path, cwb):
@@ -1556,7 +1630,7 @@ def test_lora_1d_direct_switch_is_default_fallback_and_fp32(
     assert enabled_tensor.dtype == torch.float32
 
 
-def test_quantized_marker_errors_before_output(monkeypatch, tmp_path, cwb):
+def test_invalid_quantization_sidecar_errors_before_output(monkeypatch, tmp_path, cwb):
     a = tmp_path / "quant_a.safetensors"
     b = tmp_path / "quant_b.safetensors"
     save_file({
@@ -1566,7 +1640,7 @@ def test_quantized_marker_errors_before_output(monkeypatch, tmp_path, cwb):
     save_file({"layer.weight": torch.ones((2, 2))}, str(b))
     paths = {"a": str(a), "b": str(b)}
     _patch_io(monkeypatch, cwb, tmp_path, paths)
-    with pytest.raises(ValueError, match="ComfyUI quantization metadata"):
+    with pytest.raises(ValueError, match="Invalid quantization sidecar"):
         cwb.ConsensusMergerLogic.execute(
             ["a", "b"], "diffusion_models", _params("must_not_exist")
         )
