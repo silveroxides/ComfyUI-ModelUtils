@@ -39,6 +39,25 @@ _QUANT_SIDECARS = (
 )
 
 
+def diffusion_key_map(keys, label):
+    """Map optional diffusion wrappers to each file's physical tensor keys."""
+    mapped = {}
+    for key in sorted(keys):
+        logical = key
+        for prefix in ("model.diffusion_model.", "diffusion_model."):
+            if key.startswith(prefix):
+                logical = key[len(prefix):]
+                break
+        previous = mapped.get(logical)
+        if previous is not None:
+            raise ValueError(
+                f"{label} has duplicate diffusion layer {logical!r}: "
+                f"{previous!r} and {key!r}"
+            )
+        mapped[logical] = key
+    return mapped
+
+
 class DiffusionQuantization:
     """Index and decode Core quantized diffusion weights one layer at a time.
 
@@ -151,6 +170,12 @@ class DiffusionQuantization:
                 for name in self._keys
             }
             prefix = model_detection.unet_prefix_from_state_dict(state)
+            if self.quantized_keys and all(
+                name.startswith("model.diffusion_model.") for name in self.quantized_keys
+            ):
+                prefix = "model.diffusion_model."
+            elif not any(name.startswith(prefix) for name in state):
+                prefix = ""
             detected = {
                 name[len(prefix):]: value
                 for name, value in state.items() if name.startswith(prefix)

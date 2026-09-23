@@ -29,7 +29,7 @@ from .device_utils import (
 )
 from .merger import _compile_patterns, _matches_any_pattern, load_documentation_from_file
 from .lora_resize import layer_tensor_keys, parse_lora_layers, validate_canonical_blocks
-from .quantization_guard import DiffusionQuantization, inspect_low_bit_input
+from .quantization_guard import DiffusionQuantization, diffusion_key_map, inspect_low_bit_input
 
 
 FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
@@ -859,19 +859,36 @@ class ModelAnalysisLogic:
             keys_b = set(
                 diffusion_quantizers[1].data_keys if diffusion_quantizers else handlers[1].keys()
             )
+            diffusion_maps = None
+            if diffusion_quantizers:
+                diffusion_maps = (
+                    diffusion_key_map(keys_a, "Model Analysis input A"),
+                    diffusion_key_map(keys_b, "Model Analysis input B"),
+                )
+                keys_a = set(diffusion_maps[0])
+                keys_b = set(diffusion_maps[1])
             glob_mode = bool(params.get("glob_patterns", False))
             excluded_patterns = _compile_patterns(
                 params.get("exclude_patterns", ""),
                 glob_mode=glob_mode,
             )
             include_mode = bool(params.get("include_mode", False))
+            def excluded(key):
+                aliases = [key]
+                if diffusion_maps:
+                    aliases.extend(
+                        mapping[key] for mapping in diffusion_maps if key in mapping
+                    )
+                matched = any(
+                    _matches_any_pattern(alias, excluded_patterns, glob_mode=glob_mode)
+                    for alias in aliases
+                )
+                return matched != include_mode
             excluded_a = {
-                key for key in keys_a
-                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode) != include_mode
+                key for key in keys_a if excluded(key)
             }
             excluded_b = {
-                key for key in keys_b
-                if _matches_any_pattern(key, excluded_patterns, glob_mode=glob_mode) != include_mode
+                key for key in keys_b if excluded(key)
             }
             keys_a.difference_update(excluded_a)
             keys_b.difference_update(excluded_b)
@@ -944,9 +961,17 @@ class ModelAnalysisLogic:
                 inventory["a_only"].extend(sorted(pass_a - pass_b))
                 inventory["b_only"].extend(sorted(pass_b - pass_a))
             else:
-                units = [(key, key, key) for key in sorted(keys_a & keys_b)]
-                inventory["a_only"] = sorted(keys_a - keys_b)
-                inventory["b_only"] = sorted(keys_b - keys_a)
+                if diffusion_maps:
+                    units = [
+                        (key, diffusion_maps[0][key], diffusion_maps[1][key])
+                        for key in sorted(keys_a & keys_b)
+                    ]
+                    inventory["a_only"] = sorted(keys_a - keys_b)
+                    inventory["b_only"] = sorted(keys_b - keys_a)
+                else:
+                    units = [(key, key, key) for key in sorted(keys_a & keys_b)]
+                    inventory["a_only"] = sorted(keys_a - keys_b)
+                    inventory["b_only"] = sorted(keys_b - keys_a)
             global_raw = RawStats()
             layer_stats: dict[str, RawStats] = {}
             block_stats: dict[str, RawStats] = {}

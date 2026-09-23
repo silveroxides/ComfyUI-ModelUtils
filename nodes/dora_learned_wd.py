@@ -20,6 +20,7 @@ from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
 from .extraction_stream import dora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 from .layer_parameters import parameter_input, resolve_layer_parameters
+from .quantization_guard import DiffusionQuantization, diffusion_key_map
 
 # Import the existing SV ranking and chunking logic so we don't have to duplicate it
 from .dora_extract_wd import (
@@ -379,9 +380,21 @@ def extract_dora_learned_from_files(
     handler_b = MemoryEfficientSafeOpen(model_b_path, low_memory=lazy_load)
 
     try:
-        keys_a = set(handler_a.keys())
-        keys_b = set(handler_b.keys())
-        weight_keys = sorted(k for k in keys_a if k.endswith(".weight"))
+        quantization_a = DiffusionQuantization(handler_a, model_a_path, "Learned DoRA Extract model A")
+        quantization_b = DiffusionQuantization(handler_b, model_b_path, "Learned DoRA Extract model B")
+        keys_a = set(quantization_a.data_keys)
+        keys_b = set(quantization_b.data_keys)
+        logical_a = diffusion_key_map(keys_a, "Learned DoRA Extract model A")
+        logical_b = diffusion_key_map(keys_b, "Learned DoRA Extract model B")
+        paired_keys_b = {
+            key_a: logical_b.get(logical) for logical, key_a in logical_a.items()
+        }
+        weight_keys = sorted(
+            key for key in keys_a
+            if key.endswith(".weight")
+            and key not in quantization_a.isolated_low_bit_keys
+            and paired_keys_b[key] not in quantization_b.isolated_low_bit_keys
+        )
         if mode == "fixed":
             profile = "extract:fixed"
             defaults = {"linear_dim": linear_param, "conv_dim": conv_param,
@@ -411,15 +424,16 @@ def extract_dora_learned_from_files(
             node_name="Learned DoRA Extract",
         )
         work_units = [
-            (key, key, key if key in keys_b else None)
+            (key, key, paired_keys_b[key])
             for key in weight_keys
             if (not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns))
-            and not (key not in keys_b and mismatch_mode == "skip")
+            and not (paired_keys_b[key] is None and mismatch_mode == "skip")
         ]
         pbar = comfy.utils.ProgressBar(len(work_units))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         def _process_layer(key, cpu_a, cpu_b):
+            key_b = paired_keys_b[key]
             values = resolved_parameters.get(key, defaults)
             if mode == "fixed":
                 layer_linear_param, layer_conv_param = values["linear_dim"], values["conv_dim"]
@@ -447,7 +461,7 @@ def extract_dora_learned_from_files(
             if (_matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns)):
                 return "skipped", None
 
-            if key not in keys_b:
+            if key_b is None:
                 if mismatch_mode == "skip":
                     return "skipped", None
                 if mismatch_mode == "error":
@@ -564,9 +578,12 @@ def extract_dora_learned_from_files(
 
         writer_context = atomic_uel_writer(output_path)
         writer = writer_context.__enter__()
+        stream = None
         try:
             stream = paired_async_tensors(
-                handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda")
+                handler_a, handler_b, work_units, pin_memory=str(device).startswith("cuda"),
+                quantization_a=quantization_a, quantization_b=quantization_b,
+                compute_dtype=torch.float32,
             )
             for key, cpu_a, cpu_b in tqdm(stream, total=len(work_units), desc="Extracting Learned DoRA", unit="layers"):
                 status, layer_sd = _process_layer(key, cpu_a, cpu_b)
@@ -583,9 +600,13 @@ def extract_dora_learned_from_files(
                 pbar.update(1)
             stats["skipped"] += len(weight_keys) - len(work_units)
         except BaseException as exc:
+            if stream is not None:
+                stream.close()
             writer_context.__exit__(type(exc), exc, exc.__traceback__)
             raise
         else:
+            if stream is not None:
+                stream.close()
             writer_context.__exit__(None, None, None)
 
         print(f"[Learned DoRA] Done: {stats['extracted']} extracted, {stats['chunked']} chunked, "

@@ -168,7 +168,7 @@ def test_diffusion_merge_decodes_tensorwise_quantization_and_drops_sidecars(
 
     output_path = tmp_path / "diffusion_models" / "quantized_merge.safetensors"
     result = load_file(str(output_path))
-    key = "model.diffusion_model.quant.weight"
+    key = "quant.weight"
     assert set(result) == {key, "dense.weight"}
     assert result[key].tolist() == pytest.approx([4.0, 8.0])
     assert result[key].dtype == torch.float32
@@ -176,3 +176,58 @@ def test_diffusion_merge_decodes_tensorwise_quantization_and_drops_sidecars(
     with safe_open(str(output_path), framework="pt", device="cpu") as output:
         metadata = output.metadata()
     assert metadata in (None, {})
+
+
+@pytest.mark.parametrize("prefixed_input", ["a", "b"])
+def test_diffusion_merge_matches_prefixed_and_bare_models(monkeypatch, tmp_path, modules, prefixed_input):
+    merger, operations = modules
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    for name in ("a", "b"):
+        key = f"{'model.diffusion_model.' if name == prefixed_input else ''}layer.weight"
+        if name == prefixed_input:
+            stem = key[:-len(".weight")]
+            save_file({
+                key: torch.tensor([1, 2], dtype=torch.int8),
+                f"{stem}.weight_scale": torch.tensor(2.0),
+                f"{stem}.comfy_quant": torch.tensor(
+                    list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+                ),
+            }, paths[name])
+        else:
+            save_file({key: torch.tensor([4.0, 8.0])}, paths[name])
+    monkeypatch.setattr(merger.folder_paths, "get_full_path", lambda _kind, name: paths.get(name))
+    monkeypatch.setattr(merger.folder_paths, "get_folder_paths", lambda _kind: [str(tmp_path)])
+    monkeypatch.setattr(merger.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(merger, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(merger, "cleanup_after_operation", lambda: None)
+    params = _params("mixed_prefix_merge")
+    params.update({"model_a": "a", "model_b": "b"})
+    merger.MergerLogic.execute_merge(
+        {"model_a": "a", "model_b": "b"}, "Weight-Sum",
+        operations.TWO_MODEL_MODES, params, "diffusion_models",
+    )
+    output = load_file(str(tmp_path / "diffusion_models" / "mixed_prefix_merge.safetensors"))
+    assert list(output) == ["layer.weight"]
+    torch.testing.assert_close(output["layer.weight"], torch.tensor([3.0, 6.0]))
+
+
+def test_three_diffusion_models_match_across_prefixes(monkeypatch, tmp_path, modules):
+    merger, operations = modules
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b", "c")}
+    save_file({"layer.weight": torch.tensor([1.0, 1.0])}, paths["a"])
+    save_file({"model.diffusion_model.layer.weight": torch.tensor([4.0, 4.0])}, paths["b"])
+    save_file({"layer.weight": torch.tensor([2.0, 2.0])}, paths["c"])
+    monkeypatch.setattr(merger.folder_paths, "get_full_path", lambda _kind, name: paths.get(name))
+    monkeypatch.setattr(merger.folder_paths, "get_folder_paths", lambda _kind: [str(tmp_path)])
+    monkeypatch.setattr(merger.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(merger, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(merger, "cleanup_after_operation", lambda: None)
+    params = _params("three_prefix_merge")
+    params.update({"model_a": "a", "model_b": "b", "model_c": "c"})
+    merger.MergerLogic.execute_merge(
+        {"model_a": "a", "model_b": "b", "model_c": "c"}, "Add-Difference",
+        operations.THREE_MODEL_MODES, params, "diffusion_models",
+    )
+    output = load_file(str(tmp_path / "diffusion_models" / "three_prefix_merge.safetensors"))
+    assert list(output) == ["layer.weight"]
+    torch.testing.assert_close(output["layer.weight"], torch.tensor([2.0, 2.0]))

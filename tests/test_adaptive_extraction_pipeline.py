@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from collections import Counter
@@ -259,6 +260,90 @@ def test_lora_extraction_uses_only_async_uel_and_releases_sources(monkeypatch, t
             "diffusion_model.layer.lora_A.weight",
             "diffusion_model.layer.lora_B.weight",
         ]
+
+
+@pytest.mark.parametrize("prefixed_input", ["a", "b"])
+def test_lora_extraction_matches_prefixed_and_bare_models(monkeypatch, tmp_path, prefixed_input):
+    extraction = _load_module("nodes.lora_extract_svd")
+    paths = {name: tmp_path / f"{name}.safetensors" for name in ("a", "b")}
+    output = tmp_path / "mixed_prefix.safetensors"
+    for name in ("a", "b"):
+        key = f"{'model.diffusion_model.' if name == prefixed_input else ''}layer.weight"
+        value = torch.tensor([[2.0, 0.0], [0.0, 0.0]]) if name == "a" else torch.zeros((2, 2))
+        if name == prefixed_input:
+            stem = key[:-len(".weight")]
+            _write_uel(paths[name], {
+                key: value.to(torch.int8),
+                f"{stem}.weight_scale": torch.tensor(1.0),
+                f"{stem}.comfy_quant": torch.tensor(
+                    list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+                ),
+            })
+        else:
+            _write_uel(paths[name], {key: value})
+    monkeypatch.setattr(extraction, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(extraction, "cleanup_after_operation", lambda: None)
+    extraction.extract_lora_from_files(
+        str(paths["a"]), str(paths["b"]), "fixed", 1, 1, "cpu", "fp32", str(output),
+        linear_max_rank=1, conv_max_rank=1, force_clear_cache=False,
+    )
+    with MemoryEfficientSafeOpen(str(output), low_memory=True) as result:
+        keys = sorted(result.keys())
+        assert keys == [
+            "diffusion_model.layer.lora_A.weight",
+            "diffusion_model.layer.lora_B.weight",
+        ]
+        stream = result.async_stream(keys, batch_size=1, prefetch_batches=1, pin_memory=False)
+        tensors = {}
+        try:
+            for key in keys:
+                batch = next(stream)
+                assert len(batch) == 1 and batch[0][0] == key
+                tensors[key] = batch[0][1]
+        finally:
+            for key in tensors:
+                result.mark_processed(key)
+            stream.close()
+    delta = tensors[keys[1]] @ tensors[keys[0]]
+    torch.testing.assert_close(delta, torch.tensor([[2.0, 0.0], [0.0, 0.0]]), atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("module_name,function_name,extra", [
+    ("nodes.dora_extract_wd", "extract_dora_from_files", {}),
+    ("nodes.dora_learned_wd", "extract_dora_learned_from_files", {"optimize_iters": 0}),
+])
+@pytest.mark.parametrize("prefixed_input", ["a", "b"])
+def test_dora_extraction_matches_prefixed_and_bare_models(
+    monkeypatch, tmp_path, module_name, function_name, extra, prefixed_input,
+):
+    module = _load_module(module_name)
+    paths = {name: tmp_path / f"{name}.safetensors" for name in ("a", "b")}
+    output = tmp_path / "mixed_prefix_dora.safetensors"
+    for name in ("a", "b"):
+        key = f"{'model.diffusion_model.' if name == prefixed_input else ''}layer.weight"
+        value = torch.diag(torch.tensor([3.0, 1.0])) if name == "a" else torch.eye(2)
+        if name == prefixed_input:
+            stem = key[:-len(".weight")]
+            _write_uel(paths[name], {
+                key: value.to(torch.int8),
+                f"{stem}.weight_scale": torch.tensor(1.0),
+                f"{stem}.comfy_quant": torch.tensor(
+                    list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+                ),
+            })
+        else:
+            _write_uel(paths[name], {key: value})
+    monkeypatch.setattr(module, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(module, "cleanup_after_operation", lambda: None)
+    getattr(module, function_name)(
+        str(paths["a"]), str(paths["b"]), "fixed", 1, 1, "cpu", "fp32", str(output),
+        linear_max_rank=1, conv_max_rank=1, force_clear_cache=False, **extra,
+    )
+    with MemoryEfficientSafeOpen(str(output), low_memory=True) as result:
+        keys = set(result.keys())
+    assert "diffusion_model.layer.lora_down.weight" in keys
+    assert "diffusion_model.layer.lora_up.weight" in keys
+    assert not any("comfy_quant" in key or "model.diffusion_model." in key for key in keys)
 
 
 @pytest.mark.parametrize("module_name, function_name, extra", [

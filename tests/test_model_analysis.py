@@ -366,8 +366,8 @@ def test_diffusion_analysis_decodes_int8_tensorwise_and_skips_sidecars(
     )
 
     rows = {row["key"]: row for row in csv.DictReader(StringIO(metrics_csv))}
-    assert set(rows) == {f"{prefix}.weight", "dense.weight"}
-    assert float(rows[f"{prefix}.weight"]["MAE"]) == pytest.approx(6.0)
+    assert set(rows) == {"layer.weight", "dense.weight"}
+    assert float(rows["layer.weight"]["MAE"]) == pytest.approx(6.0)
     assert float(rows["dense.weight"]["MAE"]) == pytest.approx(3.0)
     for path, keys in streamed:
         if path.endswith("a.safetensors") or path.endswith("b.safetensors"):
@@ -375,6 +375,51 @@ def test_diffusion_analysis_decodes_int8_tensorwise_and_skips_sidecars(
                 assert f"{prefix}.weight_scale" in keys
                 assert f"{prefix}.comfy_quant" in keys
     assert sum(f"{prefix}.weight" in keys or "dense.weight" in keys for _, keys in streamed) == 4
+
+
+@pytest.mark.parametrize("prefixed_input", ["a", "b"])
+def test_diffusion_analysis_matches_prefixed_and_bare_layers(
+    monkeypatch, tmp_path, analysis, prefixed_input,
+):
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    prefix = "model.diffusion_model."
+    for name in ("a", "b"):
+        key = f"{prefix if name == prefixed_input else ''}layer.weight"
+        if name == prefixed_input:
+            stem = key[:-len(".weight")]
+            save_file({
+                key: torch.tensor([1, 2], dtype=torch.int8),
+                f"{stem}.weight_scale": torch.tensor(2.0),
+                f"{stem}.comfy_quant": torch.tensor(
+                    list(json.dumps({"format": "int8_tensorwise"}).encode()), dtype=torch.uint8
+                ),
+            }, paths[name])
+        else:
+            save_file({key: torch.tensor([4.0, 8.0])}, paths[name])
+    monkeypatch.setattr(analysis.folder_paths, "get_full_path", lambda _, name: paths[name])
+    monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
+
+    _, _, metrics_csv, _ = analysis.ModelAnalysisLogic.execute(
+        "a", "b", "diffusion_models", _params(),
+    )
+    rows = list(csv.DictReader(StringIO(metrics_csv)))
+    assert [row["key"] for row in rows] == ["layer.weight"]
+    assert float(rows[0]["MAE"]) == pytest.approx(3.0)
+
+
+def test_diffusion_analysis_rejects_duplicate_prefix_variants(monkeypatch, tmp_path, analysis):
+    paths = {name: str(tmp_path / f"{name}.safetensors") for name in ("a", "b")}
+    save_file({
+        "layer.weight": torch.ones(2),
+        "model.diffusion_model.layer.weight": torch.ones(2),
+    }, paths["a"])
+    save_file({"layer.weight": torch.ones(2)}, paths["b"])
+    monkeypatch.setattr(analysis.folder_paths, "get_full_path", lambda _, name: paths[name])
+    monkeypatch.setattr(analysis, "prepare_for_large_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, "cleanup_after_operation", lambda: None)
+    with pytest.raises(ValueError, match="duplicate diffusion layer 'layer.weight'"):
+        analysis.ModelAnalysisLogic.execute("a", "b", "diffusion_models", _params())
 
 
 def test_embedding_similarity_alignment_is_explicit_opt_in(analysis):

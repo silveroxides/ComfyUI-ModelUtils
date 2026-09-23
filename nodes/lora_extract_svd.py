@@ -20,7 +20,7 @@ from .device_utils import (
 from unifiedefficientloader import MemoryEfficientSafeOpen
 from .uel_io import atomic_uel_writer
 from .artifact_paths import canonical_model_artifact_path
-from .quantization_guard import DiffusionQuantization
+from .quantization_guard import DiffusionQuantization, diffusion_key_map
 from .adaptive_svd import ADAPTIVE_PARTIAL_MODES, adaptive_partial_svd
 from .extraction_stream import lora_difference, paired_async_tensors, retry_cuda_oom_on_cpu
 from .layer_parameters import parameter_input, resolve_layer_parameters
@@ -556,6 +556,11 @@ def extract_lora_from_files(
         low_bit_b = set(quantization_b.isolated_low_bit_keys)
         keys_a = set(quantization_a.data_keys)
         keys_b = set(quantization_b.data_keys)
+        logical_a = diffusion_key_map(keys_a, "LoRA Extract model A")
+        logical_b = diffusion_key_map(keys_b, "LoRA Extract model B")
+        paired_keys_b = {
+            key_a: logical_b.get(logical) for logical, key_a in logical_a.items()
+        }
         direct_diff_suffixes = (".scale", ".lin")
         parameter_layers = sorted(
             k for k in keys_a
@@ -568,7 +573,7 @@ def extract_lora_from_files(
         extraction_keys = [
             k for k in keys_a
             if k not in low_bit_a
-            and k not in low_bit_b
+            and paired_keys_b[k] not in low_bit_b
             and (k.endswith(".weight")
             or (
                 include_1d_diffs
@@ -629,15 +634,16 @@ def extract_lora_from_files(
             node_name="LoRA Extract",
         )
         work_units = [
-            (key, key, key if key in keys_b else None)
+            (key, key, paired_keys_b[key])
             for key in extraction_keys
             if (not _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns) if not include_mode else _matches_any_pattern(key, skip_patterns, glob_mode=glob_skip_patterns))
-            and not (key not in keys_b and mismatch_mode == "skip")
+            and not (paired_keys_b[key] is None and mismatch_mode == "skip")
         ]
         pbar = comfy.utils.ProgressBar(len(work_units))
         stats = {"extracted": 0, "full": 0, "skipped": 0, "chunked": 0}
 
         def _process_layer(key, cpu_a, cpu_b):
+            key_b = paired_keys_b[key]
             values = resolved_parameters.get(key, defaults)
             if mode == "fixed":
                 layer_linear_param = values["linear_dim"]
@@ -674,14 +680,14 @@ def extract_lora_from_files(
                 return "skipped", None
 
             source_dtypes = [quantization_a.logical_dtype(key, save_torch_dtype)]
-            if key in keys_b:
-                source_dtypes.append(quantization_b.logical_dtype(key, save_torch_dtype))
+            if key_b is not None:
+                source_dtypes.append(quantization_b.logical_dtype(key_b, save_torch_dtype))
             layer_save_dtype = (
                 torch.float32 if torch.float32 in source_dtypes else save_torch_dtype
             )
 
             # Load tensors with pinned memory for CUDA
-            if key not in keys_b:
+            if key_b is None:
                 if mismatch_mode == "skip":
                     return "skipped", None
                 if mismatch_mode == "error":

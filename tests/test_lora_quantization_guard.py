@@ -506,21 +506,24 @@ def test_diffusion_decoder_matches_core_quantized_tensor(tmp_path, modules):
         handler.__exit__(None, None, None)
 
 
-def test_padded_shape_comes_from_core_meta_architecture(monkeypatch, modules):
+@pytest.mark.parametrize("prefix", ["model.", "model.diffusion_model."])
+def test_padded_shape_comes_from_core_meta_architecture(monkeypatch, modules, prefix):
     import comfy.model_detection
+
+    stem = f"{prefix}layer"
 
     class HeaderOnly:
         def keys(self):
-            return ["model.layer.weight", "model.layer.weight_scale", "model.layer.weight_scale_2"]
+            return [f"{stem}.weight", f"{stem}.weight_scale", f"{stem}.weight_scale_2"]
 
         def metadata(self):
-            return {"_quantization_metadata": json.dumps({"layers": {"model.layer": {"format": "nvfp4"}}})}
+            return {"_quantization_metadata": json.dumps({"layers": {stem: {"format": "nvfp4"}}})}
 
         def get_shape(self, key):
-            return {"model.layer.weight": (16, 8), "model.layer.weight_scale": (16, 1), "model.layer.weight_scale_2": ()}[key]
+            return {f"{stem}.weight": (16, 8), f"{stem}.weight_scale": (16, 1), f"{stem}.weight_scale_2": ()}[key]
 
         def get_dtype(self, key):
-            return torch.uint8 if key == "model.layer.weight" else torch.float32
+            return torch.uint8 if key == f"{stem}.weight" else torch.float32
 
     class Config:
         def get_model(self, state, prefix, device):
@@ -534,7 +537,7 @@ def test_padded_shape_comes_from_core_meta_architecture(monkeypatch, modules):
 
     monkeypatch.setattr(comfy.model_detection, "model_config_from_unet", lambda *args, **kwargs: Config())
     decoder = modules["guard"].DiffusionQuantization(HeaderOnly(), "header-only", "Shape test")
-    assert decoder.logical_shape("model.layer.weight") == (3, 5)
+    assert decoder.logical_shape(f"{stem}.weight") == (3, 5)
 
 
 def test_nvfp4_stream_decode_matches_core_full_dequantization(monkeypatch, tmp_path, modules):
