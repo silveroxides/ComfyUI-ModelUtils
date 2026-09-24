@@ -1862,7 +1862,7 @@ def merge_loras_to_model(
                             base_weight = cpu_base.to(device=device, dtype=torch.float32)
                         del cpu_base
 
-                        source_dtypes = [base_quant.logical_dtype(base_key, save_dtype)]
+                        base_dtype = base_quant.logical_dtype(base_key, save_dtype)
                         applied_1d_diff = False
                         applied = False
 
@@ -1900,7 +1900,6 @@ def merge_loras_to_model(
                                 )
                                 del cpu_patch
                                 continue
-                            source_dtypes.append(info["handler"].get_dtype(direct_key))
                             applied_1d_diff = applied_1d_diff or (
                                 is_additive and cpu_patch.ndim == 1
                             )
@@ -1940,9 +1939,6 @@ def merge_loras_to_model(
                                 )
                                 continue
                             tensor_keys = layer_tensor_keys(block_keys)
-                            contribution_dtypes = [
-                                info["handler"].get_dtype(key) for key in tensor_keys.values()
-                            ]
                             tensors = {
                                 key: loaded[(info["index"], key)]
                                 for key in tensor_keys.values()
@@ -2032,7 +2028,6 @@ def merge_loras_to_model(
 
                             del base_weight
                             base_weight = candidate_weight
-                            source_dtypes.extend(contribution_dtypes)
                             del adapter, tensors
                             applied = True
                             applied_groups.add((info["index"], block_name))
@@ -2044,7 +2039,7 @@ def merge_loras_to_model(
                             )
 
                         target_dtype = select_output_dtype(
-                            source_dtypes,
+                            [base_dtype],
                             save_dtype,
                             is_1d_diff=applied_1d_diff,
                         )

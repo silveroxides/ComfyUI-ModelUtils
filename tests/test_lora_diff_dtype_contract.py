@@ -94,9 +94,50 @@ def test_merge_to_model_applies_every_comfy_lora_pair_spelling(
     result = load_file(output)["model.diffusion_model.layer.weight"]
     torch.testing.assert_close(
         result,
-        torch.tensor([[1.5, 3.0], [2.0, 4.0]]),
+        torch.tensor([[1.5, 3.0], [2.0, 4.0]], dtype=torch.float16),
     )
-    assert result.dtype == torch.float32
+    assert result.dtype == torch.float16
+
+
+def test_merge_to_model_four_fp32_loras_keep_each_base_tensor_dtype(
+    monkeypatch, tmp_path, modules,
+):
+    resize, _ = modules
+    _patch_output(monkeypatch, resize, tmp_path)
+    base = tmp_path / "mixed_dtype_base.safetensors"
+    save_file({
+        "model.diffusion_model.bf16.weight": torch.zeros((2, 2), dtype=torch.bfloat16),
+        "model.diffusion_model.fp32.weight": torch.zeros((2, 2), dtype=torch.float32),
+        "model.diffusion_model.untouched.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+    }, str(base))
+    adapters = []
+    for index in range(4):
+        adapter = tmp_path / f"fp32_adapter_{index}.safetensors"
+        save_file({
+            f"diffusion_model.{block}.lora_A.weight": torch.ones((1, 2), dtype=torch.float32)
+            for block in ("bf16", "fp32")
+        } | {
+            f"diffusion_model.{block}.lora_B.weight": torch.ones((2, 1), dtype=torch.float32)
+            for block in ("bf16", "fp32")
+        }, str(adapter))
+        adapters.append(str(adapter))
+
+    output = resize.merge_loras_to_model(
+        adapters, [0.25] * 4, str(base), "cpu", torch.bfloat16,
+        "merged_mixed_dtype", verbose=False,
+    )
+    result = load_file(output)
+    assert result["model.diffusion_model.bf16.weight"].dtype == torch.bfloat16
+    assert result["model.diffusion_model.fp32.weight"].dtype == torch.float32
+    assert result["model.diffusion_model.untouched.weight"].dtype == torch.bfloat16
+    torch.testing.assert_close(
+        result["model.diffusion_model.bf16.weight"],
+        torch.ones((2, 2), dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        result["model.diffusion_model.fp32.weight"],
+        torch.ones((2, 2), dtype=torch.float32),
+    )
 
 
 def test_merge_to_model_applies_comfy_direct_norm_and_set_forms(
@@ -824,14 +865,14 @@ def test_merge_to_model_applies_generic_direct_keys_and_preserves_dtype(
     torch.testing.assert_close(tensors["model.diffusion_model.norm.weight"], torch.tensor([0.5, 1.0]))
     torch.testing.assert_close(tensors["model.diffusion_model.block.bias"], torch.tensor([1.5, 2.0]))
     assert tensors["model.diffusion_model.scale"].item() == pytest.approx(1.25)
-    torch.testing.assert_close(tensors["model.diffusion_model.lin"], torch.full((2, 2), 0.5))
+    torch.testing.assert_close(tensors["model.diffusion_model.lin"], torch.full((2, 2), 0.5, dtype=torch.float16))
     torch.testing.assert_close(tensors["model.diffusion_model.bad.weight"].float(), torch.ones((2, 2)))
     assert "Shape mismatch" in caplog.text
-    assert tensors["model.diffusion_model.block.weight"].dtype == torch.float32
+    assert tensors["model.diffusion_model.block.weight"].dtype == torch.float16
     assert tensors["model.diffusion_model.norm.weight"].dtype == torch.float32
     assert tensors["model.diffusion_model.block.bias"].dtype == torch.float32
     assert tensors["model.diffusion_model.scale"].dtype == torch.float16
-    assert tensors["model.diffusion_model.lin"].dtype == torch.float32
+    assert tensors["model.diffusion_model.lin"].dtype == torch.float16
     assert tensors["model.diffusion_model.untouched"].dtype == torch.float32
 
     default_output = resize.merge_loras_to_model(
@@ -847,7 +888,7 @@ def test_merge_to_model_applies_generic_direct_keys_and_preserves_dtype(
     )
     assert default_tensors["model.diffusion_model.scale"].item() == pytest.approx(1.25)
     torch.testing.assert_close(
-        default_tensors["model.diffusion_model.lin"], torch.full((2, 2), 0.5)
+        default_tensors["model.diffusion_model.lin"], torch.full((2, 2), 0.5, dtype=torch.float16)
     )
 
 
