@@ -11,6 +11,7 @@ paths = [
   "nodes/dora_learned_wd.py", "nodes/dtype_conversion.py",
   "nodes/cwb_delta_lora_merger.py", "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
   "nodes/lora_rename.py", "nodes/lora_resize.py", "nodes/merger.py",
+  "nodes/minimax_h3_lora_convert.py",
   "nodes/prunekeys.py", "nodes/renamekeys.py", "nodes/text_encoder_extract.py",
 ]
 python_tests = ["tests/test_artifact_paths.py"]
@@ -67,3 +68,7 @@ python_tests = ["tests/test_layer_parameters.py"]
 [groups.dtype_conversion]
 paths = ["nodes/dtype_conversion.py"]
 python_tests = ["tests/test_dtype_conversion.py"]
+
+[groups.minimax_h3_lora_convert]
+paths = ["nodes/minimax_h3_lora_convert.py"]
+python_tests = ["tests/test_minimax_h3_lora_convert.py"]
