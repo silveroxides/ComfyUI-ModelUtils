@@ -176,3 +176,29 @@ def test_node_schema_and_execution_contract(converter, monkeypatch, tmp_path):
     assert result.args[0] == "sub/converted_h3.safetensors"
     assert "MiniMax H3 Diffusers LoRA conversion complete" in result.args[1]
     assert (loras_dir / "sub" / "converted_h3.safetensors").is_file()
+
+
+def test_lora_down_up_suffixes_supported(converter, tmp_path):
+    source = tmp_path / "source_down_up.safetensors"
+    output = tmp_path / "output_down_up.safetensors"
+
+    original = _make_source_tensors("transformer_blocks.0")
+    # Replace .lora_A/.lora_B with .lora.down/.lora.up on attention layers (DMAD format)
+    modified = {}
+    for k, v in original.items():
+        if ".attn." in k:
+            k = k.replace(".lora_A.default.weight", ".lora.down.weight")
+            k = k.replace(".lora_B.default.weight", ".lora.up.weight")
+        else:
+            k = k.replace(".default.weight", ".weight")
+        modified[k] = v
+
+    save_file(modified, str(source))
+    report = converter.convert_minimax_h3_diffusers_lora(str(source), str(output))
+    assert "MiniMax H3 Diffusers LoRA conversion complete" in report
+    converted = load_file(str(output))
+
+    assert "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight" in converted
+    assert "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight" in converted
+    assert "diffusion_model.blocks.0.mlp.fc1.lora_A.weight" in converted
+    assert "diffusion_model.blocks.0.mlp.fc1.lora_B.weight" in converted

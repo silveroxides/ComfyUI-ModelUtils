@@ -15,7 +15,7 @@ from .quantization_guard import inspect_low_bit_input
 from .uel_io import atomic_uel_writer
 
 _FACTOR_RE = re.compile(
-    r"^(?P<module>.+)\.lora_(?P<factor>[AB])(?:\.default)?\.weight$"
+    r"^(?P<module>.+)\.(?:lora_(?P<factor_ab>[AB])|lora\.(?P<factor_word>down|up))(?:\.default)?\.weight$"
 )
 _BLOCK_RE = re.compile(r"^transformer_blocks\.(?P<index>\d+)\.(?P<tail>.+)$")
 _REFINER_RE = re.compile(r"^token_refiner\.refiner_blocks\.(?P<index>\d+)\.(?P<tail>.+)$")
@@ -93,7 +93,9 @@ def _build_plan(keys: list[str]) -> list[_ConversionUnit]:
                 f"Input is not a compatible MiniMax H3 Diffusers PEFT LoRA; unsupported key: {key}"
             )
         mod = match.group("module")
-        factor = match.group("factor")
+        factor = match.group("factor_ab") or (
+            "A" if match.group("factor_word") == "down" else "B"
+        )
         pair = factors.setdefault(mod, {})
         if factor in pair:
             raise ValueError(f"Duplicate LoRA factor for: {mod}")
