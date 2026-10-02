@@ -172,11 +172,25 @@ def run_selection(selection: Selection) -> int:
             filter(None, (str(REPOSITORY_ROOT), environment.get("PYTHONPATH", "")))
         )
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "--import-mode=importlib",
-             "--basetemp", str(basetemp),
-             *[str((REPOSITORY_ROOT / path).resolve())
-               for path in sorted(selection.python_tests)]],
-            cwd=COMFYUI_ROOT, env=environment, check=False,
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "--import-mode=importlib",
+                "-o",
+                "addopts=",
+                "--capture=sys",
+                "--basetemp",
+                str(basetemp),
+                *[
+                    str((REPOSITORY_ROOT / path).resolve())
+                    for path in sorted(selection.python_tests)
+                ],
+            ],
+            cwd=COMFYUI_ROOT,
+            env=environment,
+            check=False,
         )
         return result.returncode
     finally:
@@ -222,11 +236,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {path}", file=sys.stderr)
         print("Update tests/test_groups.toml or use --final.", file=sys.stderr)
         return 2
-    print_selection(selection)
+    if args.dry_run:
+        print_selection(selection)
+        return 0
     if not selection.python_tests:
         print("No tests selected.")
         return 0
-    return 0 if args.dry_run else run_selection(selection)
+    return run_selection(selection)
 
 
 if __name__ == "__main__":
