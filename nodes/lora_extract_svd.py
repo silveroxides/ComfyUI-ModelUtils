@@ -498,7 +498,7 @@ def extract_lora_from_files(
     chunk_large_layers: bool = True,
     svd_niter: int = 2,
     lazy_load: bool = True,
-    force_clear_cache: bool = True,
+    force_clear_cache: bool = False,
     glob_skip_patterns: bool = False,
     include_1d_diffs: bool = False,
     knee_probe_offset: int = 32,

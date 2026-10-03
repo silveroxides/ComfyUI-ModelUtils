@@ -390,7 +390,7 @@ def test_exact_node_schema_contract(delta_cwb):
     assert schemas[0].inputs[7].default == "full_difference"
     assert schemas[0].inputs[8].default == 384
     assert schemas[0].inputs[9].default == "cuda"
-    assert schemas[0].inputs[-2].default is True
+    assert schemas[0].inputs[-2].default is False
     assert schemas[0].inputs[-1].default is False
     assert "agreement" in schemas[0].inputs[2].tooltip
     assert "Only a failed CUDA layer retries on CPU" in schemas[0].inputs[9].tooltip

@@ -79,7 +79,7 @@ def extract_te_from_files(
     chunk_large_layers: bool = True,
     svd_niter: int = 2,
     lazy_load: bool = True,
-    force_clear_cache: bool = True,
+    force_clear_cache: bool = False,
     glob_skip_patterns: bool = False,
     knee_probe_offset: int = 32,
     include_mode: bool = False,

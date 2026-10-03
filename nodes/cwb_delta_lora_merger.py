@@ -640,7 +640,7 @@ def _fixed_inputs(count, default_filename):
         ),
         io.Boolean.Input(
             "force_clear_cache",
-            default=True,
+            default=False,
             tooltip="Clear Python and CUDA caches before each layer to reduce retained memory.",
         ),
         io.Boolean.Input(

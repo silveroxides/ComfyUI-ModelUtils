@@ -514,7 +514,7 @@ class CheckpointTwoMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -584,7 +584,7 @@ class ModelTwoMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -654,7 +654,7 @@ class TextEncoderTwoMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -724,7 +724,7 @@ class LoRATwoMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
@@ -798,7 +798,7 @@ class EmbeddingTwoMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -871,7 +871,7 @@ class CheckpointThreeMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -942,7 +942,7 @@ class ModelThreeMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -1013,7 +1013,7 @@ class TextEncoderThreeMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),
@@ -1084,7 +1084,7 @@ class LoRAThreeMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force merged non-1D tensors to save_dtype. Enabled 1D direct diffs remain FP32."),
                 io.Boolean.Input("include_1d_diffs", default=False,
                                  tooltip="Merge 1D tensors. When disabled, preserve Model A's 1D tensors unchanged."),
@@ -1159,7 +1159,7 @@ class EmbeddingThreeMerger(io.ComfyNode):
                                  tooltip="When True, exclude/discard patterns use glob syntax (* = any sequence, dots are literal). "
                                          "When False (default), patterns are Python regex matched as substrings."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Low memory mode: load tensors from disk on demand"),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear CUDA cache after each layer"),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear CUDA cache after each layer"),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force the entire model to be saved as the selected save_dtype. If False (default), higher precision dtypes are preserved."),
                 io.Boolean.Input("include_mode", default=False, tooltip="Use Exclude Patterns as a whitelist instead. Only matching tensors are merged; nonmatching tensors are preserved from Model A."),
                 parameter_input("merge"),

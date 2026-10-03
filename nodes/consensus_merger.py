@@ -2720,7 +2720,7 @@ def _common_inputs(
         ),
         io.Boolean.Input(
             "force_clear_cache",
-            default=True,
+            default=False,
             tooltip="Run Python garbage collection and clear the CUDA allocator cache before each layer. Reduces retained memory but can substantially slow merging.",
         ),
         io.Boolean.Input(
@@ -2922,7 +2922,7 @@ class CWBLoRAMultiMerger(io.ComfyNode):
                 io.String.Input("discard_patterns", default="", multiline=True, tooltip="Omit matching tensors or logical groups from the output."),
                 io.Boolean.Input("glob_patterns", default=False, tooltip="Interpret filter entries as shell-style globs instead of regular expressions."),
                 io.Boolean.Input("lazy_load", default=True, tooltip="Use bounded UEL work-unit streaming and release each completed input layer."),
-                io.Boolean.Input("force_clear_cache", default=True, tooltip="Collect Python and CUDA caches before each layer at a potential speed cost."),
+                io.Boolean.Input("force_clear_cache", default=False, tooltip="Collect Python and CUDA caches before each layer at a potential speed cost."),
                 io.Boolean.Input("override_dtype", default=False, tooltip="Force generated floating factors to the requested save dtype."),
                 io.Boolean.Input("include_1d_diffs", default=False, tooltip="CWB-merge 1D direct differences as FP32 instead of preserving the anchor."),
                 io.Boolean.Input("counterfactual_weight_sweep", default=False, tooltip="Evaluate alpha, beta, similarity-threshold, DSC, and comfort-bandpass weight combinations from each already-computed consensus similarity vector and append them to the report without additional model loads or saved outputs."),
@@ -2993,7 +2993,7 @@ def _embedding_coalesce_controls(default_filename: str):
         io.Combo.Input("save_dtype", options=["fp32", "fp16", "bf16"], default="fp32", tooltip="Requested dtype for generated floating embedding tensors."),
         io.Combo.Input("process_device", options=["cuda", "cpu"], default="cuda", tooltip="Per-tensor FP32 CWB arithmetic device; CUDA OOM retries that tensor on CPU."),
         io.Boolean.Input("lazy_load", default=True, tooltip="Use bounded UEL streaming and release each tensor after its work unit."),
-        io.Boolean.Input("force_clear_cache", default=True, tooltip="Clear Python and CUDA caches before each tensor at a possible speed cost."),
+        io.Boolean.Input("force_clear_cache", default=False, tooltip="Clear Python and CUDA caches before each tensor at a possible speed cost."),
         io.Boolean.Input("override_dtype", default=False, tooltip="Force generated floating tensors to Save Dtype."),
     ]
 

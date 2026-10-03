@@ -1243,7 +1243,7 @@ def _common_inputs(model_type: str, *, alignment_control: bool):
         ),
         io.Boolean.Input(
             "force_clear_cache",
-            default=True,
+            default=False,
             tooltip="Run garbage collection and clear the CUDA allocator cache after every analyzed work unit. Saves retained memory but slows analysis.",
         ),
         io.String.Input(
