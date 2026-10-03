@@ -12,6 +12,7 @@ paths = [
   "nodes/cwb_delta_lora_merger.py", "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
   "nodes/lora_rename.py", "nodes/lora_resize.py", "nodes/merger.py",
   "nodes/minimax_h3_lora_convert.py",
+  "nodes/minimax_h3_fold.py",
   "nodes/prunekeys.py", "nodes/renamekeys.py", "nodes/text_encoder_extract.py",
 ]
 python_tests = ["tests/test_artifact_paths.py"]
@@ -72,3 +73,7 @@ python_tests = ["tests/test_dtype_conversion.py"]
 [groups.minimax_h3_lora_convert]
 paths = ["nodes/minimax_h3_lora_convert.py"]
 python_tests = ["tests/test_minimax_h3_lora_convert.py"]
+
+[groups.minimax_h3_fold]
+paths = ["nodes/minimax_h3_fold.py"]
+python_tests = ["tests/test_minimax_h3_fold.py"]

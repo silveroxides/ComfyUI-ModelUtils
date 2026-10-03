@@ -25,6 +25,7 @@ MIGRATED_SAVE_MODULES = (
     "prunekeys.py",
     "lora_rename.py",
     "minimax_h3_lora_convert.py",
+    "minimax_h3_fold.py",
 )
 
 

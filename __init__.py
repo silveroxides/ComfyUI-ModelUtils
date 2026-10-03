@@ -61,6 +61,7 @@ from .nodes.model_info_nodes import (
 
 from .nodes.lora_rename import AnimaLoraRename
 from .nodes.minimax_h3_lora_convert import MiniMaxH3DiffusersLoRAConvert
+from .nodes.minimax_h3_fold import MiniMaxH3FoldAdaLN
 from .nodes.dtype_conversion import DiffusionModelDtypeConversion
 from .nodes.layer_parameters import LayerParameterConfiguration
 from .nodes.lora_model_analysis import LoRAOnModelAnalysis
@@ -120,8 +121,9 @@ class ModelUtilsExtension(ComfyExtension):
             # LoRA Utilities
             AnimaLoraRename,
             MiniMaxH3DiffusersLoRAConvert,
-            # Dtype Conversion
+            # Dtype Conversion & Folding
             DiffusionModelDtypeConversion,
+            MiniMaxH3FoldAdaLN,
             # Downloaders
             CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
             VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,

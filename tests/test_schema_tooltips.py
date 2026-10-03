@@ -54,6 +54,7 @@ FILTER_MODULES = [
     "merger", "consensus_merger", "cwb_delta_lora_merger", "lodestone_merger",
     "lora_resize", "dtype_conversion", "model_analysis",
     "lora_extract_svd", "dora_extract_wd", "dora_learned_wd", "text_encoder_extract",
+    "minimax_h3_fold",
 ]
 
 
