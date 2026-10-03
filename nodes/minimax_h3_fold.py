@@ -281,7 +281,16 @@ def fold_minimax_h3_diffusion_model(
 
 
 class MiniMaxH3FoldAdaLN(io.ComfyNode):
-    """Fold MiniMax H3 full-width AdaLN linears [*, 2688] onto rank-8 time-embedding curve basis."""
+    """Folds MiniMax H3 AdaLN conditioning linears onto a low-rank curve basis.
+
+    Technical details:
+    Full-width AdaLN linear weights [*, 2688] are projected onto a rank-8 SVD basis
+    of the silu(time_embedder) curve sampled across a 1025-point grid of t in [0, 1]:
+      X = silu(t_emb(t)) [1025, 2688] = U S V^T
+      adaln_t_table = U_8 S_8 (FP32),  W' = W V_8 (FP16)
+    The time embedder is dropped and replaced with adaln_t_table [1025, 8], reducing
+    model size substantially with negligible reconstruction error (< 1e-4).
+    """
 
     @classmethod
     def define_schema(cls):
@@ -289,28 +298,28 @@ class MiniMaxH3FoldAdaLN(io.ComfyNode):
             node_id="MiniMaxH3FoldAdaLN",
             display_name="MiniMax H3 Fold AdaLN",
             category="ModelUtils/DiffusionModels",
-            description="Folds MiniMax H3 full-width AdaLN linear layers onto a low-rank basis of the silu(time_embedder) curve, replacing the time embedder with adaln_t_table.",
+            description="Compresses large MiniMax H3 models by folding time-conditioning layers into a small lookup table, matching official ComfyUI checkpoint formats.",
             inputs=[
                 io.Combo.Input(
                     "model_name",
                     options=folder_paths.get_filename_list("diffusion_models"),
-                    tooltip="MiniMax H3 diffusion model with full-width AdaLN linears [*, 2688] to fold.",
+                    tooltip="Select the original/uncompressed MiniMax H3 model file to fold.",
                 ),
                 io.String.Input(
                     "output_filename",
                     default="minimax_h3_folded",
-                    tooltip="Output filename without extension, written under ComfyUI's diffusion_models directory.",
+                    tooltip="Name for the new folded model file, saved in your diffusion_models folder.",
                 ),
                 io.String.Input(
                     "discard_patterns",
                     default="",
                     multiline=True,
-                    tooltip="Newline-separated regex or glob patterns for tensors to omit entirely from the saved model (e.g. drop specific transformer blocks or refiner).",
+                    tooltip="Layers to completely remove from the final file (one name or pattern per line). Useful to strip parts you do not need.",
                 ),
                 io.Boolean.Input(
                     "glob_patterns",
                     default=False,
-                    tooltip="When True, filter patterns use shell globs (* matches any sequence, dots are literal). When False (default), patterns are Python regex matched as substrings.",
+                    tooltip="Enable simple wildcard matching (* to match anything). If unchecked, uses regular expressions.",
                 ),
                 io.Int.Input(
                     "curve_rank",
@@ -318,7 +327,7 @@ class MiniMaxH3FoldAdaLN(io.ComfyNode):
                     min=1,
                     max=64,
                     step=1,
-                    tooltip="Basis rank for the silu(time_embedder) curve (default 8, matching ComfyUI H3 checkpoints).",
+                    tooltip="Compression size for the time schedule table. Leave at 8 to match standard ComfyUI MiniMax H3 models.",
                 ),
                 io.Int.Input(
                     "curve_grid",
@@ -326,24 +335,24 @@ class MiniMaxH3FoldAdaLN(io.ComfyNode):
                     min=65,
                     max=4097,
                     step=64,
-                    tooltip="Number of interpolation grid points sampled for timestep t in [0, 1] (default 1025).",
+                    tooltip="Sampling resolution for the time schedule curve. Leave at 1025 to match standard ComfyUI MiniMax H3 models.",
                 ),
                 io.Combo.Input(
                     "process_device",
                     options=["cuda", "cpu"],
                     default="cuda",
-                    tooltip="Device used for SVD curve decomposition and matrix projection; CUDA OOM automatically retries on CPU.",
+                    tooltip="Hardware device used to perform the math. Use cuda (GPU) for speed, or cpu if you run low on VRAM.",
                 ),
                 io.String.Input(
                     "exclude_patterns",
                     default="",
                     multiline=True,
-                    tooltip="Newline-separated regex or glob patterns. Matching AdaLN layers remain unfolded at full width [*, 2688].",
+                    tooltip="Specific layers to skip folding, keeping them at their original full size (one name or pattern per line).",
                 ),
                 io.Boolean.Input(
                     "include_mode",
                     default=False,
-                    tooltip="When True, use exclude_patterns as a whitelist: only matching AdaLN layers are folded; all others remain full width.",
+                    tooltip="Invert the exclude filter: only fold layers matching the pattern, and keep everything else untouched.",
                 ),
             ],
             outputs=[
