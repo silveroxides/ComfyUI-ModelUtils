@@ -393,3 +393,295 @@ class MiniMaxH3FoldAdaLN(io.ComfyNode):
             process_device=process_device,
         )
         return io.NodeOutput(output_name, report)
+
+
+def unfold_minimax_h3_diffusion_model(
+    model_a_path: str,
+    model_b_path: str,
+    output_path: str,
+    *,
+    exclude_patterns: str = "",
+    include_mode: bool = False,
+    discard_patterns: str = "",
+    glob_patterns: bool = False,
+    curve_rank: int = 8,
+    curve_grid: int = 1025,
+    process_device: str = "cuda",
+) -> str:
+    """Stream and reconstruct unfolded MiniMax H3 AdaLN linears using a reference base model."""
+    if os.path.normcase(os.path.abspath(model_a_path)) == os.path.normcase(
+        os.path.abspath(output_path)
+    ):
+        raise ValueError("Output path must differ from the folded model (Model A) path.")
+    if os.path.normcase(os.path.abspath(model_b_path)) == os.path.normcase(
+        os.path.abspath(output_path)
+    ):
+        raise ValueError("Output path must differ from the base model (Model B) path.")
+
+    device = torch.device(
+        process_device if torch.cuda.is_available() and process_device == "cuda" else "cpu"
+    )
+
+    compiled_excludes = _compile_patterns(exclude_patterns, glob_patterns)
+    compiled_discards = _compile_patterns(discard_patterns, glob_patterns)
+
+    handler_a = MemoryEfficientSafeOpen(model_a_path, low_memory=True)
+    handler_b = MemoryEfficientSafeOpen(model_b_path, low_memory=True)
+
+    try:
+        inspect_low_bit_input(handler_a, f"Model A ({model_a_path})", "MiniMax H3 Unfold AdaLN")
+        inspect_low_bit_input(handler_b, f"Model B ({model_b_path})", "MiniMax H3 Unfold AdaLN")
+
+        all_keys_a = list(handler_a.keys())
+        all_keys_b = list(handler_b.keys())
+
+        prefix_b, time_keys_b = _detect_time_embedder_keys(all_keys_b)
+        prefix_a = "diffusion_model." if any(k.startswith("diffusion_model.") for k in all_keys_a) else ""
+
+        # Step 1: Compute basis and table from base model (Model B)
+        tstream_b = handler_b.async_stream(
+            list(time_keys_b.values()),
+            batch_size=1,
+            prefetch_batches=1,
+            pin_memory=False,
+        )
+        time_tensors_b = {}
+        try:
+            for batch in tstream_b:
+                for k, t in batch:
+                    time_tensors_b[k] = t
+            _, basis, error = _fold_curve_basis(
+                time_tensors_b[time_keys_b["w1"]],
+                time_tensors_b[time_keys_b["b1"]],
+                time_tensors_b[time_keys_b["w2"]],
+                time_tensors_b[time_keys_b["b2"]],
+                curve_grid,
+                curve_rank,
+                device,
+            )
+        finally:
+            for k in time_keys_b.values():
+                handler_b.mark_processed(k)
+            tstream_b.close()
+
+        basis_device = basis.to(device)
+
+        metadata = dict(handler_a.metadata() or {})
+        if "config" in metadata:
+            try:
+                cfg = json.loads(metadata["config"])
+                if isinstance(cfg, dict):
+                    tf = cfg.setdefault("transformer", {})
+                    tf.pop("adaln_curve_grid", None)
+                    tf["time_embed_dim"] = basis.shape[0]
+                    metadata["config"] = json.dumps(cfg, separators=(",", ":"))
+            except Exception:
+                pass
+        metadata["modelutils_adaln_unfold"] = f"reconstructed_rank{basis.shape[1]}_with_base"
+
+        table_key_a = f"{prefix_a}adaln_t_table"
+
+        counts = {
+            "unfolded": 0,
+            "preserved": 0,
+            "discarded": 0,
+            "time_embedder_restored": 0,
+        }
+
+        with atomic_uel_writer(output_path, metadata) as writer:
+            # Emit the 4 time_embedder tensors restored from Model B
+            for _, base_k in time_keys_b.items():
+                target_k = f"{prefix_a}{base_k.removeprefix(prefix_b)}"
+                if not _matches_any_pattern(target_k, compiled_discards, glob_patterns):
+                    writer.write_batch([(target_k, time_tensors_b[base_k])])
+                    counts["time_embedder_restored"] += 1
+
+            time_tensors_b.clear()
+
+            remaining_keys_a = [k for k in all_keys_a if k != table_key_a]
+            progress = comfy.utils.ProgressBar(len(remaining_keys_a))
+
+            for key in remaining_keys_a:
+                if _matches_any_pattern(key, compiled_discards, glob_patterns):
+                    counts["discarded"] += 1
+                    handler_a.mark_processed(key)
+                    progress.update(1)
+                    continue
+
+                astream = handler_a.async_stream(
+                    [key], batch_size=1, prefetch_batches=1, pin_memory=False
+                )
+                try:
+                    tensor_a = next(astream)[0][1]
+
+                    if _is_adaln(key):
+                        matched = _matches_any_pattern(key, compiled_excludes, glob_patterns)
+                        should_unfold = matched if include_mode else not matched
+                        if should_unfold and key.endswith(".weight"):
+                            base_key = f"{prefix_b}{key.removeprefix(prefix_a)}"
+                            if base_key not in all_keys_b:
+                                raise KeyError(
+                                    f"Matching base layer '{base_key}' not found in Model B."
+                                )
+                            bstream = handler_b.async_stream(
+                                [base_key], batch_size=1, prefetch_batches=1, pin_memory=False
+                            )
+                            try:
+                                base_w = next(bstream)[0][1]
+                                if base_w.ndim != 2 or base_w.shape[1] != basis.shape[0]:
+                                    raise ValueError(
+                                        f"{base_key} in Model B has shape {tuple(base_w.shape)}, expected [*, {basis.shape[0]}]"
+                                    )
+                                bw_f32 = base_w.to(device, torch.float32)
+                                w_folded = tensor_a.to(device, torch.float32)
+                                w_diff = w_folded - bw_f32 @ basis_device
+                                w_unfolded = (bw_f32 + w_diff @ basis_device.T).to(base_w.dtype).cpu().contiguous()
+                                writer.write_batch([(key, w_unfolded)])
+                                counts["unfolded"] += 1
+                            finally:
+                                handler_b.mark_processed(base_key)
+                                bstream.close()
+                        else:
+                            writer.write_batch([(key, tensor_a.contiguous())])
+                            counts["preserved"] += 1
+                    else:
+                        writer.write_batch([(key, tensor_a.contiguous())])
+                        counts["preserved"] += 1
+                finally:
+                    handler_a.mark_processed(key)
+                    astream.close()
+
+                progress.update(1)
+    finally:
+        handler_a.__exit__(None, None, None)
+        handler_b.__exit__(None, None, None)
+        cleanup_after_operation()
+
+    report_lines = [
+        "MiniMax H3 AdaLN Unfold complete",
+        f"Curve rank: {curve_rank}, grid points: {curve_grid}",
+        f"Base basis reconstruction error: {error:.4e}",
+        f"AdaLN layers unfolded: {counts['unfolded']}",
+        f"Time embedder tensors restored: {counts['time_embedder_restored']}",
+        f"Tensors preserved: {counts['preserved']}",
+        f"Tensors discarded: {counts['discarded']}",
+        f"Output size: {os.path.getsize(output_path)} bytes",
+        f"Output: {output_path}",
+    ]
+    return "\n".join(report_lines)
+
+
+class MiniMaxH3UnfoldAdaLN(io.ComfyNode):
+    """Reconstruct full-width AdaLN linears [*, 2688] from a folded model and reference base model."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3UnfoldAdaLN",
+            display_name="MiniMax H3 Unfold AdaLN",
+            category="ModelUtils/DiffusionModels",
+            description="Reconstructs full-width MiniMax H3 AdaLN linears [*, 2688] from a folded model (Model A) using a reference non-folded base model (Model B) to supply the time embedder and orthogonal dimensions.",
+            inputs=[
+                io.Combo.Input(
+                    "model_a",
+                    options=folder_paths.get_filename_list("diffusion_models"),
+                    tooltip="Select the folded MiniMax H3 model (Model A) to unfold.",
+                ),
+                io.Combo.Input(
+                    "model_b",
+                    options=folder_paths.get_filename_list("diffusion_models"),
+                    tooltip="Select the reference original/unfolded MiniMax H3 base model (Model B) to supply the time embedder and missing dimensions.",
+                ),
+                io.String.Input(
+                    "output_filename",
+                    default="minimax_h3_unfolded",
+                    tooltip="Name for the reconstructed unfolded model file, saved in your diffusion_models folder.",
+                ),
+                io.String.Input(
+                    "discard_patterns",
+                    default="",
+                    multiline=True,
+                    tooltip="Layers to completely remove from the final file (one name or pattern per line). Useful to strip parts you do not need.",
+                ),
+                io.Boolean.Input(
+                    "glob_patterns",
+                    default=False,
+                    tooltip="Enable simple wildcard matching (* to match anything). If unchecked, uses regular expressions.",
+                ),
+                io.Int.Input(
+                    "curve_rank",
+                    default=8,
+                    min=1,
+                    max=64,
+                    step=1,
+                    tooltip="Basis rank used when the model was folded (default 8, matching standard ComfyUI H3 checkpoints).",
+                ),
+                io.Int.Input(
+                    "curve_grid",
+                    default=1025,
+                    min=65,
+                    max=4097,
+                    step=64,
+                    tooltip="Sampling resolution used when the model was folded (default 1025, matching standard ComfyUI H3 checkpoints).",
+                ),
+                io.Combo.Input(
+                    "process_device",
+                    options=["cuda", "cpu"],
+                    default="cuda",
+                    tooltip="Hardware device used to perform the math. Use cuda (GPU) for speed, or cpu if you run low on VRAM.",
+                ),
+                io.String.Input(
+                    "exclude_patterns",
+                    default="",
+                    multiline=True,
+                    tooltip="Specific layers to skip unfolding, keeping them at their folded size (one name or pattern per line).",
+                ),
+                io.Boolean.Input(
+                    "include_mode",
+                    default=False,
+                    tooltip="Invert the exclude filter: only unfold layers matching the pattern, and keep everything else untouched.",
+                ),
+            ],
+            outputs=[
+                io.AnyType.Output(display_name="output_path"),
+                io.String.Output(display_name="report"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model_a: str,
+        model_b: str,
+        output_filename: str,
+        discard_patterns: str = "",
+        glob_patterns: bool = False,
+        curve_rank: int = 8,
+        curve_grid: int = 1025,
+        process_device: str = "cuda",
+        exclude_patterns: str = "",
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        model_a_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models", model_a
+        )
+        model_b_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models", model_b
+        )
+        output_path, output_name = canonical_model_artifact_path(
+            "diffusion_models", output_filename
+        )
+        report = unfold_minimax_h3_diffusion_model(
+            model_a_path,
+            model_b_path,
+            output_path,
+            exclude_patterns=exclude_patterns,
+            include_mode=include_mode,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
+            curve_rank=curve_rank,
+            curve_grid=curve_grid,
+            process_device=process_device,
+        )
+        return io.NodeOutput(output_name, report)

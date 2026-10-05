@@ -160,3 +160,87 @@ def test_node_schema_and_execution_contract(folder_module, monkeypatch, tmp_path
     assert result.args[0] == "sub/folded_h3.safetensors"
     assert "MiniMax H3 AdaLN Fold complete" in result.args[1]
     assert (diff_dir / "sub" / "folded_h3.safetensors").is_file()
+
+
+def test_unfold_h3_diffusion_model_reconstructs_with_base(folder_module, tmp_path):
+    base_file = tmp_path / "model_base.safetensors"
+    folded_file = tmp_path / "model_folded.safetensors"
+    unfolded_file = tmp_path / "model_unfolded.safetensors"
+
+    original_base = _make_h3_checkpoint()
+    save_file(original_base, str(base_file))
+
+    # Fold base model to create folded model A
+    folder_module.fold_minimax_h3_diffusion_model(
+        str(base_file), str(folded_file), process_device="cpu"
+    )
+
+    # Unfold model A using base model B
+    report = folder_module.unfold_minimax_h3_diffusion_model(
+        str(folded_file), str(base_file), str(unfolded_file), process_device="cpu"
+    )
+    assert "MiniMax H3 AdaLN Unfold complete" in report
+    assert "AdaLN layers unfolded: 2" in report
+
+    reconstructed = load_file(str(unfolded_file))
+
+    # adaln_t_table should be dropped in unfolded output
+    assert "adaln_t_table" not in reconstructed
+
+    # time_embedder restored from base model B
+    assert "time_embedder.proj_in.weight" in reconstructed
+    assert "time_embedder.proj_out.weight" in reconstructed
+    assert torch.equal(reconstructed["time_embedder.proj_in.weight"], original_base["time_embedder.proj_in.weight"])
+    assert torch.equal(reconstructed["time_embedder.proj_out.weight"], original_base["time_embedder.proj_out.weight"])
+
+    # AdaLN linear weights reconstructed to full width [128, 2688]
+    assert reconstructed["blocks.0.adaln_proj.linear.weight"].shape == (128, 2688)
+    assert reconstructed["blocks.1.adaln_proj.linear.weight"].shape == (128, 2688)
+
+    # Other tensors preserved
+    assert torch.equal(reconstructed["blocks.0.attn.qkv_proj.weight"], original_base["blocks.0.attn.qkv_proj.weight"])
+
+
+def test_unfold_h3_node_schema_and_execution(folder_module, monkeypatch, tmp_path):
+    schema = folder_module.MiniMaxH3UnfoldAdaLN.define_schema()
+    assert schema.node_id == "MiniMaxH3UnfoldAdaLN"
+    assert schema.is_output_node is True
+
+    input_ids = [item.id for item in schema.inputs]
+    assert input_ids == [
+        "model_a", "model_b", "output_filename", "discard_patterns",
+        "glob_patterns", "curve_rank", "curve_grid", "process_device",
+        "exclude_patterns", "include_mode",
+    ]
+    assert input_ids[-1] == "include_mode"
+
+    for item in schema.inputs:
+        assert hasattr(item, "tooltip") and item.tooltip.strip()
+
+    models_dir = tmp_path / "models"
+    diff_dir = models_dir / "diffusion_models"
+    diff_dir.mkdir(parents=True)
+
+    base_file = diff_dir / "base.safetensors"
+    folded_file = diff_dir / "folded.safetensors"
+
+    save_file(_make_h3_checkpoint(), str(base_file))
+    folder_module.fold_minimax_h3_diffusion_model(str(base_file), str(folded_file), process_device="cpu")
+
+    monkeypatch.setattr(folder_module.folder_paths, "models_dir", str(models_dir))
+    monkeypatch.setattr(
+        folder_module.folder_paths,
+        "get_full_path_or_raise",
+        lambda folder, name: str(diff_dir / name),
+    )
+
+    result = folder_module.MiniMaxH3UnfoldAdaLN.execute(
+        model_a="folded.safetensors",
+        model_b="base.safetensors",
+        output_filename="sub/unfolded_h3",
+        process_device="cpu",
+    )
+
+    assert result.args[0] == "sub/unfolded_h3.safetensors"
+    assert "MiniMax H3 AdaLN Unfold complete" in result.args[1]
+    assert (diff_dir / "sub" / "unfolded_h3.safetensors").is_file()
