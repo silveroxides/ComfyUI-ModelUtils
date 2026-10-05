@@ -2,154 +2,194 @@
 
 ---
 
-## Weight-Sum
-> `A * (1 - α) + B * α`. A simple linear interpolation between two models.
+### Core Convention Across All 2-Model Modes
+- **Model A is ALWAYS the base / anchor model.**
+- **Model B is ALWAYS the donor / incoming model being merged into Model A.**
+- When interpolating or blending between weights:
+  $$\text{Output} = A \cdot (1 - \text{mask}) + B \cdot \text{mask}$$
+- A blend factor / weight of `0.0` yields **100% Model A** (pure Model A).
+- A blend factor / weight of `1.0` yields **100% Model B** (pure Model B).
+- Intermediate values control how much of Model B replaces or alters Model A.
 
-**Models Used:** A, B
+---
+
+## Weight-Sum
+> $\text{Output} = A \cdot (1 - \alpha) + B \cdot \alpha$. Direct linear interpolation between Model A and Model B.
+
+**Models Used:** A (Base), B (Incoming)
+
 **Parameters:**
-- **Alpha:** Interpolation weight. `0.0` is 100% Model A, `1.0` is 100% Model B.
+- **Alpha:** The blend ratio determining what fraction of **Model B** replaces **Model A**.
+  - `0.0`: **100% Model A, 0% Model B** (exact Model A; Model B is completely ignored).
+  - `0.25`: **75% Model A, 25% Model B** (mostly Model A, with 25% of Model B blended in).
+  - `0.50`: **50% Model A, 50% Model B** (equal 50/50 mix of both models).
+  - `0.75`: **25% Model A, 75% Model B** (mostly Model B, retaining 25% of Model A).
+  - `1.0`: **0% Model A, 100% Model B** (exact Model B; Model A is completely replaced).
 
 ---
 
 ## Comparative-Interpolation
-> Interpolates between A and B based on the relative differences in their tensor values. Creates a unique blend by deciding how much of each model to use for each individual weight.
+> Interpolates between A and B based on the relative differences in their tensor values, creating a selective blend rather than a flat uniform mix.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Incoming)
+
 **Parameters:**
-- **Alpha:** Controls the interpolation curve's strength and shape.
-- **Beta:** Switches the interpolation style. `0.0` focuses on similarity, `1.0` focuses on difference.
-- **Gamma:** Mixes between a randomized (binomial) interpolation at `0.0` and a smooth (linear) one at `1.0`.
+- **Alpha (Blend Intensity):** Controls the overall pull of **Model B into Model A**.
+  - `0.0`: Heavily favors Model A (virtually no Model B incorporated).
+  - `0.5`: Balanced curve where weights with moderate differences blend equally.
+  - `1.0`: Strongly pulls in Model B wherever weights differ.
+- **Beta (Feature Focus):** Controls whether the merge targets similar or divergent weights.
+  - `0.0`: Focuses blending on weights where Model A and Model B are already similar.
+  - `1.0`: Focuses blending on weights where Model A and Model B differ most.
+- **Gamma (Transition Style):** Mixes between discrete selection and smooth gradation.
+  - `0.0`: Stochastic / binomial selection (individual weights are chosen probabilistically as either pure A or pure B).
+  - `1.0`: Smooth linear interpolation across all weights.
 
 ---
 
 ## Power-Up (DARE)
-> Adds the unique capabilities of Model B to Model A using the Drop and Rescale (DARE) technique. This implementation handles shape mismatches between models by padding and uses a randomized dropout mask.
+> Adds the unique capabilities of Model B onto Model A using the Drop and Rescale (DARE) technique. Computes the task delta $(B - A)$, randomly drops a fraction of the delta parameters, rescales the survivors to maintain expected magnitude, and adds them to Model A.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Donor)
+
 **Parameters:**
-- **Alpha:** The dropout rate ($p$). This is the proportion of delta parameters from Model B that are randomly set to zero.
-- **Beta:** A final multiplier for the rescaled difference before it's added to Model A.
-- **Rescaling Logic:** Remaining weights are automatically rescaled by $1/(1-p)$ as per the DARE paper to approximate the original embeddings.
+- **Alpha (Dropout Rate $p$):** Proportion of Model B's delta parameters to randomly zero out.
+  - Range: `0.0` to `1.0`.
+  - Typical: `0.7` to `0.9`. For example, `0.85` means 85% of Model B's delta values are discarded, keeping only 15% of the most distinct changes.
+- **Beta (Scale Multiplier):** Final strength multiplier for Model B's rescaled delta before adding to Model A.
+  - `1.0`: Standard 100% strength addition of Model B's surviving features.
+  - `0.5`: Half-strength addition of Model B's features.
+  - `1.2`: Amplified addition of Model B's features.
+- **Rescaling Logic:** Surviving parameters are automatically scaled by $1 / (1 - p)$ per the DARE paper to preserve the expected total update magnitude.
 
 ---
 
 ## Power-Up (DARE+TIES)
-> Combines DARE (Drop and Rescale) with TIES (Trim, Elect Sign), the current best-practice algorithm for merging fine-tuned models, particularly LoRA-tuned ones. DARE sparsifies the task vector via random dropout and rescaling; TIES then removes residual low-magnitude noise and enforces sign consistency. The result is a cleaner, more targeted capability transfer from B to A with less interference.
+> Combines DARE (Drop and Rescale) with TIES (Trim, Elect Sign) to merge fine-tuned models cleanly. DARE sparsifies the delta; TIES trims low-magnitude background noise and enforces sign consensus.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Donor)
+
 **Parameters:**
-- **Alpha:** DARE drop rate. Fraction of delta parameters randomly zeroed. Higher values produce a sparser, more targeted delta. Typical range: `0.5`–`0.9`.
-- **Beta:** TIES trim quantile. Fraction of the smallest-magnitude delta parameters zeroed after DARE, removing residual noise. `0.0` disables trimming. Typical range: `0.1`–`0.3`.
-- **Gamma:** Lambda scale. Final multiplier applied to the merged delta before adding to Model A. Equivalent to the task arithmetic scaling coefficient. Typical range: `0.5`–`1.5`.
-- **Seed:** Random seed for the DARE dropout mask. Controls reproducibility.
+- **Alpha (DARE Drop Rate):** Fraction of Model B's delta parameters randomly dropped (`0.5`–`0.9`). Higher values produce a sparser capability transfer.
+- **Beta (TIES Trim Quantile):** Fraction of the smallest-magnitude delta parameters eliminated after DARE to remove noise. `0.0` disables trimming; `0.2` trims the lowest 20% by absolute magnitude. Typical: `0.1`–`0.3`.
+- **Gamma (Lambda Scale / Strength):** Multiplier for the filtered delta added to Model A.
+  - `1.0`: Standard 100% strength of Model B's filtered capability added to Model A.
+  - `0.25`: Gentle 25% addition of Model B's capabilities.
+  - `1.5`: Amplified capability transfer.
+- **Seed:** Random seed for reproducible DARE dropout masks.
 
 **Algorithm:**
-1. Compute task vector `δ = B − A`
-2. **DARE:** apply random binary mask with keep probability `1 − alpha`; rescale survivors by `1/(1−alpha)`
-3. **TIES trim:** zero out parameters below the `beta`-quantile magnitude threshold
-4. **TIES elect:** determine dominant sign per position; zero out disagreeing parameters
-5. Return `A + gamma × δ_filtered`
-
-**Guidance:**
-- Start with `alpha=0.9, beta=0.2, gamma=1.0` for LoRA-derived models
-- Lower `alpha` (e.g. `0.5`) for full fine-tunes where more delta mass should be retained
-- Increase `gamma` beyond `1.0` to amplify B's influence; decrease below `1.0` to soften it
+1. Compute task vector $\delta = B - A$
+2. **DARE:** Apply random binary mask with keep probability $1 - \alpha$; rescale survivors by $1 / (1 - \alpha)$
+3. **TIES trim:** Zero out parameters below the $\beta$-quantile magnitude threshold
+4. **TIES elect:** Determine dominant sign direction per position; zero out disagreeing parameters
+5. Return $A + \gamma \cdot \delta_{\text{filtered}}$
 
 ---
 
-## Enhanced Man Interp
-> Sophisticated interpolation between values from A and B depending on their difference relative to other values, with manual threshold control.
+## Enhanced Man Interp (Enhanced Manual Interpolation)
+> Selective interpolation between Model A and Model B based on normalized pairwise differences, constrained within a user-defined threshold band.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Incoming)
+
+**Formula:**
+$$\text{diff} = \frac{\max(|A - B|) - |A - B|}{\max(|A - B|)}$$
+$$\text{mask}_{\text{threshold}} = (\beta < \text{mean}(\text{diff}) < \gamma)$$
+$$\text{blend\_strength} = \text{diff}^{(1/\alpha - 1)} \cdot \text{mask}_{\text{threshold}}$$
+$$\text{Output} = A \cdot (1 - \text{interpolated\_mask}) + B \cdot \text{interpolated\_mask}$$
+
 **Parameters:**
-- **Alpha:** Interpolation strength.
-- **Beta:** Lower mean threshold for filtering differences.
-- **Gamma:** Upper mean threshold for filtering differences.
-- **Delta:** Smoothness factor (mix between randomized mask and powered differences).
+- **Alpha (Model B Pull Strength):** Controls how strongly Model B is pulled into Model A.
+  - Mathematically, the exponent applied to similarity is $(1/\alpha - 1)$.
+  - **`Alpha = 0.25`**: Exponent is $(1/0.25 - 1) = 3$. This aggressively suppresses Model B's contribution toward zero. Only weights that are virtually identical between both models get even a minor blend of Model B; the final result remains overwhelmingly **Model A** (>90% Model A).
+  - **`Alpha = 0.50`**: Exponent is $(1/0.50 - 1) = 1$ (linear). Weights with high similarity incorporate Model B proportionally up to 50%.
+  - **`Alpha = 0.75`**: Exponent is $0.33$. Flattens similarity, pulling in substantially more of Model B wherever differences meet the threshold.
+  - **`Alpha = 1.0`**: Exponent is $0$. Full maximum pull of Model B across all qualifying weights.
+- **Beta (Lower Mean Threshold):** Minimum normalized similarity required before Model B can be blended into Model A. Layers/weights with similarity below $\beta$ remain 100% Model A.
+- **Gamma (Upper Mean Threshold):** Maximum normalized similarity allowed for blending. Layers/weights with similarity above $\gamma$ remain 100% Model A. Together, $[\beta, \gamma]$ acts as a bandpass filter targeting only weights with moderate differences.
+- **Delta (Smoothness Factor):** Blends between stochastic selection (`0.0`, a Bernoulli coin-flip choosing either pure A or pure B per weight) and smooth continuous blending (`1.0`, smooth linear weighting between A and B).
 
 ---
 
-## Enhanced Auto Interp
-> Automated version of the enhanced interpolation mode that dynamically calculates thresholds based on mean differences.
+## Enhanced Auto Interp (Enhanced Automatic Interpolation)
+> Automated version of Enhanced Interpolation that dynamically computes threshold boundaries centered on the layer's mean difference.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Incoming)
+
+**Formula:**
+$$\text{threshold\_band} = [\text{mean}(\text{diff}) \cdot (1 - \beta), \;\; \text{mean}(\text{diff}) \cdot (1 + \beta)]$$
+$$\text{Output} = A \cdot (1 - \text{interpolated\_mask}) + B \cdot \text{interpolated\_mask}$$
+
 **Parameters:**
-- **Alpha:** Interpolation strength.
-- **Beta:** Threshold adjustment factor.
-- **Gamma:** Smoothness factor.
+- **Alpha (Model B Pull Strength):** Controls how much of Model B replaces Model A inside the active band.
+  - `0.25`: Low Model B contribution; output remains mostly Model A.
+  - `0.50`: Moderate, balanced blend of Model B into Model A.
+  - `1.0`: Maximum Model B influence within the threshold band.
+- **Beta (Threshold Width Around Mean):** Defines how wide the window of affected weights is around the layer's average difference.
+  - `0.1`: Narrow window ($\pm 10\%$ around mean difference).
+  - `0.5`: Broad window ($\pm 50\%$ around mean difference).
+- **Gamma (Smoothness Factor):** Blends between stochastic Bernoulli selection (`0.0`) and smooth continuous linear interpolation (`1.0`).
 
 ---
 
 ## Weight-Sum Cutoff
-> A linear interpolation mode that only applies the merge to weights whose differences fall within a specific threshold range.
+> Linear interpolation that only blends Model B into Model A for weights whose relative difference falls within an explicit cutoff window.
 
-**Models Used:** A, B
+**Models Used:** A (Base), B (Incoming)
+
+**Formula:**
+$$\text{Output} = A \cdot (1 - \alpha \cdot \text{mask}) + B \cdot (\alpha \cdot \text{mask})$$
+
 **Parameters:**
-- **Alpha:** Interpolation weight (multiplier for the difference).
-- **Beta:** Upper threshold for the difference cutoff.
-- **Gamma:** Lower threshold for the difference cutoff.
+- **Alpha (Model B Mix Ratio):** The percentage of Model B blended into Model A for weights inside the window.
+  - `0.0`: 0% Model B (100% Model A everywhere).
+  - `0.25`: 25% Model B, 75% Model A for weights inside the cutoff window; weights outside remain 100% Model A.
+  - `0.50`: 50% Model B, 50% Model A inside the window.
+  - `1.0`: 100% Model B inside the window (complete replacement of qualifying weights).
+- **Beta (Upper Difference Threshold):** Upper cutoff for normalized difference.
+- **Gamma (Lower Difference Threshold):** Lower cutoff for normalized difference. Weights with difference between $\gamma$ and $\beta$ receive the blend; all other weights stay 100% Model A.
 
 ---
 
 ## SVD LoRA Extraction
-> Extracts the difference between Model B and Model A and saves it as a new LoRA file. **This mode outputs a LoRA, not a full model.** The output file will be saved to your `loras` directory.
+> Computes the difference between Model A and Model B and extracts it as a new LoRA file using Singular Value Decomposition (SVD). **Outputs a LoRA safetensors file into your `loras` directory, not a full model.**
 
-**Models Used:** A (Tuned Model), B (Base Model)
+**Models Used:** A (Tuned / Modified Model), B (Base Model)
+- Computes delta: $\Delta W = A - B$
+- Low-rank approximation: $\Delta W \approx U S V^T \implies \text{lora\_B} \cdot \text{lora\_A}$
+
 **Parameters:**
-- **Alpha:** The Rank (dimension) for the LoRA's standard layers.
-- **Beta:** The Rank (dimension) specifically for 3x3 convolution layers.
-- **Gamma:** The clamp quantile for weight values. `0.99` is a typical value to prevent outlier weights from dominating.
+- **Alpha (Linear Rank):** Target rank (dimension) for 2D dense/linear layer LoRA factors (e.g. `32`, `64`, `128`).
+- **Beta (Conv Rank):** Target rank specifically for 3x3 convolution layer LoRA factors (e.g. `16`, `32`).
+- **Gamma (Clamp Quantile):** Outlier clamping quantile (e.g. `0.99` clips the top 1% extreme values before SVD to prevent outlier distortion).
 
 ---
 
-## Layer Mismatch Handling
+## Layer Mismatch Handling (`mismatch_mode`)
 
-When merging models with different layer structures (e.g., fine-tuned models with added/removed layers, or LoRAs with partial layer coverage), the `mismatch_mode` parameter controls behavior:
+When Model A and Model B have differing layer structures or when merging partial LoRAs:
 
 | Mode | Behavior |
 |------|----------|
-| `skip` | Missing layers in B use A's values **(default)** |
-| `zeros` | Missing layers in B are treated as zeros |
-| `error` | Fail if any layer is missing |
+| `skip` | Missing layers in Model B use Model A's values unchanged **(default)** |
+| `zeros` | Missing layers in Model B are treated as zeros |
+| `error` | Raise an error and stop execution if any layer is missing in Model B |
 
-**Common scenarios:**
-- Merging a fine-tuned model with added/removed layers
-- Combining LoRA-extracted differences with base models
-- Cross-architecture experiments
-
-**Note:** Extra layers in Model B that don't exist in Model A are currently ignored. The output will always have the same layer structure as Model A.
+**Note:** Extra layers in Model B that do not exist in Model A are ignored. Output topology always mirrors Model A.
 
 ---
 
 ## Dtype Preservation & Override
 
-By default, the merger preserves the highest precision `dtype` for each key found across all active source models (Model A and Model B) and the requested `save_dtype`.
-
-- **Preserve Higher Precision**: If a key is `float32` in any of the source models, but you requested `save_dtype="bf16"` or `"fp16"`, that key will be saved as `float32` anyway. This prevents degrading critical high-precision layers (such as normalization layers or layers with restored outliers).
-- **Explicit Override**: If you prefer to force the entire model to be saved strictly as the selected `save_dtype` (e.g. for complete downcasting to `bf16`), toggle `override_dtype` to `True`.
+By default, the merger preserves the highest precision `dtype` for each key found across active source models and the requested `save_dtype`:
+- **Preserve Higher Precision (default, `override_dtype = False`)**: If a key is `float32` in Model A or Model B, but `save_dtype="bf16"` is selected, that key remains `float32` to protect sensitive normalization layers.
+- **Explicit Override (`override_dtype = True`)**: Forces all floating tensors strictly to `save_dtype`.
 
 ---
 
-## Layer Filtering (Regex Patterns)
+## Layer Filtering
 
-Use regex patterns to control which layers are merged:
-
-### `exclude_patterns`
-Layers matching any pattern will **keep Model A's values only** (no merge).
-
-### `discard_patterns`
-Layers matching any pattern will be **removed entirely** from the output.
-
-**Pattern format:**
-- Whitespace-separated regex patterns
-- Patterns use **substring matching** (not full match)
-- Example: `text_model lora` matches any key containing "text_model" OR "lora"
-- Example: `layer\.[0-5]\.` matches layers 0-5 using regex syntax
-
-**Pattern Examples:**
-| Pattern | Matches |
-|---------|---------|
-| `text_model` | All text encoder layers |
-| `\.norm` | All normalization layers |
-| `attn\.(q\|k\|v)` | Query, key, value attention weights |
-| `block\.[0-9]\.` | Blocks 0-9 |
+- **`exclude_patterns`**: Newline-separated patterns. Matching layers are **not merged** and keep Model A's values unchanged (unless `include_mode` is enabled).
+- **`include_mode`**: Inverts `exclude_patterns` into a whitelist: only matching layers are merged; all non-matching layers keep Model A's values unchanged.
+- **`discard_patterns`**: Newline-separated patterns. Matching layers are **removed completely** from the saved output.
+- **`glob_patterns`**: When enabled, uses shell wildcards (`*`, `?`). When disabled, uses regex substring matching.

@@ -692,7 +692,12 @@ class ManEnhInterpDifference(CalcMode):
     name = 'Enhanced Man Interp'
     description = 'Enhanced interpolation between each pair of values from A and B depending on their difference relative to other values.'
     models_used = ['A', 'B']
-    param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Lower mean threshold.', 'gamma': 'Upper mean threshold.', 'delta': 'Smoothness factor.'}
+    param_docs = {
+        'alpha': 'Model B pull strength (exponent 1/alpha - 1). 0.25 strongly suppresses B; 0.50 is linear; 1.0 is full B.',
+        'beta': 'Lower mean threshold. Only weights with normalized difference > beta blend B.',
+        'gamma': 'Upper mean threshold. Only weights with normalized difference < gamma blend B.',
+        'delta': 'Smoothness factor. 0.0 is stochastic Bernoulli choice; 1.0 is smooth linear blend.',
+    }
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
         alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
@@ -717,7 +722,11 @@ class AutoEnhInterpDifference(CalcMode):
     name = 'Enhanced Auto Interp'
     description = 'Interpolates between each pair of values from A and B depending on their difference relative to other values.'
     models_used = ['A', 'B']
-    param_docs = {'alpha': 'Interpolation strength.', 'beta': 'Threshold adjustment factor.', 'gamma': 'Smoothness factor.'}
+    param_docs = {
+        'alpha': 'Model B pull strength (exponent 1/alpha - 1). Lower keeps output close to Model A; higher pulls in Model B.',
+        'beta': 'Threshold width around the layer mean difference (+/- beta).',
+        'gamma': 'Smoothness factor. 0.0 is stochastic Bernoulli choice; 1.0 is smooth linear blend.',
+    }
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
         alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
@@ -742,7 +751,11 @@ class WeightSumCutoffMode(CalcMode):
     name = 'Weight-Sum Cutoff'
     description = 'Weight-sum with cutoff based on value differences.'
     models_used = ['A', 'B']
-    param_docs = {'alpha': 'Interpolation weight.', 'beta': 'Upper threshold.', 'gamma': 'Lower threshold.'}
+    param_docs = {
+        'alpha': 'Model B blend fraction inside the threshold window. 0.0 is pure Model A; 0.25 is 25% B / 75% A; 1.0 is 100% B.',
+        'beta': 'Upper difference threshold cutoff.',
+        'gamma': 'Lower difference threshold cutoff.',
+    }
     def create_recipe(self, key, **kwargs):
         mismatch_mode = kwargs.get('mismatch_mode', MissingTensorBehavior.SKIP)
         alignment_mode = kwargs.get('alignment_mode', 'pad/crop')
