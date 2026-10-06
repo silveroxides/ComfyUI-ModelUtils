@@ -1,7 +1,64 @@
+import glob
 import os
+import numpy as np
+from PIL import Image, ImageOps
+import torch
 import folder_paths
 from comfy_api.latest import io
-from .downloader_utils import get_potential_preview_files, load_image_tensor, get_model_workflows, get_model_metadata_file
+
+
+def get_potential_preview_files(base_path: str) -> list[str]:
+    exts = ["png", "jpg", "jpeg", "webp", "mp4"]
+    files = []
+    for ext in exts:
+        files.append(f"{base_path}.preview.{ext}")
+        files.append(f"{base_path}.{ext}")
+    return files
+
+
+def load_image_tensor(path: str):
+    if not os.path.exists(path):
+        return None
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        image = img.convert("RGB")
+        image_np = np.array(image).astype(np.float32) / 255.0
+        return torch.from_numpy(image_np)[None,]
+    except Exception as e:
+        print(f"Error loading image {path}: {e}")
+        return None
+
+
+def get_model_workflows(base_path: str) -> list[str]:
+    workflows = []
+    main_json = f"{base_path}.json"
+    if os.path.exists(main_json):
+        workflows.append(main_json)
+
+    preview_json = f"{base_path}.preview.json"
+    if os.path.exists(preview_json) and preview_json not in workflows:
+        workflows.append(preview_json)
+
+    example_jsons = glob.glob(f"{base_path}.example.*.json")
+    example_jsons.sort()
+    for ej in example_jsons:
+        if ej not in workflows:
+            workflows.append(ej)
+
+    return workflows
+
+
+def get_model_metadata_file(base_path: str) -> str | None:
+    civitai_info = f"{base_path}.civitai.info"
+    if os.path.exists(civitai_info):
+        return civitai_info
+
+    metadata_json = f"{base_path}.metadata.json"
+    if os.path.exists(metadata_json):
+        return metadata_json
+
+    return None
 
 class BaseModelInfoLoader(io.ComfyNode):
     CATEGORY = "ModelUtils/Info"

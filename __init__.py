@@ -49,10 +49,18 @@ from .nodes.lora_resize import (
     LoRAResizeFrobenius, LoRAResizeCumulative,
     LoRAMergeToModel
 )
-from .nodes.downloader_nodes import (
-    CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
-    VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader
-)
+try:
+    from .nodes.downloader_nodes import (
+        CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
+        VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader
+    )
+    DOWNLOADER_NODES: list[type[io.ComfyNode]] = [
+        CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
+        VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,
+    ]
+except ImportError:
+    DOWNLOADER_NODES = []
+
 from .nodes.model_info_nodes import (
     CheckpointInfoLoader, LoRAInfoLoader, EmbeddingInfoLoader,
     VAEInfoLoader, ControlNetInfoLoader, DiffusionModelInfoLoader
@@ -125,9 +133,8 @@ class ModelUtilsExtension(ComfyExtension):
             DiffusionModelDtypeConversion,
             MiniMaxH3FoldAdaLN,
             MiniMaxH3UnfoldAdaLN,
-            # Downloaders
-            CheckpointInfoMetaDownloader, DiffusionModelInfoMetaDownloader, LoRAInfoMetaDownloader, EmbeddingInfoMetaDownloader,
-            VAEInfoMetaDownloader, ControlNetInfoMetaDownloader, ManualPathInfoMetaDownloader,
+            # Downloaders (available in manual git/source installations)
+            *DOWNLOADER_NODES,
             # Info Loaders
             CheckpointInfoLoader, LoRAInfoLoader, EmbeddingInfoLoader,
             VAEInfoLoader, ControlNetInfoLoader, DiffusionModelInfoLoader,

@@ -1,6 +1,7 @@
 [groups.repository_contract]
 paths = ["__init__.py", "nodes/*.py"]
 python_tests = [
+  "tests/test_conditional_registration.py",
   "tests/test_schema_tooltips.py",
   "tests/test_uel_repository_contract.py",
 ]

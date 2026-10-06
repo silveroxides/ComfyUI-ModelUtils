@@ -32,11 +32,15 @@ except ImportError:
     HAS_AV = False
     print("Warning: av (PyAV) not found. MP4 metadata extraction fallback disabled.")
 
-# Add the reference module to the Python path
 # Assuming downloader_utils.py is inside nodes/, the root is one level up
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(root_dir, 'unifiedefficientloader-reference'))
 from unifiedefficientloader import UnifiedSafetensorsLoader
+from .model_info_nodes import (
+    get_potential_preview_files,
+    load_image_tensor,
+    get_model_workflows,
+    get_model_metadata_file,
+)
 
 # --- Database Path Logic ---
 try:
@@ -381,14 +385,6 @@ class Downloader:
         os.rename(temp_path, target_path)
         return True
 
-def get_potential_preview_files(base_path):
-    exts = ["png", "jpg", "jpeg", "webp", "mp4"]
-    files = []
-    for ext in exts:
-        files.append(f"{base_path}.preview.{ext}")
-        files.append(f"{base_path}.{ext}")
-    return files
-
 def preview_exists(base_path):
     previews = get_potential_preview_files(base_path)
     for p in previews:
@@ -569,59 +565,6 @@ def process_file(filepath, cache, api, nsfw_threshold, max_examples):
                         for k in stats: stats[k] += res.get(k, 0)
     return stats
 
-import numpy as np
-from PIL import Image, ImageOps
-import torch
-
-def load_image_tensor(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        img = Image.open(path)
-        img = ImageOps.exif_transpose(img)
-        image = img.convert("RGB")
-        image = np.array(image).astype(np.float32) / 255.0
-        image = torch.from_numpy(image)[None,]
-        return image
-    except Exception as e:
-        print(f"Error loading image {path}: {e}")
-        return None
-
-def get_model_workflows(base_path):
-    workflows = []
-    # Main workflow
-    main_json = f"{base_path}.json"
-    if os.path.exists(main_json):
-        workflows.append(main_json)
-
-    # Example workflows
-    # They are named like base_path.example.N.json
-    # or base_path.preview.json (if extracted from preview)
-    preview_json = f"{base_path}.preview.json"
-    if os.path.exists(preview_json) and preview_json not in workflows:
-        workflows.append(preview_json)
-
-    example_jsons = glob.glob(f"{base_path}.example.*.json")
-    # Sort them by index
-    example_jsons.sort()
-    for ej in example_jsons:
-        if ej not in workflows:
-            workflows.append(ej)
-
-    return workflows
-
-def get_model_metadata_file(base_path):
-    # Prefer civitai.info if available
-    civitai_info = f"{base_path}.civitai.info"
-    if os.path.exists(civitai_info):
-        return civitai_info
-
-    # Fallback to metadata.json (safetensors metadata)
-    metadata_json = f"{base_path}.metadata.json"
-    if os.path.exists(metadata_json):
-        return metadata_json
-
-    return None
 
 def scan_and_process(scan_dirs, recursive=True, db_path=None, nsfw_level="All", max_examples=0, api_key=None, threads=4):
     """

@@ -1,1 +1,4 @@
 tests/
+nodes/downloader_nodes.py
+nodes/downloader_utils.py
+
