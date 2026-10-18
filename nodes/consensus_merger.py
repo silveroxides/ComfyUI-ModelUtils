@@ -7,13 +7,14 @@ import logging
 import os
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 import comfy.utils
 import folder_paths
 import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
+from comfy_api.latest._io import _DynamicGroup
 from tqdm import tqdm
 from unifiedefficientloader import MemoryEfficientSafeOpen, transfer_to_gpu_pinned
 
@@ -3088,8 +3089,273 @@ class CWBEmbeddingMultiMerger(io.ComfyNode):
         return io.NodeOutput(filename, documentation, report)
 
 
+def _embedding_template() -> list[io.Input]:
+    return [
+        io.Combo.Input(
+            "embedding_name",
+            options=folder_paths.get_filename_list("embeddings"),
+            tooltip="The name of the Embedding file to apply.",
+        ),
+        io.Boolean.Input(
+            "enabled",
+            default=True,
+            tooltip="Turn off to skip this Embedding without changing its file.",
+        ),
+    ]
+
+
+def build_embedding_stack_dynamic_combo(
+    depth: int = 1, max_depth: int = 30
+) -> io.DynamicCombo.Input:
+    sub_inputs: list[io.Input] = [
+        io.Combo.Input(
+            "embedding_name",
+            options=folder_paths.get_filename_list("embeddings"),
+            tooltip="The name of the Embedding file to apply.",
+        ),
+        io.Boolean.Input(
+            "enabled",
+            default=True,
+            tooltip="Turn off to skip this Embedding without removing its settings.",
+        ),
+    ]
+    if depth < max_depth:
+        sub_inputs.append(
+            build_embedding_stack_dynamic_combo(
+                depth + 1, max_depth=max_depth
+            )
+        )
+
+    input_id = "add_embedding" if depth == 1 else f"add_embedding_{depth}"
+    return io.DynamicCombo.Input(
+        input_id,
+        options=[
+            io.DynamicCombo.Option("False", inputs=[]),
+            io.DynamicCombo.Option("True", inputs=sub_inputs),
+        ],
+        display_name="add_embedding",
+        tooltip="Enable to configure and add an Embedding to the stack.",
+    )
+
+
+def _parse_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def extract_embedding_stack_entries(
+    add_embedding_data: Any = None, embedding_list: str = "", **kwargs: Any
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    stack_active = False
+
+    # 1. Walk nested dictionary structure
+    curr = add_embedding_data
+    depth = 1
+    while isinstance(curr, dict):
+        key = f"add_embedding_{depth}" if depth > 1 else "add_embedding"
+        combo_val = curr.get(key, curr.get("add_embedding"))
+        is_active = _parse_bool(combo_val, default=False)
+        if not is_active:
+            break
+
+        stack_active = True
+        embedding_name = curr.get("embedding_name")
+        enabled = _parse_bool(curr.get("enabled", True), default=True)
+        if embedding_name:
+            entries.append(
+                {
+                    "embedding_name": str(embedding_name),
+                    "enabled": bool(enabled),
+                }
+            )
+
+        depth += 1
+        next_key = f"add_embedding_{depth}"
+        next_child = curr.get(next_key)
+        if not isinstance(next_child, dict):
+            for k, v in curr.items():
+                if k.startswith("add_embedding") and k != key and isinstance(v, dict):
+                    next_child = v
+                    break
+        curr = next_child
+
+    # 2. Fallback: inspect kwargs if add_embedding was not a dict
+    if not stack_active and kwargs:
+        raw_add = kwargs.get("add_embedding", add_embedding_data)
+        single_active = _parse_bool(raw_add, default=False)
+        if single_active:
+            stack_active = True
+            embedding_name = kwargs.get("embedding_name")
+            if embedding_name:
+                enabled = _parse_bool(kwargs.get("enabled", True), default=True)
+                entries.append(
+                    {
+                        "embedding_name": str(embedding_name),
+                        "enabled": bool(enabled),
+                    }
+                )
+
+    # 3. String list fallback when the stack is set to False
+    if not stack_active:
+        raw_list = embedding_list if embedding_list else kwargs.get("embedding_list", "")
+        if not raw_list and isinstance(add_embedding_data, dict):
+            raw_list = add_embedding_data.get("embedding_list", "")
+        if isinstance(raw_list, str) and raw_list.strip():
+            for line in raw_list.splitlines():
+                for part in line.split(","):
+                    cleaned = part.strip()
+                    if cleaned:
+                        entries.append(
+                            {
+                                "embedding_name": cleaned,
+                                "enabled": True,
+                            }
+                        )
+
+    return entries
+
+
+def enable_dynamic_group_link_support() -> bool:
+    """Allow _DynamicGroup inputs to accept connected COMFY_DYNAMICGROUP_V3 socket links."""
+    try:
+        from comfy_api.latest._io import (
+            DYNAMIC_INPUT_LOOKUP,
+            finalize_prefix,
+            register_dynamic_input_func,
+        )
+        from execution import is_link
+
+        orig_func = DYNAMIC_INPUT_LOOKUP.get(_DynamicGroup.io_type)
+        if orig_func is None or getattr(orig_func, "_supports_links", False):
+            return True
+
+        def _expand_dynamic_group_with_links(
+            out_dict, live_inputs, value, input_type, curr_prefix
+        ):
+            finalized_prefix = finalize_prefix(curr_prefix)
+            val = live_inputs.get(finalized_prefix)
+            if is_link(val):
+                out_dict[input_type][finalized_prefix] = value
+                return
+            return orig_func(out_dict, live_inputs, value, input_type, curr_prefix)
+
+        _expand_dynamic_group_with_links._supports_links = True
+        register_dynamic_input_func(
+            _DynamicGroup.io_type, _expand_dynamic_group_with_links
+        )
+        return True
+    except Exception:
+        return False
+
+
+enable_dynamic_group_link_support()
+
+
+class CWBEmbeddingStack(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="CWBEmbeddingStack",
+            display_name="CWB Embedding Stack",
+            category="ModelUtils/Configuration",
+            description="Specifies a stack of Embeddings using a recursive DynamicCombo template or a newline/comma-separated list when add_embedding is False.",
+            search_aliases=[
+                "embedding",
+                "embedding stack",
+                "stack",
+                "dynamic group",
+                "embedding template",
+            ],
+            inputs=[
+                build_embedding_stack_dynamic_combo(depth=1, max_depth=30),
+                io.String.Input(
+                    "embedding_list",
+                    default="",
+                    multiline=True,
+                    tooltip="Newline or comma-separated list of embedding path names used when add_embedding is False.",
+                ),
+            ],
+            outputs=[
+                io.Custom("COMFY_DYNAMICGROUP_V3").Output(
+                    "embeddings",
+                    display_name="embeddings",
+                    tooltip="The Embedding stack specification using the DynamicGroup format.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, add_embedding=None, embedding_list: str = "", **kwargs) -> io.NodeOutput:
+        entries = extract_embedding_stack_entries(
+            add_embedding, embedding_list=embedding_list, **kwargs
+        )
+        return io.NodeOutput(entries)
+
+
+class CWBEmbeddingStackMerger(CWBEmbeddingMultiMerger):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CWBEmbeddingStackMerger",
+            display_name="CWB Embedding Stack Multi-Merge",
+            category="ModelUtils/Embeddings/Merge",
+            description="CWB-merge an arbitrary stack or list of embeddings, then coalesce locally similar output vectors.",
+            inputs=[
+                _DynamicGroup.Input(
+                    "embeddings",
+                    template=_embedding_template(),
+                    min=1,
+                    max=20,
+                    tooltip="Each row includes one embedding in the merge, or connect an Embedding Stack.",
+                    group_name="Embedding",
+                ),
+                *_embedding_coalesce_controls("cwb_merged_coalesced_embedding"),
+            ],
+            outputs=[
+                io.AnyType.Output(display_name="output_filename"),
+                io.String.Output(display_name="documentation"),
+                io.String.Output(display_name="cwb_report"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, embeddings: list[dict] | None = None, **kwargs):
+        documentation = load_documentation_from_file("consensus_mergers.md")
+        if kwargs["execution_mode"] == "DOCUMENTATION ONLY":
+            return io.NodeOutput(
+                "Documentation mode active. No merge performed.",
+                documentation,
+                "CWB report unavailable because no merge was performed.",
+            )
+        if kwargs["legacy_boundary_search"] and not kwargs["vision_boundary_embeddings"]:
+            raise ValueError("Legacy boundary search requires Vision Boundary Embeddings.")
+        names = [
+            str(row["embedding_name"]).strip()
+            for row in (embeddings or [])
+            if isinstance(row, dict)
+            and _parse_bool(row.get("enabled", True), default=True)
+            and row.get("embedding_name")
+            and str(row["embedding_name"]).strip()
+            and str(row["embedding_name"]).strip() != "None"
+        ]
+        if len(names) < 2:
+            raise ValueError("At least 2 enabled embeddings are required for CWB Embedding Multi-Merge.")
+        filename, report = ConsensusMergerLogic.execute(
+            names, "embeddings", _embedding_coalesce_params(kwargs), embedding_union=True
+        )
+        return io.NodeOutput(filename, documentation, report)
+
+
 CWB_MERGER_NODES = [
     CWBCustomConfiguration,
+    CWBEmbeddingStack,
     CWBCheckpointTwoMerger,
     CWBCheckpointThreeMerger,
     CWBModelTwoMerger,
@@ -3103,4 +3369,5 @@ CWB_MERGER_NODES = [
     CWBEmbeddingThreeMerger,
     CWBEmbeddingSelfCoalesce,
     CWBEmbeddingMultiMerger,
+    CWBEmbeddingStackMerger,
 ]

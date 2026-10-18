@@ -622,9 +622,9 @@ def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
 
 
 def test_all_cwb_schemas_and_compact_control_contract(cwb):
-    assert len(cwb.CWB_MERGER_NODES) == 14
+    assert len(cwb.CWB_MERGER_NODES) == 16
     schemas = [node.define_schema() for node in cwb.CWB_MERGER_NODES]
-    assert len({schema.node_id for schema in schemas}) == 14
+    assert len({schema.node_id for schema in schemas}) == 16
     advanced = {
         "consensus_type", "alignment_method", "alignment_threshold",
         "similarity_threshold", "power_alpha", "diversity_beta",
@@ -639,7 +639,7 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
         ids = [value.id for value in schema.inputs]
         assert schema.description
         assert all(value.tooltip for value in schema.inputs)
-        if node is cwb.CWBCustomConfiguration:
+        if node in (cwb.CWBCustomConfiguration, cwb.CWBEmbeddingStack):
             continue
         assert [output.display_name for output in schema.outputs] == [
             "output_filename", "documentation", "cwb_report"
@@ -658,7 +658,11 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
                 "include_mode",
             ]
             continue
-        if node in (cwb.CWBEmbeddingSelfCoalesce, cwb.CWBEmbeddingMultiMerger):
+        if node in (
+            cwb.CWBEmbeddingSelfCoalesce,
+            cwb.CWBEmbeddingMultiMerger,
+            cwb.CWBEmbeddingStackMerger,
+        ):
             assert "vision_boundary_embeddings" in ids
             assert "legacy_boundary_search" in ids
             assert "boundary_reference_embedding" in ids
@@ -1068,6 +1072,91 @@ def test_embedding_multi_wrapper_forwards_selected_inputs(monkeypatch, cwb):
     assert captured["options"] == {"embedding_union": True}
     assert captured["params"]["embedding_coalesce"] is True
     assert result.result == ("merged.safetensors", "DOCS", "REPORT")
+
+
+def test_embedding_stack_and_stack_merger(monkeypatch, cwb):
+    stack_schema = cwb.CWBEmbeddingStack.define_schema()
+    assert stack_schema.node_id == "CWBEmbeddingStack"
+    assert [inp.id for inp in stack_schema.inputs] == ["add_embedding", "embedding_list"]
+    assert stack_schema.outputs[0].get_io_type() == "COMFY_DYNAMICGROUP_V3"
+
+    # 1. Active recursive DynamicCombo stack
+    stack_data = {
+        "add_embedding": "True",
+        "embedding_name": "emb1.safetensors",
+        "enabled": True,
+        "add_embedding_2": {
+            "add_embedding_2": "True",
+            "embedding_name": "emb2.safetensors",
+            "enabled": False,
+            "add_embedding_3": {
+                "add_embedding_3": "True",
+                "embedding_name": "emb3.safetensors",
+                "enabled": True,
+                "add_embedding_4": {"add_embedding_4": "False"},
+            },
+        },
+    }
+    stack_out = cwb.CWBEmbeddingStack.execute(
+        add_embedding=stack_data, embedding_list="ignored1.safetensors, ignored2.safetensors"
+    )
+    assert stack_out.result[0] == [
+        {"embedding_name": "emb1.safetensors", "enabled": True},
+        {"embedding_name": "emb2.safetensors", "enabled": False},
+        {"embedding_name": "emb3.safetensors", "enabled": True},
+    ]
+
+    # 2. Stack set to False -> uses newline/comma-separated string list
+    list_out = cwb.CWBEmbeddingStack.execute(
+        add_embedding="False",
+        embedding_list="first.safetensors, second.safetensors\nthird.safetensors, \nfourth.safetensors",
+    )
+    assert list_out.result[0] == [
+        {"embedding_name": "first.safetensors", "enabled": True},
+        {"embedding_name": "second.safetensors", "enabled": True},
+        {"embedding_name": "third.safetensors", "enabled": True},
+        {"embedding_name": "fourth.safetensors", "enabled": True},
+    ]
+
+    # 3. CWBEmbeddingStackMerger is a child of CWBEmbeddingMultiMerger and executes enabled entries
+    assert issubclass(cwb.CWBEmbeddingStackMerger, cwb.CWBEmbeddingMultiMerger)
+    monkeypatch.setattr(cwb, "load_documentation_from_file", lambda _: "DOCS")
+    captured = {}
+
+    def execute(names, model_type, params, **options):
+        captured.update(names=names, model_type=model_type, params=params, options=options)
+        return "merged.safetensors", "REPORT"
+
+    monkeypatch.setattr(cwb.ConsensusMergerLogic, "execute", execute)
+    base_kwargs = {
+        "execution_mode": "MERGE",
+        "cwb_preset": "balanced_sim_mean",
+        "cwb_config": None,
+        "target_vector_count": 0,
+        "coalesce_similarity_threshold": 0.95,
+        "coalesce_position_window": 0.1,
+        "vision_boundary_embeddings": False,
+        "legacy_boundary_search": False,
+        "boundary_reference_embedding": "None",
+        "boundary_similarity_threshold": 0.95,
+        "output_filename": "merged",
+        "save_dtype": "fp32",
+        "process_device": "cpu",
+        "lazy_load": True,
+        "force_clear_cache": False,
+        "override_dtype": False,
+    }
+    res = cwb.CWBEmbeddingStackMerger.execute(
+        embeddings=stack_out.result[0], **base_kwargs
+    )
+    assert captured["names"] == ["emb1.safetensors", "emb3.safetensors"]
+    assert res.result == ("merged.safetensors", "DOCS", "REPORT")
+
+    with pytest.raises(ValueError, match="At least 2 enabled embeddings"):
+        cwb.CWBEmbeddingStackMerger.execute(
+            embeddings=[{"embedding_name": "only_one.safetensors", "enabled": True}],
+            **base_kwargs,
+        )
 
 
 def test_streaming_dtype_nonfloat_and_secondary_preservation(
