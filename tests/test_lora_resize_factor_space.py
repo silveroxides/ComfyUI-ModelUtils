@@ -566,3 +566,85 @@ def test_cuda_and_cpu_factor_space_results_match(resize):
     cpu_update = cpu["lora_up"] @ cpu["lora_down"]
     cuda_update = cuda["lora_up"] @ cuda["lora_down"]
     assert torch.allclose(cpu_update, cuda_update, atol=2e-4, rtol=2e-4)
+
+
+def test_modify_lora_alpha_handles_present_and_absent_alpha(monkeypatch, tmp_path, resize):
+    source = tmp_path / "mixed_alpha.safetensors"
+    down_a = torch.eye(4, dtype=torch.float16)
+    up_a = torch.ones((4, 4), dtype=torch.float16)
+    down_b = torch.eye(2, dtype=torch.float16)
+    up_b = torch.ones((2, 2), dtype=torch.float16) * 3.0
+    _write_uel(
+        source,
+        {
+            "diffusion_model.block_a.lora_A.weight": down_a,
+            "diffusion_model.block_a.lora_B.weight": up_a,
+            "diffusion_model.block_a.alpha": torch.tensor(2.0, dtype=torch.float16),
+            "diffusion_model.block_b.lora_A.weight": down_b,
+            "diffusion_model.block_b.lora_B.weight": up_b,
+        },
+    )
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    scaled = resize.modify_lora_alpha_file(
+        str(source), "scaled_alpha", alpha_mode="scale", alpha_value=1.5, verbose=False
+    )
+    scaled_tensors = _read_uel(scaled)
+    # Factor weights are byte-exact unchanged
+    assert torch.equal(scaled_tensors["diffusion_model.block_a.lora_A.weight"], down_a)
+    assert torch.equal(scaled_tensors["diffusion_model.block_a.lora_B.weight"], up_a)
+    assert torch.equal(scaled_tensors["diffusion_model.block_b.lora_A.weight"], down_b)
+    assert torch.equal(scaled_tensors["diffusion_model.block_b.lora_B.weight"], up_b)
+    # block_a had alpha=2.0 -> 2.0 * 1.5 = 3.0; block_b had no alpha (rank=2) -> 2.0 * 1.5 = 3.0
+    assert scaled_tensors["diffusion_model.block_a.alpha"].item() == pytest.approx(3.0)
+    assert scaled_tensors["diffusion_model.block_b.alpha"].item() == pytest.approx(3.0)
+
+    # Shifted with filter excluding block_a
+    shifted = resize.modify_lora_alpha_file(
+        str(source),
+        "shifted_alpha",
+        alpha_mode="shift",
+        alpha_value=2.0,
+        exclude_patterns="block_a",
+        verbose=False,
+    )
+    shifted_tensors = _read_uel(shifted)
+    assert shifted_tensors["diffusion_model.block_a.alpha"].item() == pytest.approx(2.0)
+    assert shifted_tensors["diffusion_model.block_b.alpha"].item() == pytest.approx(4.0)
+
+
+def test_denormalize_lora_alpha_is_inverse_of_normalize(monkeypatch, tmp_path, resize):
+    source = tmp_path / "alpha_lora.safetensors"
+    down = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    up = torch.tensor([[2.0, 0.5], [1.0, 3.0]], dtype=torch.float32)
+    _write_uel(
+        source,
+        {
+            "diffusion_model.block.lora_A.weight": down,
+            "diffusion_model.block.lora_B.weight": up,
+            "diffusion_model.block.alpha": torch.tensor(1.0, dtype=torch.float32),
+        },
+    )
+    monkeypatch.setattr(resize.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(resize, "cleanup_after_operation", lambda: None)
+
+    normalized_path = resize.normalize_lora_alpha_file(
+        str(source), "norm_step", verbose=False
+    )
+    denormalized_path = resize.denormalize_lora_alpha_file(
+        str(normalized_path),
+        "denorm_step",
+        alpha_mode="set_alpha",
+        alpha_value=1.0,
+        verbose=False,
+    )
+    denorm_tensors = _read_uel(denormalized_path)
+    assert denorm_tensors["diffusion_model.block.alpha"].item() == pytest.approx(1.0)
+    assert torch.allclose(denorm_tensors["diffusion_model.block.lora_A.weight"], down)
+    assert torch.allclose(denorm_tensors["diffusion_model.block.lora_B.weight"], up)
+
+    with pytest.raises(ValueError, match="non-zero"):
+        resize.denormalize_lora_alpha_file(
+            str(normalized_path), "bad_zero", alpha_mode="set_alpha", alpha_value=0.0, verbose=False
+        )

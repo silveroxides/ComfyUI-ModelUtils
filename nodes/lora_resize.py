@@ -910,6 +910,472 @@ def normalize_lora_alpha_file(
         handler.__exit__(None, None, None)
         cleanup_after_operation()
 
+
+def _compile_alpha_filter_patterns(
+    exclude_patterns: str, discard_patterns: str, glob_patterns: bool
+):
+    return [
+        [
+            re.compile(
+                fnmatch.translate(line.strip()) if glob_patterns else line.strip()
+            )
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        for text in (exclude_patterns, discard_patterns)
+    ]
+
+
+def _matches_alpha_patterns(patterns, names) -> bool:
+    return any(pattern.search(name) for pattern in patterns for name in names)
+
+
+def _compute_modified_alpha(
+    old_alpha: float, rank: int, alpha_mode: str, alpha_value: float
+) -> float:
+    val = float(alpha_value)
+    if alpha_mode == "scale":
+        return old_alpha * val
+    if alpha_mode == "shift":
+        return old_alpha + val
+    if alpha_mode == "set_alpha":
+        return val
+    if alpha_mode == "rank_ratio":
+        return float(rank) * val
+    raise ValueError(f"Unsupported alpha_mode '{alpha_mode}'.")
+
+
+def modify_lora_alpha_file(
+    lora_path: str,
+    output_filename: str,
+    alpha_mode: str = "scale",
+    alpha_value: float = 1.0,
+    reference_model_path: Optional[str] = None,
+    exclude_patterns: str = "",
+    discard_patterns: str = "",
+    glob_patterns: bool = False,
+    include_mode: bool = False,
+    verbose: bool = True,
+) -> str:
+    """Create or modify LoRA alpha scalars while preserving factor weights byte-exact."""
+    if alpha_mode not in ("scale", "shift", "set_alpha", "rank_ratio"):
+        raise ValueError(f"Unsupported alpha_mode '{alpha_mode}'.")
+
+    handler = MemoryEfficientSafeOpen(lora_path, low_memory=True)
+    try:
+        metadata = (handler.metadata() or {}).copy()
+        all_keys = handler.keys()
+        pairs, passthrough_keys = parse_lora_layers(all_keys)
+        output_keys: Dict[str, str] = {}
+        mapped_blocks: Dict[str, str] = {}
+        if reference_model_path:
+            layer_map = build_lora_layer_map(
+                [{"pairs": pairs}], reference_model_path
+            )
+            validate_canonical_blocks(layer_map, "LoRA Modify Alpha")
+            mapped_blocks = {
+                source_block: output_block
+                for output_block, sources in layer_map.items()
+                for _, source_block in sources
+            }
+            for block_name, output_block in mapped_blocks.items():
+                for role, source_key in layer_tensor_keys(pairs[block_name]).items():
+                    output_keys[source_key] = canonical_lora_key(output_block, role)
+
+        consumed_alpha_keys = {
+            block_keys["alpha"]
+            for block_keys in pairs.values()
+            if "alpha" in block_keys and "down" in block_keys and "up" in block_keys
+        }
+        all_alpha_keys = {key for key in all_keys if key.endswith(".alpha")}
+        orphan_alpha_keys = sorted(all_alpha_keys - consumed_alpha_keys)
+        if orphan_alpha_keys:
+            raise ValueError(
+                f"Alpha tensor has no complete LoRA pair: {orphan_alpha_keys[0]}"
+            )
+
+        excludes, discards = _compile_alpha_filter_patterns(
+            exclude_patterns, discard_patterns, glob_patterns
+        )
+        discarded_keys = set()
+        replaced_alpha_keys = set()
+        stream_units = []
+        synthesized_units = []
+        alpha_out_map: Dict[str, Tuple[int, str, torch.dtype]] = {}
+        claimed_passthrough = set()
+
+        for block_name, block_keys in pairs.items():
+            tensor_keys = layer_tensor_keys(block_keys)
+            related_pt = [
+                key
+                for key in passthrough_keys
+                if key.startswith(f"{block_name}.") and key not in claimed_passthrough
+            ]
+            claimed_passthrough.update(related_pt)
+            group_keys = list(tensor_keys.values()) + related_pt
+            names = [block_name, canonical_lora_block_name(block_name)]
+            if block_name in mapped_blocks:
+                names.append(mapped_blocks[block_name])
+            for k in group_keys:
+                names.append(k)
+                if k in output_keys:
+                    names.append(output_keys[k])
+
+            if _matches_alpha_patterns(discards, names):
+                discarded_keys.update(group_keys)
+                continue
+
+            matched = _matches_alpha_patterns(excludes, names)
+            preserve = matched != include_mode
+            if preserve or not ("down" in block_keys and "up" in block_keys):
+                continue
+
+            down_key = block_keys["down"]
+            up_key = block_keys["up"]
+            down_shape = handler.get_shape(down_key)
+            up_shape = handler.get_shape(up_key)
+            if len(down_shape) < 2 or len(up_shape) < 2:
+                raise ValueError(
+                    f"LoRA factors for '{block_name}' must have at least two dimensions."
+                )
+            rank = int(down_shape[0])
+            if rank <= 0 or int(up_shape[1]) != rank:
+                raise ValueError(f"LoRA factor rank mismatch for '{block_name}'.")
+
+            if block_name in mapped_blocks:
+                alpha_out_key = canonical_lora_key(mapped_blocks[block_name], "alpha")
+            elif "alpha" in block_keys:
+                alpha_out_key = block_keys["alpha"]
+            else:
+                alpha_out_key = f"{block_name}.alpha"
+
+            up_dtype = handler.get_dtype(up_key)
+            default_dtype = (
+                up_dtype
+                if up_dtype in (torch.float16, torch.bfloat16, torch.float32)
+                else torch.float32
+            )
+
+            alpha_key = block_keys.get("alpha")
+            if alpha_key is not None:
+                replaced_alpha_keys.add(alpha_key)
+                stream_units.append((block_name, {0: [alpha_key]}))
+                alpha_out_map[block_name] = (rank, alpha_out_key, default_dtype)
+            else:
+                synthesized_units.append((block_name, rank, alpha_out_key, default_dtype))
+
+        for key in passthrough_keys:
+            if key in claimed_passthrough:
+                continue
+            if _matches_alpha_patterns(discards, [key]):
+                discarded_keys.add(key)
+
+        if not stream_units and not synthesized_units:
+            raise ValueError("No matching LoRA pairs found to modify alpha.")
+
+        metadata["alpha_normalized"] = "false"
+        metadata["alpha_modified"] = f"{alpha_mode}:{alpha_value}"
+        output_path, _ = canonical_model_artifact_path("loras", output_filename)
+
+        with atomic_uel_writer(output_path, metadata) as writer:
+            for key in all_keys:
+                if key in discarded_keys or key in replaced_alpha_keys:
+                    continue
+                write_preserved_tensor(
+                    writer,
+                    key,
+                    handler,
+                    output_key=output_keys.get(key),
+                    force_raw=True,
+                )
+
+            if stream_units:
+                with torch.no_grad():
+                    iterator = stream_work_units(
+                        {0: handler}, stream_units, pin_memory=False
+                    )
+                    try:
+                        for block_name, loaded in iterator:
+                            alpha_key = pairs[block_name]["alpha"]
+                            rank, alpha_out_key, default_dtype = alpha_out_map[block_name]
+                            alpha = loaded[(0, alpha_key)]
+                            try:
+                                if (
+                                    alpha.numel() != 1
+                                    or not torch.isfinite(alpha).all().item()
+                                ):
+                                    raise ValueError(
+                                        f"LoRA alpha for '{block_name}' must be a finite scalar."
+                                    )
+                                old_alpha = float(alpha.to(dtype=torch.float32).item())
+                                new_alpha = _compute_modified_alpha(
+                                    old_alpha, rank, alpha_mode, alpha_value
+                                )
+                                out_dtype = (
+                                    alpha.dtype
+                                    if alpha.dtype
+                                    in (torch.float16, torch.bfloat16, torch.float32)
+                                    else default_dtype
+                                )
+                                writer.write_batch(
+                                    [
+                                        (
+                                            alpha_out_key,
+                                            torch.tensor(new_alpha, dtype=out_dtype),
+                                        )
+                                    ]
+                                )
+                            finally:
+                                del alpha
+                    finally:
+                        iterator.close()
+
+            if synthesized_units:
+                synth_batch = []
+                for block_name, rank, alpha_out_key, default_dtype in synthesized_units:
+                    new_alpha = _compute_modified_alpha(
+                        float(rank), rank, alpha_mode, alpha_value
+                    )
+                    synth_batch.append(
+                        (alpha_out_key, torch.tensor(new_alpha, dtype=default_dtype))
+                    )
+                writer.write_batch(synth_batch)
+
+        if verbose:
+            total_modified = len(stream_units) + len(synthesized_units)
+            print(
+                f"[LoRA Modify Alpha] Updated {total_modified} alpha tensors ({alpha_mode}={alpha_value})"
+            )
+            print(f"[LoRA Modify Alpha] Saved to {output_path}")
+        return output_path
+    finally:
+        handler.__exit__(None, None, None)
+        cleanup_after_operation()
+
+
+def denormalize_lora_alpha_file(
+    lora_path: str,
+    output_filename: str,
+    alpha_mode: str = "set_alpha",
+    alpha_value: float = 1.0,
+    reference_model_path: Optional[str] = None,
+    exclude_patterns: str = "",
+    discard_patterns: str = "",
+    glob_patterns: bool = False,
+    include_mode: bool = False,
+    verbose: bool = True,
+) -> str:
+    """Set target LoRA alpha tensors and counter-scale up factors to preserve effective delta."""
+    if alpha_mode not in ("set_alpha", "rank_ratio"):
+        raise ValueError(
+            f"Unsupported alpha_mode '{alpha_mode}' for denormalization; expected 'set_alpha' or 'rank_ratio'."
+        )
+    if float(alpha_value) == 0.0:
+        raise ValueError(
+            "Target alpha value must be non-zero to denormalize LoRA factors."
+        )
+
+    handler = MemoryEfficientSafeOpen(lora_path, low_memory=True)
+    try:
+        low_bit_keys = inspect_low_bit_input(
+            handler, f"LoRA ({lora_path})", "LoRA Alpha Denormalize"
+        )
+        metadata = (handler.metadata() or {}).copy()
+        all_keys = handler.keys()
+        pairs, passthrough_keys = parse_lora_layers(all_keys)
+        output_keys: Dict[str, str] = {}
+        mapped_blocks: Dict[str, str] = {}
+        if reference_model_path:
+            layer_map = build_lora_layer_map(
+                [{"pairs": pairs}], reference_model_path
+            )
+            validate_canonical_blocks(layer_map, "LoRA Alpha Denormalize")
+            mapped_blocks = {
+                source_block: output_block
+                for output_block, sources in layer_map.items()
+                for _, source_block in sources
+            }
+            for block_name, output_block in mapped_blocks.items():
+                for role, source_key in layer_tensor_keys(pairs[block_name]).items():
+                    output_keys[source_key] = canonical_lora_key(output_block, role)
+
+        consumed_alpha_keys = {
+            block_keys["alpha"]
+            for block_keys in pairs.values()
+            if "alpha" in block_keys and "down" in block_keys and "up" in block_keys
+        }
+        all_alpha_keys = {key for key in all_keys if key.endswith(".alpha")}
+        orphan_alpha_keys = sorted(all_alpha_keys - consumed_alpha_keys)
+        if orphan_alpha_keys:
+            raise ValueError(
+                f"Alpha tensor has no complete LoRA pair: {orphan_alpha_keys[0]}"
+            )
+
+        excludes, discards = _compile_alpha_filter_patterns(
+            exclude_patterns, discard_patterns, glob_patterns
+        )
+        discarded_keys = set()
+        replaced_keys = set()
+        work_units = []
+        unit_meta: Dict[str, Tuple[int, str, str]] = {}
+        claimed_passthrough = set()
+
+        for block_name, block_keys in pairs.items():
+            tensor_keys = layer_tensor_keys(block_keys)
+            related_pt = [
+                key
+                for key in passthrough_keys
+                if key.startswith(f"{block_name}.") and key not in claimed_passthrough
+            ]
+            claimed_passthrough.update(related_pt)
+            group_keys = list(tensor_keys.values()) + related_pt
+            names = [block_name, canonical_lora_block_name(block_name)]
+            if block_name in mapped_blocks:
+                names.append(mapped_blocks[block_name])
+            for k in group_keys:
+                names.append(k)
+                if k in output_keys:
+                    names.append(output_keys[k])
+
+            if _matches_alpha_patterns(discards, names):
+                discarded_keys.update(group_keys)
+                continue
+
+            matched = _matches_alpha_patterns(excludes, names)
+            preserve = matched != include_mode
+            if preserve or not ("down" in block_keys and "up" in block_keys):
+                continue
+
+            down_key = block_keys["down"]
+            up_key = block_keys["up"]
+            if down_key in low_bit_keys or up_key in low_bit_keys:
+                raise ValueError(
+                    f"Cannot denormalize low-bit LoRA factors for '{block_name}'."
+                )
+            down_shape = handler.get_shape(down_key)
+            up_shape = handler.get_shape(up_key)
+            if len(down_shape) < 2 or len(up_shape) < 2:
+                raise ValueError(
+                    f"LoRA factors for '{block_name}' must have at least two dimensions."
+                )
+            rank = int(down_shape[0])
+            if rank <= 0 or int(up_shape[1]) != rank:
+                raise ValueError(f"LoRA factor rank mismatch for '{block_name}'.")
+
+            up_out_key = output_keys.get(up_key, up_key)
+            if block_name in mapped_blocks:
+                alpha_out_key = canonical_lora_key(mapped_blocks[block_name], "alpha")
+            elif "alpha" in block_keys:
+                alpha_out_key = block_keys["alpha"]
+            else:
+                alpha_out_key = f"{block_name}.alpha"
+
+            alpha_key = block_keys.get("alpha")
+            replaced_keys.add(up_key)
+            if alpha_key is not None:
+                replaced_keys.add(alpha_key)
+                work_units.append((block_name, {0: [up_key, alpha_key]}))
+            else:
+                work_units.append((block_name, {0: [up_key]}))
+            unit_meta[block_name] = (rank, up_out_key, alpha_out_key)
+
+        for key in passthrough_keys:
+            if key in claimed_passthrough:
+                continue
+            if _matches_alpha_patterns(discards, [key]):
+                discarded_keys.add(key)
+
+        if not work_units:
+            raise ValueError("No matching LoRA pairs found to denormalize alpha.")
+
+        metadata["alpha_normalized"] = "false"
+        metadata["alpha_denormalization"] = (
+            f"alpha set via {alpha_mode}={alpha_value}; up factor counter-scaled to preserve delta"
+        )
+        output_path, _ = canonical_model_artifact_path("loras", output_filename)
+
+        with atomic_uel_writer(output_path, metadata) as writer:
+            for key in all_keys:
+                if key in discarded_keys or key in replaced_keys:
+                    continue
+                write_preserved_tensor(
+                    writer,
+                    key,
+                    handler,
+                    output_key=output_keys.get(key),
+                    force_raw=True,
+                )
+
+            with torch.no_grad():
+                iterator = stream_work_units(
+                    {0: handler}, work_units, pin_memory=False
+                )
+                try:
+                    for block_name, loaded in iterator:
+                        block_keys = pairs[block_name]
+                        up_key = block_keys["up"]
+                        alpha_key = block_keys.get("alpha")
+                        rank, up_out_key, alpha_out_key = unit_meta[block_name]
+                        up = loaded[(0, up_key)]
+                        alpha = loaded.get((0, alpha_key)) if alpha_key else None
+                        output_up = up
+                        try:
+                            if alpha is not None:
+                                if (
+                                    alpha.numel() != 1
+                                    or not torch.isfinite(alpha).all().item()
+                                ):
+                                    raise ValueError(
+                                        f"LoRA alpha for '{block_name}' must be a finite scalar."
+                                    )
+                                old_alpha = float(alpha.to(dtype=torch.float32).item())
+                            else:
+                                old_alpha = float(rank)
+
+                            new_alpha = _compute_modified_alpha(
+                                old_alpha, rank, alpha_mode, alpha_value
+                            )
+                            factor_scale = old_alpha / new_alpha
+                            if factor_scale != 1.0:
+                                output_up = (
+                                    up.to(dtype=torch.float32)
+                                    .mul_(factor_scale)
+                                    .to(dtype=up.dtype)
+                                    .contiguous()
+                                )
+                            alpha_dtype = (
+                                up.dtype
+                                if up.dtype
+                                in (torch.float16, torch.bfloat16, torch.float32)
+                                else torch.float32
+                            )
+                            writer.write_batch(
+                                [
+                                    (up_out_key, output_up.cpu().contiguous()),
+                                    (
+                                        alpha_out_key,
+                                        torch.tensor(new_alpha, dtype=alpha_dtype),
+                                    ),
+                                ]
+                            )
+                        finally:
+                            del output_up
+                            del up
+                            if alpha is not None:
+                                del alpha
+                finally:
+                    iterator.close()
+
+        if verbose:
+            print(
+                f"[LoRA Denormalize Alpha] Updated {len(work_units)} LoRA pairs ({alpha_mode}={alpha_value})"
+            )
+            print(f"[LoRA Denormalize Alpha] Saved to {output_path}")
+        return output_path
+    finally:
+        handler.__exit__(None, None, None)
+        cleanup_after_operation()
+
 def resize_lora_file(
     lora_path: str,
     new_rank: int,
@@ -1278,6 +1744,168 @@ class LoRANormalizeAlpha(io.ComfyNode):
             lora_path,
             output_filename,
             reference_model_path=reference_path,
+        )
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
+
+
+class LoRAModifyAlpha(io.ComfyNode):
+    """Modify or create per-layer LoRA alpha scalars to adjust influence without changing factor weights."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRAModifyAlpha",
+            display_name="LoRA Modify Alpha",
+            category="ModelUtils/LoRA/Utilities",
+            description="Create or modify LoRA alpha scalars to scale, shift, or set layer influence while keeping factor weights byte-exact.",
+            inputs=[
+                io.Combo.Input(
+                    "lora_name",
+                    options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA whose per-layer alpha scalars will be modified or created.",
+                ),
+                io.Combo.Input(
+                    "alpha_mode",
+                    options=["scale", "shift", "set_alpha", "rank_ratio"],
+                    default="scale",
+                    tooltip="How to compute new alpha from existing alpha (or rank when absent): scale multiplies, shift adds, set_alpha sets a fixed scalar, rank_ratio sets rank * value.",
+                ),
+                io.Float.Input(
+                    "alpha_value",
+                    default=1.0,
+                    min=-10000.0,
+                    max=10000.0,
+                    step=0.01,
+                    tooltip="Multiplier, additive shift, fixed alpha, or alpha/rank ratio applied to matched LoRA layers.",
+                ),
+                io.String.Input(
+                    "output_filename",
+                    default="modified_alpha_lora",
+                    tooltip="Output filename without extension, written under ComfyUI's LoRA directory.",
+                ),
+                io.Combo.Input(
+                    "reference_model",
+                    options=["None", *folder_paths.get_filename_list("diffusion_models")],
+                    default="None",
+                    tooltip="Optional diffusion model used to normalize flattened LoRA layer names to its exact model paths.",
+                ),
+                *_resize_filter_inputs(),
+            ],
+            outputs=[io.AnyType.Output(display_name="output_path")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        lora_name,
+        alpha_mode="scale",
+        alpha_value=1.0,
+        output_filename="modified_alpha_lora",
+        reference_model="None",
+        exclude_patterns="",
+        discard_patterns="",
+        glob_patterns=False,
+        include_mode=False,
+    ) -> io.NodeOutput:
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        reference_path = None
+        if reference_model != "None":
+            reference_path = folder_paths.get_full_path_or_raise(
+                "diffusion_models", reference_model
+            )
+        modify_lora_alpha_file(
+            lora_path,
+            output_filename,
+            alpha_mode=alpha_mode,
+            alpha_value=alpha_value,
+            reference_model_path=reference_path,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
+            include_mode=include_mode,
+        )
+        _, output_name = canonical_model_artifact_path("loras", output_filename)
+        return io.NodeOutput(output_name)
+
+
+class LoRADenormalizeAlpha(io.ComfyNode):
+    """Set explicit LoRA alpha scalars and counter-scale up factors to preserve the effective delta."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LoRADenormalizeAlpha",
+            display_name="LoRA Denormalize Alpha",
+            category="ModelUtils/LoRA/Utilities",
+            description="Inverse of LoRA Normalize Alpha: write target alpha scalars and counter-scale LoRA up factors so effective layer deltas remain unchanged.",
+            inputs=[
+                io.Combo.Input(
+                    "lora_name",
+                    options=folder_paths.get_filename_list("loras"),
+                    tooltip="LoRA whose alpha tensors will be restored or rebased while preserving effective layer deltas.",
+                ),
+                io.Combo.Input(
+                    "alpha_mode",
+                    options=["set_alpha", "rank_ratio"],
+                    default="set_alpha",
+                    tooltip="set_alpha writes a fixed alpha value; rank_ratio writes alpha = rank * value.",
+                ),
+                io.Float.Input(
+                    "alpha_value",
+                    default=1.0,
+                    min=-10000.0,
+                    max=10000.0,
+                    step=0.01,
+                    tooltip="Non-zero target alpha value or target alpha/rank ratio.",
+                ),
+                io.String.Input(
+                    "output_filename",
+                    default="denormalized_alpha_lora",
+                    tooltip="Output filename without extension, written under ComfyUI's LoRA directory.",
+                ),
+                io.Combo.Input(
+                    "reference_model",
+                    options=["None", *folder_paths.get_filename_list("diffusion_models")],
+                    default="None",
+                    tooltip="Optional diffusion model used to normalize flattened LoRA layer names to its exact model paths.",
+                ),
+                *_resize_filter_inputs(),
+            ],
+            outputs=[io.AnyType.Output(display_name="output_path")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        lora_name,
+        alpha_mode="set_alpha",
+        alpha_value=1.0,
+        output_filename="denormalized_alpha_lora",
+        reference_model="None",
+        exclude_patterns="",
+        discard_patterns="",
+        glob_patterns=False,
+        include_mode=False,
+    ) -> io.NodeOutput:
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        reference_path = None
+        if reference_model != "None":
+            reference_path = folder_paths.get_full_path_or_raise(
+                "diffusion_models", reference_model
+            )
+        denormalize_lora_alpha_file(
+            lora_path,
+            output_filename,
+            alpha_mode=alpha_mode,
+            alpha_value=alpha_value,
+            reference_model_path=reference_path,
+            exclude_patterns=exclude_patterns,
+            discard_patterns=discard_patterns,
+            glob_patterns=glob_patterns,
+            include_mode=include_mode,
         )
         _, output_name = canonical_model_artifact_path("loras", output_filename)
         return io.NodeOutput(output_name)

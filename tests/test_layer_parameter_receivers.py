@@ -103,5 +103,10 @@ def test_no_expansion_to_other_node_families():
         for node in nodes(module):
             assert "layer_parameters" not in {item.id for item in node.define_schema().inputs}
     resize = load("lora_resize")
-    for node in (resize.LoRAMergeToModel, resize.LoRANormalizeAlpha):
+    for node in (
+        resize.LoRAMergeToModel,
+        resize.LoRANormalizeAlpha,
+        resize.LoRAModifyAlpha,
+        resize.LoRADenormalizeAlpha,
+    ):
         assert "layer_parameters" not in {item.id for item in node.define_schema().inputs}
