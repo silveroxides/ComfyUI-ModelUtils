@@ -622,9 +622,9 @@ def test_norm_rescale_and_dsc_bandpass_are_finite(cwb):
 
 
 def test_all_cwb_schemas_and_compact_control_contract(cwb):
-    assert len(cwb.CWB_MERGER_NODES) == 16
+    assert len(cwb.CWB_MERGER_NODES) == 17
     schemas = [node.define_schema() for node in cwb.CWB_MERGER_NODES]
-    assert len({schema.node_id for schema in schemas}) == 16
+    assert len({schema.node_id for schema in schemas}) == 17
     advanced = {
         "consensus_type", "alignment_method", "alignment_threshold",
         "similarity_threshold", "power_alpha", "diversity_beta",
@@ -648,6 +648,12 @@ def test_all_cwb_schemas_and_compact_control_contract(cwb):
         assert schema.outputs[1].get_io_type() == "STRING"
         assert schema.outputs[2].get_io_type() == "STRING"
         assert advanced.isdisjoint(ids)
+        if node is cwb.CWBModelGraft:
+            assert "attention_preset" in ids
+            assert "ffn_preset" in ids
+            assert "protect_early_blocks" in ids
+            assert ids[-1] == "include_mode"
+            continue
         assert "cwb_config" in ids
         if node is cwb.CWBLoRAMultiMerger:
             assert ids[:4] == ["execution_mode", "lora_count", "lora_1", "lora_2"]
@@ -1157,6 +1163,129 @@ def test_embedding_stack_and_stack_merger(monkeypatch, cwb):
             embeddings=[{"embedding_name": "only_one.safetensors", "enabled": True}],
             **base_kwargs,
         )
+
+
+def test_cwb_model_graft_protected_blocks_subparts_and_mismatched_shapes(
+    monkeypatch, tmp_path, cwb
+):
+    base_path = tmp_path / "base.safetensors"
+    donor_path = tmp_path / "donor.safetensors"
+
+    base_qkv_0 = torch.ones((6, 4), dtype=torch.float32) * 2.0
+    base_qkv_2 = torch.cat(
+        [
+            torch.ones((2, 4), dtype=torch.float32) * 1.0,
+            torch.ones((2, 4), dtype=torch.float32) * 2.0,
+            torch.ones((2, 4), dtype=torch.float32) * 3.0,
+        ],
+        dim=0,
+    )
+    base_ffn_2 = torch.cat(
+        [
+            torch.ones((2, 4), dtype=torch.float32) * 4.0,
+            torch.ones((2, 4), dtype=torch.float32) * 5.0,
+        ],
+        dim=0,
+    )
+    base_custom = torch.ones((2, 4), dtype=torch.float32) * 2.0
+
+    save_file(
+        {
+            "layers.0.proj.qkv.weight": base_qkv_0,
+            "layers.2.proj.qkv.weight": base_qkv_2,
+            "layers.2.proj.ffn_up_gate.weight": base_ffn_2,
+            "layers.3.proj.qkv.weight": base_qkv_0.clone(),
+            "custom_target.weight": base_custom,
+        },
+        str(base_path),
+    )
+
+    # Donor has split q/k/v for layers.2 and a differently-shaped custom_donor.weight
+    save_file(
+        {
+            "layers.0.proj.qkv.weight": torch.ones((6, 4), dtype=torch.float32) * 99.0,
+            "layers.2.proj.q.weight": torch.ones((2, 4), dtype=torch.float32) * 50.0,
+            "layers.2.proj.k.weight": torch.ones((2, 4), dtype=torch.float32) * 60.0,
+            "layers.2.proj.v.weight": torch.tensor(
+                [[9.0, 1.0, 1.0, 1.0], [1.0, 9.0, 1.0, 1.0]], dtype=torch.float32
+            ),
+            "layers.2.proj.ffn_up_gate.weight": torch.cat(
+                [
+                    torch.tensor(
+                        [[8.0, 1.0, 1.0, 1.0], [1.0, 8.0, 1.0, 1.0]],
+                        dtype=torch.float32,
+                    ),
+                    torch.ones((2, 4), dtype=torch.float32) * 77.0,
+                ],
+                dim=0,
+            ),
+            "layers.3.proj.qkv.weight": torch.ones((6, 4), dtype=torch.float32) * 88.0,
+            "custom_donor.weight": torch.tensor(
+                [
+                    [10.0, 2.0, 1.0, 1.0, 1.0, 1.0],
+                    [1.0, 10.0, 2.0, 1.0, 1.0, 1.0],
+                    [1.0, 1.0, 10.0, 2.0, 1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+        },
+        str(donor_path),
+    )
+
+    paths = {"base": str(base_path), "donor": str(donor_path)}
+    _patch_io(monkeypatch, cwb, tmp_path, paths)
+    monkeypatch.setattr(cwb, "load_documentation_from_file", lambda _: "DOCS")
+
+    out = cwb.CWBModelGraft.execute(
+        execution_mode="MERGE",
+        model_a="base",
+        model_b="donor",
+        attention_preset="balanced_mean",
+        attention_config=None,
+        ffn_preset="balanced_mean",
+        ffn_config=None,
+        protect_early_blocks=2,
+        attention_block_rule="interleaved_even",
+        ffn_block_rule="all_after_protected",
+        attention_subpart="value_and_output",
+        ffn_subpart="up_only",
+        custom_key_map="custom_donor.weight -> custom_target.weight",
+        output_filename="grafted",
+        save_dtype="fp32",
+        process_device="cpu",
+        exclude_patterns="",
+        discard_patterns="",
+        glob_patterns=False,
+        lazy_load=True,
+        force_clear_cache=False,
+        override_dtype=False,
+        include_mode=False,
+    )
+
+    rel_name, docs, report = out.result
+    assert docs == "DOCS"
+    assert "attn=balanced_mean, ffn=balanced_mean" in report
+    tensors = load_file(str(_result_path(tmp_path, "diffusion_models", rel_name)))
+
+    # 1. Protected block 0 is byte-exact identical to Base
+    assert torch.equal(tensors["layers.0.proj.qkv.weight"], base_qkv_0)
+    # 2. Odd block 3 attention is untouched under interleaved_even
+    assert torch.equal(tensors["layers.3.proj.qkv.weight"], base_qkv_0)
+    # 3. Even block 2 qkv: Q and K slices stay Base, only V slice is grafted from split donor
+    q_out, k_out, v_out = tensors["layers.2.proj.qkv.weight"].chunk(3, dim=0)
+    assert torch.equal(q_out, base_qkv_2[:2])
+    assert torch.equal(k_out, base_qkv_2[2:4])
+    assert not torch.equal(v_out, base_qkv_2[4:6])
+    # 4. Block 2 ffn_up_gate: up half is grafted, gate half stays Base
+    up_out, gate_out = tensors["layers.2.proj.ffn_up_gate.weight"].chunk(2, dim=0)
+    assert not torch.equal(up_out, base_ffn_2[:2])
+    assert torch.equal(gate_out, base_ffn_2[2:])
+    # 5. Mismatched-shape custom mapped tensor blends without changing shape or norm
+    assert tensors["custom_target.weight"].shape == base_custom.shape
+    assert not torch.equal(tensors["custom_target.weight"], base_custom)
+    assert torch.linalg.vector_norm(tensors["custom_target.weight"]).item() == pytest.approx(
+        torch.linalg.vector_norm(base_custom).item(), rel=1e-5
+    )
 
 
 def test_streaming_dtype_nonfloat_and_secondary_preservation(
