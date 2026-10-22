@@ -98,7 +98,7 @@ def test_all_39_receivers_forward_configuration(monkeypatch, module_name, count)
 
 
 def test_no_expansion_to_other_node_families():
-    for module_name in ("consensus_merger", "cwb_delta_lora_merger", "lodestone_merger", "lora_merger", "model_analysis", "dtype_conversion"):
+    for module_name in ("consensus_merger", "cwb_model_graft", "cwb_delta_lora_merger", "lodestone_merger", "lora_merger", "model_analysis", "dtype_conversion"):
         module = load(module_name)
         for node in nodes(module):
             assert "layer_parameters" not in {item.id for item in node.define_schema().inputs}

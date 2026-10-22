@@ -10,7 +10,7 @@ python_tests = [
 paths = [
   "nodes/artifact_paths.py", "nodes/dora_extract_wd.py",
   "nodes/dora_learned_wd.py", "nodes/dtype_conversion.py",
-  "nodes/cwb_delta_lora_merger.py", "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
+  "nodes/cwb_delta_lora_merger.py", "nodes/cwb_model_graft.py", "nodes/lodestone_merger.py", "nodes/lora_extract_svd.py", "nodes/lora_merger.py",
   "nodes/lora_rename.py", "nodes/lora_resize.py", "nodes/merger.py",
   "nodes/minimax_h3_lora_convert.py",
   "nodes/minimax_h3_fold.py",
@@ -19,9 +19,9 @@ paths = [
 python_tests = ["tests/test_artifact_paths.py"]
 
 [groups.cwb]
-paths = ["nodes/consensus_merger.py", "nodes/cwb_delta_lora_merger.py", "run_cwb_api_workflow.py", "run_cwb_preset_sweep.py"]
+paths = ["nodes/consensus_merger.py", "nodes/cwb_model_graft.py", "nodes/cwb_delta_lora_merger.py", "run_cwb_api_workflow.py", "run_cwb_preset_sweep.py"]
 python_tests = [
-  "tests/test_consensus_merger.py", "tests/test_cwb_api_runner.py",
+  "tests/test_consensus_merger.py", "tests/test_cwb_model_graft.py", "tests/test_cwb_api_runner.py",
   "tests/test_cwb_delta_lora_merger.py", "tests/test_cwb_preset_sweep.py",
 ]
 
