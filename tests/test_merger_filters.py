@@ -231,3 +231,54 @@ def test_three_diffusion_models_match_across_prefixes(monkeypatch, tmp_path, mod
     output = load_file(str(tmp_path / "diffusion_models" / "three_prefix_merge.safetensors"))
     assert list(output) == ["layer.weight"]
     torch.testing.assert_close(output["layer.weight"], torch.tensor([2.0, 2.0]))
+
+
+def test_prunekeys_include_mode_and_uel_streaming(monkeypatch, tmp_path):
+    prunekeys = _module("nodes.prunekeys")
+    for cls in (
+        prunekeys.ModelPruneKeys,
+        prunekeys.TextEncoderPruneKeys,
+        prunekeys.LoRAPruneKeys,
+        prunekeys.CheckpointPruneKeys,
+        prunekeys.EmbeddingPruneKeys,
+    ):
+        schema = cls.define_schema()
+        assert schema.inputs[-1].id == "include_mode"
+        assert schema.inputs[-1].default is False
+
+    src = tmp_path / "source.safetensors"
+    save_file(
+        {
+            "layers.0.attn.weight": torch.tensor([1.0, 2.0]),
+            "layers.0.ffn.weight": torch.tensor([3.0, 4.0]),
+            "layers.1.attn.weight": torch.tensor([5.0, 6.0]),
+        },
+        str(src),
+        metadata={"author": "test"},
+    )
+    monkeypatch.setattr(prunekeys.folder_paths, "get_full_path_or_raise", lambda _kind, _name: str(src))
+    monkeypatch.setattr(prunekeys.folder_paths, "models_dir", str(tmp_path))
+    monkeypatch.setattr(prunekeys, "prepare_for_large_operation", lambda *args: None)
+    monkeypatch.setattr(prunekeys, "cleanup_after_operation", lambda: None)
+
+    # Default include_mode=False removes matching keys
+    rel_removed = prunekeys.ModelPruneKeys.execute(
+        diffusionmodel_name="source.safetensors",
+        keys_to_prune="attn",
+        use_regex=False,
+        output_filename="removed_attn",
+        include_mode=False,
+    ).result[0]
+    removed_tensors = load_file(str(tmp_path / "diffusion_models" / rel_removed))
+    assert set(removed_tensors) == {"layers.0.ffn.weight"}
+
+    # include_mode=True keeps only matching keys
+    rel_kept = prunekeys.ModelPruneKeys.execute(
+        diffusionmodel_name="source.safetensors",
+        keys_to_prune=r"^layers\.\d+\.attn\.",
+        use_regex=True,
+        output_filename="kept_attn",
+        include_mode=True,
+    ).result[0]
+    kept_tensors = load_file(str(tmp_path / "diffusion_models" / rel_kept))
+    assert set(kept_tensors) == {"layers.0.attn.weight", "layers.1.attn.weight"}

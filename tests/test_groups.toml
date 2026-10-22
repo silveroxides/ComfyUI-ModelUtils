@@ -56,7 +56,7 @@ paths = ["nodes/lora_resize.py"]
 python_tests = ["tests/test_lora_resize_factor_space.py", "tests/test_lora_resize_min_rank.py"]
 
 [groups.merger_filters]
-paths = ["nodes/merger.py"]
+paths = ["nodes/merger.py", "nodes/prunekeys.py"]
 python_tests = ["tests/test_merger_filters.py"]
 
 [groups.layer_parameters]

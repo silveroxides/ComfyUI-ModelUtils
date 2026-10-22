@@ -1,3 +1,4 @@
+from contextlib import closing
 import os
 import re
 import folder_paths
@@ -8,12 +9,24 @@ from .utils import convert_pt_to_safetensors
 from .device_utils import estimate_model_size, prepare_for_large_operation, cleanup_after_operation
 
 from unifiedefficientloader import MemoryEfficientSafeOpen
-from .uel_io import atomic_uel_writer
+from .uel_io import atomic_uel_writer, stream_work_units
 from .artifact_paths import canonical_model_artifact_path
+from .quantization_guard import (
+    UPSTREAM_WRITER_STORAGE_CODES,
+    _is_low_bit,
+    storage_dtype_code,
+    write_preserved_tensor,
+)
 
 
-def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
-                use_regex: bool, output_filename: str) -> str:
+def _prune_keys(
+    model_name: str,
+    model_type: str,
+    keys_to_prune_str: str,
+    use_regex: bool,
+    output_filename: str,
+    include_mode: bool = False,
+) -> str:
     """Shared logic for all PruneKeys nodes."""
     model_path = folder_paths.get_full_path_or_raise(model_type, model_name)
 
@@ -27,43 +40,73 @@ def _prune_keys(model_name: str, model_type: str, keys_to_prune_str: str,
     else:
         model_path_to_load = model_path
 
-    # Prepare memory before operation
-    model_size_gb = estimate_model_size(model_path_to_load)
-    prepare_for_large_operation(model_size_gb * 1.2)
-
-    patterns = [p.strip() for p in keys_to_prune_str.strip().split('\n') if p.strip()]
-
-    if not patterns:
+    raw_patterns = [p.strip() for p in keys_to_prune_str.strip().split('\n') if p.strip()]
+    if not raw_patterns:
         raise ValueError("No keys/patterns provided to prune.")
 
-    # Use [-1] for diffusion_models to get the actual diffusion_models folder, not legacy unet
+    compiled_patterns = []
+    if use_regex:
+        for pat in raw_patterns:
+            try:
+                compiled_patterns.append(re.compile(pat))
+            except re.error as exc:
+                raise ValueError(f"Invalid regex pattern '{pat}': {exc}") from exc
+
+    model_size_gb = estimate_model_size(model_path_to_load)
+    if model_size_gb:
+        prepare_for_large_operation(model_size_gb * 1.2)
+
     output_path, output_name = canonical_model_artifact_path(model_type, output_filename)
 
-    # Stream tensors, filter on the fly, write immediately
-    with MemoryEfficientSafeOpen(model_path_to_load, low_memory=True) as handler:
-        metadata = handler.metadata() or {}
-        with atomic_uel_writer(output_path, metadata) as writer:
-            all_keys = handler.keys()
-            pbar = comfy.utils.ProgressBar(len(all_keys))
-            kept_keys = [
-                key for key in all_keys
-                if not (
-                    any(re.search(pattern, key) for pattern in patterns)
-                    if use_regex else any(pattern in key for pattern in patterns)
-                )
-            ]
-            stream = handler.async_stream(
-                kept_keys, batch_size=1, prefetch_batches=1, pin_memory=False
+    handler = MemoryEfficientSafeOpen(model_path_to_load, low_memory=True)
+    try:
+        metadata = (handler.metadata() or {}).copy()
+        all_keys = list(handler.keys())
+        kept_keys = []
+        for key in all_keys:
+            matched = (
+                any(pat.search(key) is not None for pat in compiled_patterns)
+                if use_regex
+                else any(pat in key for pat in raw_patterns)
             )
-            for batch in tqdm(stream, total=len(kept_keys), desc="Pruning keys", unit="keys"):
-                key, tensor = batch[0]
-                writer.write_batch([(key, tensor.contiguous())])
-                handler.mark_processed(key)
-                pbar.update(1)
-            pbar.update(len(all_keys) - len(kept_keys))
+            keep = matched if include_mode else not matched
+            if keep:
+                kept_keys.append(key)
 
-    # Cleanup after operation
-    cleanup_after_operation()
+        work_units = []
+        raw_preserve_keys = set()
+        for key in kept_keys:
+            code = storage_dtype_code(handler, key)
+            if _is_low_bit(handler, key) or (
+                code is not None and code not in UPSTREAM_WRITER_STORAGE_CODES
+            ):
+                raw_preserve_keys.add(key)
+                work_units.append((key, {}))
+            else:
+                work_units.append((key, {0: [key]}))
+
+        pbar = comfy.utils.ProgressBar(len(all_keys))
+        with atomic_uel_writer(output_path, metadata) as writer, closing(
+            stream_work_units({0: handler}, work_units, pin_memory=False)
+        ) as streamed:
+            for key, loaded in tqdm(streamed, total=len(work_units), desc="Pruning keys", unit="keys"):
+                if key in raw_preserve_keys:
+                    write_preserved_tensor(
+                        writer, key, handler, output_key=key, force_raw=True
+                    )
+                else:
+                    tensor = loaded[(0, key)]
+                    try:
+                        write_preserved_tensor(
+                            writer, key, handler, output_key=key, tensor=tensor
+                        )
+                    finally:
+                        del tensor
+                pbar.update(1)
+            pbar.update(len(all_keys) - len(work_units))
+    finally:
+        handler.__exit__(None, None, None)
+        cleanup_after_operation()
 
     return output_name
 
@@ -85,6 +128,7 @@ class ModelPruneKeys(io.ComfyNode):
                 io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
                 io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
                 io.String.Input("output_filename", default="pruned_model", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Keep only matching keys instead of removing them. Nonmatching keys are pruned from the output."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -92,10 +136,22 @@ class ModelPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, diffusionmodel_name: str, keys_to_prune: str,
-                use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(diffusionmodel_name, "diffusion_models",
-                          keys_to_prune, use_regex, output_filename)
+    def execute(
+        cls,
+        diffusionmodel_name: str,
+        keys_to_prune: str,
+        use_regex: bool,
+        output_filename: str,
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        path = _prune_keys(
+            diffusionmodel_name,
+            "diffusion_models",
+            keys_to_prune,
+            use_regex,
+            output_filename,
+            include_mode=include_mode,
+        )
         return io.NodeOutput(path)
 
 
@@ -116,6 +172,7 @@ class TextEncoderPruneKeys(io.ComfyNode):
                 io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
                 io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
                 io.String.Input("output_filename", default="pruned_textencoder", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Keep only matching keys instead of removing them. Nonmatching keys are pruned from the output."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -123,10 +180,22 @@ class TextEncoderPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, textencoder_name: str, keys_to_prune: str,
-                use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(textencoder_name, "text_encoders",
-                          keys_to_prune, use_regex, output_filename)
+    def execute(
+        cls,
+        textencoder_name: str,
+        keys_to_prune: str,
+        use_regex: bool,
+        output_filename: str,
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        path = _prune_keys(
+            textencoder_name,
+            "text_encoders",
+            keys_to_prune,
+            use_regex,
+            output_filename,
+            include_mode=include_mode,
+        )
         return io.NodeOutput(path)
 
 
@@ -147,6 +216,7 @@ class LoRAPruneKeys(io.ComfyNode):
                 io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
                 io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
                 io.String.Input("output_filename", default="pruned_lora", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Keep only matching keys instead of removing them. Nonmatching keys are pruned from the output."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -154,10 +224,22 @@ class LoRAPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_name: str, keys_to_prune: str,
-                use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(lora_name, "loras",
-                          keys_to_prune, use_regex, output_filename)
+    def execute(
+        cls,
+        lora_name: str,
+        keys_to_prune: str,
+        use_regex: bool,
+        output_filename: str,
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        path = _prune_keys(
+            lora_name,
+            "loras",
+            keys_to_prune,
+            use_regex,
+            output_filename,
+            include_mode=include_mode,
+        )
         return io.NodeOutput(path)
 
 
@@ -178,6 +260,7 @@ class CheckpointPruneKeys(io.ComfyNode):
                 io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
                 io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
                 io.String.Input("output_filename", default="pruned_checkpoint", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Keep only matching keys instead of removing them. Nonmatching keys are pruned from the output."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -185,10 +268,22 @@ class CheckpointPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, ckpt_name: str, keys_to_prune: str,
-                use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(ckpt_name, "checkpoints",
-                          keys_to_prune, use_regex, output_filename)
+    def execute(
+        cls,
+        ckpt_name: str,
+        keys_to_prune: str,
+        use_regex: bool,
+        output_filename: str,
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        path = _prune_keys(
+            ckpt_name,
+            "checkpoints",
+            keys_to_prune,
+            use_regex,
+            output_filename,
+            include_mode=include_mode,
+        )
         return io.NodeOutput(path)
 
 
@@ -209,6 +304,7 @@ class EmbeddingPruneKeys(io.ComfyNode):
                 io.String.Input("keys_to_prune", multiline=True, default="", tooltip="One tensor-key pattern per line. Blank lines are ignored."),
                 io.Boolean.Input("use_regex", default=False, tooltip="Interpret each line as a regular expression; otherwise match literal key text."),
                 io.String.Input("output_filename", default="pruned_embedding", tooltip="Output filename without extension, written under the matching ComfyUI model directory."),
+                io.Boolean.Input("include_mode", default=False, tooltip="Keep only matching keys instead of removing them. Nonmatching keys are pruned from the output."),
             ],
             outputs=[
                 io.AnyType.Output(display_name="output_path"),
@@ -216,8 +312,20 @@ class EmbeddingPruneKeys(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, embedding: str, keys_to_prune: str,
-                use_regex: bool, output_filename: str) -> io.NodeOutput:
-        path = _prune_keys(embedding, "embeddings",
-                          keys_to_prune, use_regex, output_filename)
+    def execute(
+        cls,
+        embedding: str,
+        keys_to_prune: str,
+        use_regex: bool,
+        output_filename: str,
+        include_mode: bool = False,
+    ) -> io.NodeOutput:
+        path = _prune_keys(
+            embedding,
+            "embeddings",
+            keys_to_prune,
+            use_regex,
+            output_filename,
+            include_mode=include_mode,
+        )
         return io.NodeOutput(path)
