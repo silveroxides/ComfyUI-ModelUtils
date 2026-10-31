@@ -15,7 +15,7 @@ from .quantization_guard import inspect_low_bit_input
 from .uel_io import atomic_uel_writer
 
 _FACTOR_RE = re.compile(
-    r"^(?P<module>.+)\.(?:lora_(?P<factor_ab>[AB])|lora\.(?P<factor_word>down|up))(?:\.default)?\.weight$"
+    r"^(?P<module>.+)\.(?:lora_(?P<factor_ab>[AB])|lora[._](?P<factor_word>down|up))(?:\.default)?(?:\.weight)?$"
 )
 _BLOCK_RE = re.compile(r"^transformer_blocks\.(?P<index>\d+)\.(?P<tail>.+)$")
 _REFINER_RE = re.compile(r"^token_refiner\.refiner_blocks\.(?P<index>\d+)\.(?P<tail>.+)$")
@@ -54,7 +54,7 @@ def _target_module(module: str) -> tuple[str, str | None, bool]:
     Returns:
         (target_module, qkv_part, is_swiglu_fc1)
     """
-    clean_mod = module.removeprefix("transformer.")
+    clean_mod = module.removeprefix("base_model.model.").removeprefix("transformer.")
     match = _BLOCK_RE.fullmatch(clean_mod)
     if match:
         prefix = f"diffusion_model.blocks.{match.group('index')}"

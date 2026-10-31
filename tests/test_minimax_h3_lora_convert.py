@@ -202,3 +202,25 @@ def test_lora_down_up_suffixes_supported(converter, tmp_path):
     assert "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight" in converted
     assert "diffusion_model.blocks.0.mlp.fc1.lora_A.weight" in converted
     assert "diffusion_model.blocks.0.mlp.fc1.lora_B.weight" in converted
+
+
+def test_bare_lora_ab_without_weight_suffix_supported(converter, tmp_path):
+    source = tmp_path / "source_bare_ab.safetensors"
+    output = tmp_path / "output_bare_ab.safetensors"
+
+    original = _make_source_tensors("token_refiner.refiner_blocks.0")
+    modified = {
+        k.replace(".default.weight", ""): v
+        for k, v in original.items()
+    }
+
+    save_file(modified, str(source))
+    report = converter.convert_minimax_h3_diffusers_lora(str(source), str(output))
+    assert "MiniMax H3 Diffusers LoRA conversion complete" in report
+    converted = load_file(str(output))
+
+    assert "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_A.weight" in converted
+    assert "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_B.weight" in converted
+    assert "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_A.weight" in converted
+    assert "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_B.weight" in converted
+
