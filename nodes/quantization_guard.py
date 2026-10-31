@@ -7,9 +7,6 @@ import struct
 import torch
 
 
-MAX_ISOLATED_LOW_BIT_TENSORS = 2
-
-
 def _low_bit_dtypes():
     names = (
         "int8",
@@ -135,11 +132,6 @@ class DiffusionQuantization:
             key for key in self.data_keys
             if key not in self.quantized_keys and _is_low_bit(handler, key)
         }
-        if len(self.isolated_low_bit_keys) > MAX_ISOLATED_LOW_BIT_TENSORS:
-            raise ValueError(
-                f"[{label}] {model_path} contains {len(self.isolated_low_bit_keys)} low-bit tensors; "
-                "casted or quantized inputs are unsupported"
-            )
         if self.isolated_low_bit_keys:
             logging.warning(
                 "[%s] %s contains %d isolated low-bit tensor(s); preserving/excluding unchanged: %s",
@@ -413,11 +405,6 @@ def inspect_low_bit_input(handler, label: str, operation: str) -> set[str]:
         )
 
     low_bit_keys = {key for key in keys if _is_low_bit(handler, key)}
-    if len(low_bit_keys) > MAX_ISOLATED_LOW_BIT_TENSORS:
-        raise ValueError(
-            f"[{operation}] {label} contains {len(low_bit_keys)} low-bit tensors; "
-            "casted or quantized inputs are unsupported"
-        )
     if low_bit_keys:
         logging.warning(
             "[%s] %s contains %d isolated low-bit tensor(s); "

@@ -85,17 +85,16 @@ def test_int8_uint8_are_detected_and_warn_once(tmp_path, modules, caplog, dtype)
     assert "low" in records[0].message
 
 
-def test_exact_two_tensor_threshold(tmp_path, modules):
-    for count in range(4):
+def test_multiple_low_bit_config_tensors_allowed(tmp_path, modules):
+    for count in (0, 1, 2, 52):
         path = tmp_path / f"threshold_{count}.safetensors"
-        tensors = {f"low_{i}": torch.ones(2, dtype=torch.uint8) for i in range(count)}
+        tensors = {
+            f"diffusion_model.blocks.{i}.attn.comfy_attention.config": torch.ones(2, dtype=torch.uint8)
+            for i in range(count)
+        }
         tensors["normal"] = torch.ones(1)
         save_file(tensors, str(path))
-        if count <= 2:
-            assert len(_inspect_file(path, modules)) == count
-        else:
-            with pytest.raises(ValueError, match="3 low-bit tensors.*casted or quantized"):
-                _inspect_file(path, modules)
+        assert len(_inspect_file(path, modules)) == count
 
 
 @pytest.mark.parametrize(
@@ -315,18 +314,24 @@ def test_multi_variants_preserve_earliest_complete_affected_layer(
     assert "diffusion_model.normal.diff" in result
 
 
-def test_hard_error_happens_before_resize_output_creation(monkeypatch, tmp_path, modules):
+def test_resize_preserves_multiple_low_bit_config_tensors(monkeypatch, tmp_path, modules):
     resize = modules["resize"]
     _patch_output(monkeypatch, resize, tmp_path)
     source = tmp_path / "three_low.safetensors"
-    save_file({f"low_{i}": torch.ones(1, dtype=torch.uint8) for i in range(3)}, str(source))
-    output = tmp_path / "must_not_exist.safetensors"
+    tensors = {
+        f"diffusion_model.blocks.{i}.attn.comfy_attention.config": torch.ones(1, dtype=torch.uint8)
+        for i in range(3)
+    }
+    tensors["diffusion_model.normal.lora_down.weight"] = torch.ones((2, 2))
+    tensors["diffusion_model.normal.lora_up.weight"] = torch.ones((2, 2))
+    save_file(tensors, str(source))
 
-    with pytest.raises(ValueError, match="3 low-bit tensors"):
-        resize.resize_lora_file(
-            str(source), 1, None, None, "cpu", torch.float16, output.stem, verbose=False
-        )
-    assert not output.exists()
+    output = resize.resize_lora_file(
+        str(source), 1, None, None, "cpu", torch.float16, "three_low_out", verbose=False
+    )
+    result = load_file(output)
+    for i in range(3):
+        assert result[f"diffusion_model.blocks.{i}.attn.comfy_attention.config"].dtype == torch.uint8
 
 
 def test_recognized_quantization_creates_no_resize_output(monkeypatch, tmp_path, modules):

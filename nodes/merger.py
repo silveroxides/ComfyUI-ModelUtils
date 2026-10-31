@@ -312,13 +312,13 @@ class MergerLogic:
                     discarded_keys += 1
                     pbar.update(1)
                     continue
-                if preserve_low_bit:
-                    write_preserved_tensor(writer, key, primary_handler, force_raw=True)
-                    pbar.update(1)
-                    continue
                 # Check discard patterns first - skip entirely
                 if _matches_any_pattern(key, discard_patterns, glob_mode=glob_mode):
                     discarded_keys += 1
+                    pbar.update(1)
+                    continue
+                if preserve_low_bit:
+                    write_preserved_tensor(writer, key, primary_handler, force_raw=True)
                     pbar.update(1)
                     continue
 
