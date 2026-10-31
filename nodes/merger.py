@@ -131,11 +131,20 @@ class MergerLogic:
             metadata = primary_handler.metadata()
 
         low_bit_keys_by_name = {}
-        if model_type == "loras":
+        if model_type == "diffusion_models":
+            low_bit_keys_by_name = {
+                name: {
+                    logical
+                    for logical, physical in diffusion_maps[name].items()
+                    if physical in quantizer.isolated_low_bit_keys
+                }
+                for name, quantizer in diffusion_quantizers.items()
+            }
+        else:
             try:
                 for name, handler in handlers.items():
                     low_bit_keys_by_name[name] = inspect_low_bit_input(
-                        handler, f"LoRA ({name})", "Generic LoRA Merge"
+                        handler, f"Input ({name})", f"Generic {model_type} Merge"
                     )
             except Exception:
                 for handler in handlers.values():
@@ -253,7 +262,7 @@ class MergerLogic:
 
         work_units = []
         for key in all_keys:
-            preserve_low_bit = model_type == "loras" and any(
+            preserve_low_bit = any(
                 key in low_bit_keys for low_bit_keys in low_bit_keys_by_name.values()
             )
             discarded = _matches_any_pattern(key, discard_patterns, glob_mode=glob_mode)
@@ -305,7 +314,7 @@ class MergerLogic:
             )
         ) as streamed:
             for key, loaded in tqdm(streamed, total=len(work_units), desc="Merging layers", unit="layers"):
-                preserve_low_bit = model_type == "loras" and any(
+                preserve_low_bit = any(
                     key in low_bit_keys for low_bit_keys in low_bit_keys_by_name.values()
                 )
                 if key in alpha_keys:
@@ -318,7 +327,14 @@ class MergerLogic:
                     pbar.update(1)
                     continue
                 if preserve_low_bit:
-                    write_preserved_tensor(writer, key, primary_handler, force_raw=True)
+                    primary_source_key = (
+                        diffusion_maps[primary_model_name][key]
+                        if primary_model_name in diffusion_maps
+                        else key
+                    )
+                    write_preserved_tensor(
+                        writer, primary_source_key, primary_handler, output_key=key, force_raw=True
+                    )
                     pbar.update(1)
                     continue
 
