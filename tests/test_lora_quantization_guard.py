@@ -593,3 +593,53 @@ def test_nvfp4_stream_decode_matches_core_full_dequantization(monkeypatch, tmp_p
         assert actual.shape == original.shape
     finally:
         handler.__exit__(None, None, None)
+
+
+def test_w6a8_int8_stream_decode_matches_core_dequantization(tmp_path, modules):
+    from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor, get_layout_class
+
+    layout_name = QUANT_ALGOS["w6a8_int8"]["comfy_tensor_layout"]
+    layout = get_layout_class(layout_name)
+    original = torch.randn(4, 256, dtype=torch.float32)
+    qdata, params = layout.quantize(original, bits=6, codebook=False)
+    path = tmp_path / "w6a8.safetensors"
+    key = "model.layer.weight"
+    metadata = {
+        "_quantization_metadata": json.dumps({
+            "layers": {
+                "model.layer": {
+                    "format": "w6a8_int8",
+                    "group_size": params.group_size,
+                    "convrot_groupsize": params.convrot_groupsize,
+                }
+            }
+        })
+    }
+    save_file({
+        key: qdata,
+        "model.layer.weight_s_rel": params.scale,
+        "model.layer.weight_s_channel": params.s_channel,
+    }, str(path), metadata=metadata)
+
+    handler = modules["resize"].MemoryEfficientSafeOpen(str(path), low_memory=True)
+    try:
+        decoder = modules["guard"].DiffusionQuantization(handler, str(path), "W6A8 test")
+        assert decoder.logical_shape(key) == tuple(original.shape)
+        keys = decoder.required_keys(key)
+        stream = handler.async_stream(keys, batch_size=1, prefetch_batches=1, pin_memory=False)
+        tensors = {}
+        try:
+            for source_key in keys:
+                batch = next(stream)
+                assert len(batch) == 1 and batch[0][0] == source_key
+                tensors[source_key] = batch[0][1]
+            actual = decoder.decode(key, tensors, torch.float32)
+        finally:
+            for source_key in tensors:
+                handler.mark_processed(source_key)
+            stream.close()
+        expected = QuantizedTensor(qdata, layout_name, params).dequantize()
+        torch.testing.assert_close(actual, expected)
+        assert actual.shape == original.shape
+    finally:
+        handler.__exit__(None, None, None)

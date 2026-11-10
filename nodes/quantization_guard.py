@@ -280,6 +280,12 @@ class DiffusionQuantization:
             if len(shape) != 2:
                 raise ValueError(f"[{self.label}] Expected packed matrix weight for {key}, got {shape}")
             return shape[0], shape[1] * 2
+        if fmt == "w6a8_int8":
+            if len(shape) != 2:
+                raise ValueError(f"[{self.label}] Expected packed matrix weight for {key}, got {shape}")
+            if (shape[1] * 8) % 6 != 0:
+                raise ValueError(f"[{self.label}] Invalid 6-bit packed width {shape[1]} for {key}")
+            return shape[0], shape[1] * 8 // 6
         return shape
 
     def logical_dtype(self, key: str, compute_dtype: torch.dtype) -> torch.dtype:
@@ -342,7 +348,7 @@ class DiffusionQuantization:
                 "quant_group_size": 64,
                 "linear_dtype": config.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
             }
-        elif fmt == "asym_w4a8_int8":
+        elif fmt in ("asym_w4a8_int8", "w6a8_int8"):
             if f"{stem}.weight_correction" in tensors:
                 raise ValueError(
                     f"[{self.label}] Core's W4A8 loader does not apply weight_correction for {key}"
